@@ -61,20 +61,47 @@ impl Environment {
         for p in &mut self.state.players {
             p.current_bet = 0;
             p.total_contributed = 0;
-            p.is_folded = p.stack == 0;
-            p.is_all_in = false;
-            p.hole_cards = [self.deck.deal(), self.deck.deal()];
+            if p.stack > 0 {
+                p.is_folded = false;
+                p.is_all_in = false;
+                p.hole_cards = [self.deck.deal(), self.deck.deal()];
+            } else {
+                p.is_folded = true;
+                p.is_all_in = false;
+                p.hole_cards = [None, None];
+            }
         }
 
-        // Post Blinds
-        let num_p = self.state.num_players;
-        let (sb_idx, bb_idx, first_actor) = if num_p == 2 {
-            // Heads up: BTN posts SB and acts first preflop, other posts BB
-            (button_idx, (button_idx + 1) % num_p, button_idx)
+        // Find surviving players with chips
+        let surviving: Vec<usize> = (0..self.state.num_players)
+            .filter(|&i| self.state.players[i].stack > 0)
+            .collect();
+
+        if surviving.len() < 2 {
+            // Tournament is finished or only 1 player left
+            self.state.street = Street::Showdown;
+            if let Some(&winner) = surviving.first() {
+                self.state.players[winner].stack += self.state.pot;
+                self.state.pot = 0;
+            }
+            return;
+        }
+
+        // Map button to closest surviving player
+        let num_surv = surviving.len();
+        let btn_s_idx = surviving.iter().position(|&s| s >= button_idx).unwrap_or(0);
+        let actual_btn = surviving[btn_s_idx];
+        self.state.button_idx = actual_btn;
+
+        let (sb_idx, bb_idx, first_actor) = if num_surv == 2 {
+            // Heads-up: BTN is SB and acts first preflop, other is BB
+            let sb = actual_btn;
+            let bb = surviving[(btn_s_idx + 1) % 2];
+            (sb, bb, sb)
         } else {
-            let sb = (button_idx + 1) % num_p;
-            let bb = (button_idx + 2) % num_p;
-            let utg = (button_idx + 3) % num_p;
+            let sb = surviving[(btn_s_idx + 1) % num_surv];
+            let bb = surviving[(btn_s_idx + 2) % num_surv];
+            let utg = surviving[(btn_s_idx + 3) % num_surv];
             (sb, bb, utg)
         };
 

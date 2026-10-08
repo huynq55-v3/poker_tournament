@@ -17,6 +17,7 @@ pub struct PokerGuiApp {
     pub blind_schedule: TournamentBlindSchedule,
     pub policy: DeepCFRPolicy,
     pub num_seats: usize,
+    pub selected_num_seats: usize,
     pub hero_seat: usize,
     pub button_idx: usize,
     pub last_bot_act_time: Instant,
@@ -24,6 +25,7 @@ pub struct PokerGuiApp {
     pub auto_play_bots: bool,
     pub hand_number: usize,
     pub hand_in_progress: bool,
+    pub tournament_over: bool,
     pub winner_announcement: Option<String>,
     pub action_logs: Vec<String>,
     pub model_status: String,
@@ -37,7 +39,7 @@ impl PokerGuiApp {
         let schedule = TournamentBlindSchedule::new(num_seats);
         let current_blind = schedule.current_level();
 
-        // 1. Initial Stack is exactly 1,000 chips per player!
+        // 1. Initial Stack: Strictly 1,000 chips per player!
         let initial_stack = 1000u32;
         let stacks = vec![initial_stack; num_seats];
         let button_idx = 0;
@@ -46,10 +48,10 @@ impl PokerGuiApp {
         let mut rng = thread_rng();
         env.reset_hand(&mut rng, button_idx);
 
-        // Mark seat 0 as Hero (human)
+        // Seat 0 is Hero (human)
         env.state.players[0].is_bot = false;
 
-        // 3. Load trained Neural Network if deep_cfr_model.json exists
+        // Load trained Deep CFR Model if available
         let model_path = "deep_cfr_model.json";
         let (mlp, status) = match MLP::load_from_file(model_path) {
             Ok(loaded) => (
@@ -70,6 +72,7 @@ impl PokerGuiApp {
             blind_schedule: schedule,
             policy,
             num_seats,
+            selected_num_seats: num_seats,
             hero_seat: 0,
             button_idx,
             last_bot_act_time: Instant::now(),
@@ -77,8 +80,9 @@ impl PokerGuiApp {
             auto_play_bots: true,
             hand_number: 1,
             hand_in_progress: true,
+            tournament_over: false,
             winner_announcement: None,
-            action_logs: vec!["🎲 Tournament started! Everyone starts with 1,000 chips. Blinds: 10/20.".to_string()],
+            action_logs: vec![format!("🎲 Started {}-Player Tournament! 1,000 chips each. Blinds: 10/20.", num_seats)],
             model_status: status,
             is_training: Arc::new(AtomicBool::new(false)),
             train_progress_msg: Arc::new(RwLock::new(String::new())),
@@ -88,30 +92,64 @@ impl PokerGuiApp {
         app
     }
 
+    /// Reset and start a completely new tournament with `seats` players (2 to 8)
+    pub fn start_new_tournament(&mut self, seats: usize) {
+        self.num_seats = seats.clamp(2, 8);
+        self.selected_num_seats = self.num_seats;
+        self.blind_schedule = TournamentBlindSchedule::new(self.num_seats);
+        let current_blind = self.blind_schedule.current_level();
+
+        let initial_stack = 1000u32;
+        let stacks = vec![initial_stack; self.num_seats];
+        self.button_idx = 0;
+        self.hand_number = 1;
+        self.tournament_over = false;
+        self.winner_announcement = None;
+
+        self.env = Environment::new(self.num_seats, &stacks, current_blind.bb, current_blind.sb, self.button_idx);
+        let mut rng = thread_rng();
+        self.env.reset_hand(&mut rng, self.button_idx);
+        self.env.state.players[self.hero_seat].is_bot = false;
+
+        self.hand_in_progress = true;
+        self.action_logs.clear();
+        self.action_logs.push(format!("🏆 New {}-Player Tournament Started! 1,000 chips each. Blinds: 10/20.", self.num_seats));
+        self.log_hand_start();
+    }
+
+    fn surviving_players(&self) -> Vec<usize> {
+        (0..self.num_seats)
+            .filter(|&i| self.env.state.players[i].stack > 0)
+            .collect()
+    }
+
     fn log_hand_start(&mut self) {
         let bl = self.blind_schedule.current_level();
+        let surv = self.surviving_players().len();
         self.action_logs.push(format!(
-            "--- Hand #{} started (Level {}: {}/{}) ---",
-            self.hand_number, bl.level_num, bl.sb, bl.bb
+            "--- Hand #{} started ({} players left | Level {}: {}/{}) ---",
+            self.hand_number, surv, bl.level_num, bl.sb, bl.bb
         ));
     }
 
     fn start_next_hand(&mut self) {
+        let surviving = self.surviving_players();
+
+        // Check if Tournament is won
+        if surviving.len() <= 1 {
+            self.tournament_over = true;
+            self.hand_in_progress = false;
+            if let Some(&winner) = surviving.first() {
+                let win_name = if winner == self.hero_seat { "Hero (You) 🏆" } else { &format!("Bot_{}", winner) };
+                let msg = format!("🏆 TOURNAMENT OVER! {} won all chips and is the Champion!", win_name);
+                self.action_logs.push(msg.clone());
+                self.winner_announcement = Some(msg);
+            }
+            return;
+        }
+
         self.hand_number += 1;
         self.button_idx = (self.button_idx + 1) % self.num_seats;
-
-        // Rebuy to 1,000 chips if broke
-        if self.env.state.players[self.hero_seat].stack == 0 {
-            self.env.state.players[self.hero_seat].stack = 1000;
-            self.action_logs.push("💰 Hero re-bought for 1,000 chips!".to_string());
-        }
-
-        // Top-up bankrupt bots with 1,000 chips
-        for (i, p) in self.env.state.players.iter_mut().enumerate() {
-            if i != self.hero_seat && p.stack < self.blind_schedule.current_level().bb {
-                p.stack = 1000;
-            }
-        }
 
         let curr_bl = self.blind_schedule.current_level();
         self.env.state.bb_size = curr_bl.bb;
@@ -151,24 +189,34 @@ impl PokerGuiApp {
     }
 
     fn check_showdown_result(&mut self) {
-        let mut winners = Vec::new();
-        let mut max_stack = 0u32;
-        for (_, p) in self.env.state.players.iter().enumerate() {
-            if p.is_in_hand() && p.stack > max_stack {
-                max_stack = p.stack;
-            }
-        }
+        let mut active_survivors = Vec::new();
         for (i, p) in self.env.state.players.iter().enumerate() {
             if p.is_in_hand() {
-                winners.push(if i == self.hero_seat { "Hero".to_string() } else { format!("Bot_{}", i) });
+                active_survivors.push(if i == self.hero_seat { "Hero".to_string() } else { format!("Bot_{}", i) });
             }
         }
-        let announcement = format!("🏆 Hand ended! Remaining: {}", winners.join(", "));
+        let announcement = format!("Hand ended. Remaining in hand: {}", active_survivors.join(", "));
         self.action_logs.push(announcement.clone());
-        self.winner_announcement = Some(announcement);
+
+        // Check for player eliminations
+        for (i, p) in self.env.state.players.iter().enumerate() {
+            if p.stack == 0 {
+                let name = if i == self.hero_seat { "Hero (You)".to_string() } else { format!("Bot_{}", i) };
+                self.action_logs.push(format!("💀 {} ran out of chips and is ELIMINATED!", name));
+            }
+        }
+
+        let total_surviving = self.surviving_players().len();
+        if total_surviving <= 1 {
+            self.tournament_over = true;
+            let winner_idx = self.surviving_players().first().copied().unwrap_or(0);
+            let win_name = if winner_idx == self.hero_seat { "Hero (You) 🏆".to_string() } else { format!("Bot_{}", winner_idx) };
+            self.winner_announcement = Some(format!("🏆 TOURNAMENT OVER! {} is the Champion!", win_name));
+        } else {
+            self.winner_announcement = Some(announcement);
+        }
     }
 
-    /// Reload model from deep_cfr_model.json
     pub fn reload_model(&mut self) {
         match MLP::load_from_file("deep_cfr_model.json") {
             Ok(loaded) => {
@@ -184,7 +232,6 @@ impl PokerGuiApp {
         }
     }
 
-    /// Spawn background thread to train Deep CFR AI for 10 iterations
     pub fn start_background_training(&mut self) {
         if self.is_training.load(Ordering::SeqCst) {
             return;
@@ -210,10 +257,8 @@ impl PokerGuiApp {
                 }
             }
 
-            // Save trained model
             let _ = trainer.advantage_net.read().map(|net| net.save_to_file("deep_cfr_model.json"));
 
-            // Hot-reload into live policy
             if let Ok(trained_net) = trainer.advantage_net.read() {
                 if let Ok(mut live_net) = target_net.write() {
                     *live_net = trained_net.clone();
@@ -243,12 +288,13 @@ impl eframe::App for PokerGuiApp {
 
         ctx.request_repaint_after(Duration::from_millis(50));
 
-        // 2. Handle Bot Turns automatically
-        if self.hand_in_progress {
+        // 2. Handle Bot Turns automatically if hand is running
+        if self.hand_in_progress && !self.tournament_over {
             let curr_actor = self.env.state.current_player_idx;
             let is_bot = self.env.state.players[curr_actor].is_bot;
+            let is_alive = self.env.state.players[curr_actor].is_active();
 
-            if is_bot && self.auto_play_bots {
+            if is_bot && is_alive && self.auto_play_bots {
                 if self.last_bot_act_time.elapsed() >= Duration::from_millis(self.bot_delay_ms) {
                     let mask = self.env.get_action_mask();
                     let features = self.env.state.encode_features(curr_actor);
@@ -259,24 +305,40 @@ impl eframe::App for PokerGuiApp {
             }
         }
 
-        // 3. Render Top Banner (Tournament Timer & Blinds)
+        // 3. Render Top Banner (Tournament Settings, Timer, Blinds)
         egui::TopBottomPanel::top("top_banner").show(ctx, |ui| {
-            ui.add_space(6.0);
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.heading(RichText::new("♠️ TEXAS HOLD'EM DEEP CFR").color(Color32::from_rgb(240, 200, 80)).strong());
+                ui.heading(RichText::new("♠️ TEXAS HOLD'EM TOURNAMENT").color(Color32::from_rgb(240, 200, 80)).strong());
                 ui.separator();
 
+                // Player Count Selector (Min 2, Max 8)
+                ui.label(RichText::new("👥 Players:").strong());
+                if ui.button("➖").clicked() && self.selected_num_seats > 2 {
+                    self.selected_num_seats -= 1;
+                }
+                ui.label(RichText::new(format!("{}", self.selected_num_seats)).size(16.0).color(Color32::from_rgb(100, 200, 255)).strong());
+                if ui.button("➕").clicked() && self.selected_num_seats < 8 {
+                    self.selected_num_seats += 1;
+                }
+
+                if ui.button(RichText::new("🔄 New Tournament").color(Color32::LIGHT_GREEN).strong()).clicked() {
+                    self.start_new_tournament(self.selected_num_seats);
+                }
+
+                ui.separator();
+
+                // Blinds info
                 let curr_bl = self.blind_schedule.current_level();
                 ui.label(RichText::new(format!("Level {}", curr_bl.level_num)).strong());
                 ui.label(RichText::new(format!("Blinds: {}/{}", curr_bl.sb, curr_bl.bb)).color(Color32::from_rgb(100, 220, 100)).strong());
 
                 ui.separator();
-                let timer_text = format!("⏳ Next Blind: {}", self.blind_schedule.formatted_time_remaining());
+                let timer_text = format!("⏳ {}", self.blind_schedule.formatted_time_remaining());
                 ui.label(RichText::new(timer_text).color(Color32::from_rgb(255, 130, 130)).strong());
 
-                if let Some(nxt) = self.blind_schedule.next_level() {
-                    ui.label(format!("(Next: {}/{})", nxt.sb, nxt.bb));
-                }
+                let surv_count = self.surviving_players().len();
+                ui.label(RichText::new(format!("(Alive: {}/{})", surv_count, self.num_seats)).color(Color32::from_rgb(200, 200, 200)));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("⏭️ Next Blind").clicked() {
@@ -298,11 +360,11 @@ impl eframe::App for PokerGuiApp {
 
         // 4. Render Right Sidebar (Model Manager, GTO Probs & Logs)
         egui::SidePanel::right("right_panel")
-            .min_width(340.0)
+            .min_width(330.0)
             .show(ctx, |ui| {
-                ui.add_space(8.0);
+                ui.add_space(6.0);
 
-                // Neural Network Model Management
+                // Deep CFR Neural Network
                 ui.heading("🧠 Deep CFR Neural Net");
                 ui.separator();
                 ui.label(RichText::new(&self.model_status).size(12.0));
@@ -324,8 +386,8 @@ impl eframe::App for PokerGuiApp {
                     }
                 });
 
-                ui.add_space(14.0);
-                ui.heading("📊 Real-time GTO Decisions");
+                ui.add_space(12.0);
+                ui.heading("📊 Real-time GTO Decision Probs");
                 ui.separator();
 
                 let curr_actor = self.env.state.current_player_idx;
@@ -346,8 +408,8 @@ impl eframe::App for PokerGuiApp {
                     });
                 }
 
-                ui.add_space(16.0);
-                ui.heading("📜 Hand Logs");
+                ui.add_space(14.0);
+                ui.heading("📜 Tournament Logs");
                 ui.separator();
 
                 egui::ScrollArea::vertical()
@@ -370,7 +432,7 @@ impl eframe::App for PokerGuiApp {
             let felt_size = Vec2::new(table_rect.width() * 0.90, table_height * 0.84);
             let felt_rect = egui::Rect::from_center_size(center, felt_size);
 
-            painter.rect_filled(felt_rect, 120.0, Color32::from_rgb(20, 68, 38)); // Rich dark casino green
+            painter.rect_filled(felt_rect, 120.0, Color32::from_rgb(18, 62, 35)); // Tournament green felt
             painter.rect_stroke(felt_rect, 120.0, Stroke::new(7.0, Color32::from_rgb(190, 150, 70))); // Gold rim
 
             // Pot Display
@@ -403,91 +465,121 @@ impl eframe::App for PokerGuiApp {
                 let seat_pos = egui::pos2(center.x + radius_x * angle.cos(), center.y + radius_y * angle.sin());
 
                 let p = &self.env.state.players[i];
-                let is_actor = i == self.env.state.current_player_idx && self.hand_in_progress;
+                let is_actor = i == self.env.state.current_player_idx && self.hand_in_progress && !self.tournament_over;
                 let is_hero = i == self.hero_seat;
+                let is_busted = p.stack == 0;
                 let pos_name = Position::for_seat(i, self.button_idx, num_p);
 
-                // Seat box (larger to comfortably fit bigger cards and text)
                 let seat_rect = egui::Rect::from_center_size(seat_pos, Vec2::new(138.0, 96.0));
-                let border_color = if is_actor {
-                    Color32::from_rgb(255, 235, 50) // Bright glowing turn indicator
-                } else if is_hero {
-                    Color32::from_rgb(70, 180, 255)
-                } else {
-                    Color32::from_rgb(80, 80, 80)
-                };
 
-                let bg_color = if p.is_folded {
-                    Color32::from_rgba_unmultiplied(25, 25, 25, 220)
-                } else {
-                    Color32::from_rgba_unmultiplied(16, 20, 24, 240)
-                };
+                if is_busted {
+                    // ELIMINATED / BUSTED SEAT VISUAL
+                    painter.rect_filled(seat_rect, 10.0, Color32::from_rgba_unmultiplied(35, 20, 20, 230));
+                    painter.rect_stroke(seat_rect, 10.0, Stroke::new(1.5, Color32::from_rgb(120, 40, 40)));
 
-                painter.rect_filled(seat_rect, 10.0, bg_color);
-                painter.rect_stroke(seat_rect, 10.0, Stroke::new(if is_actor { 3.5 } else { 1.5 }, border_color));
-
-                // Name & Position Badge
-                let p_name = if is_hero { "Hero (You)".to_string() } else { format!("Bot_{}", i) };
-                let pos_badge = if i == self.button_idx { format!("{} [D]", format!("{:?}", pos_name)) } else { format!("{:?}", pos_name) };
-
-                painter.text(
-                    egui::pos2(seat_pos.x, seat_pos.y - 34.0),
-                    egui::Align2::CENTER_CENTER,
-                    format!("{} ({})", p_name, pos_badge),
-                    egui::FontId::proportional(13.0),
-                    if is_hero { Color32::from_rgb(120, 210, 255) } else { Color32::WHITE },
-                );
-
-                // Chips & BB
-                let stack_bb = p.stack as f32 / self.env.state.bb_size as f32;
-                painter.text(
-                    egui::pos2(seat_pos.x, seat_pos.y - 16.0),
-                    egui::Align2::CENTER_CENTER,
-                    format!("{} chips ({:.1} BB)", p.stack, stack_bb),
-                    egui::FontId::proportional(13.0),
-                    Color32::from_rgb(110, 240, 110),
-                );
-
-                // Hole Cards or Status
-                if p.is_folded {
+                    let p_name = if is_hero { "Hero (You)".to_string() } else { format!("Bot_{}", i) };
                     painter.text(
-                        egui::pos2(seat_pos.x, seat_pos.y + 16.0),
+                        egui::pos2(seat_pos.x, seat_pos.y - 25.0),
                         egui::Align2::CENTER_CENTER,
-                        "FOLDED",
+                        p_name,
+                        egui::FontId::proportional(13.0),
+                        Color32::from_rgb(180, 100, 100),
+                    );
+
+                    painter.text(
+                        egui::pos2(seat_pos.x, seat_pos.y + 4.0),
+                        egui::Align2::CENTER_CENTER,
+                        "💀 ELIMINATED",
                         egui::FontId::proportional(15.0),
+                        Color32::from_rgb(255, 70, 70),
+                    );
+                    painter.text(
+                        egui::pos2(seat_pos.x, seat_pos.y + 24.0),
+                        egui::Align2::CENTER_CENTER,
+                        "0 chips (OUT)",
+                        egui::FontId::proportional(11.0),
                         Color32::GRAY,
                     );
-                } else if p.is_all_in {
-                    painter.text(
-                        egui::pos2(seat_pos.x, seat_pos.y + 16.0),
-                        egui::Align2::CENTER_CENTER,
-                        "ALL-IN!",
-                        egui::FontId::proportional(16.0),
-                        Color32::RED,
-                    );
-                } else if is_hero || !self.hand_in_progress {
-                    // Show Hero's cards or show showdown hands
-                    if let (Some(c0), Some(c1)) = (p.hole_cards[0], p.hole_cards[1]) {
-                        draw_medium_card(painter, egui::pos2(seat_pos.x - 26.0, seat_pos.y + 16.0), c0);
-                        draw_medium_card(painter, egui::pos2(seat_pos.x + 26.0, seat_pos.y + 16.0), c1);
-                    }
                 } else {
-                    // Face down cards for bots
-                    draw_card_back(painter, egui::pos2(seat_pos.x - 22.0, seat_pos.y + 16.0));
-                    draw_card_back(painter, egui::pos2(seat_pos.x + 22.0, seat_pos.y + 16.0));
-                }
+                    // ACTIVE SURVIVING SEAT
+                    let border_color = if is_actor {
+                        Color32::from_rgb(255, 235, 50) // Bright glowing turn indicator
+                    } else if is_hero {
+                        Color32::from_rgb(70, 180, 255)
+                    } else {
+                        Color32::from_rgb(80, 80, 80)
+                    };
 
-                // Bet chips in front of player
-                if p.current_bet > 0 {
-                    let bet_offset = Vec2::new(-angle.cos() * 54.0, -angle.sin() * 54.0);
-                    let bet_pos = seat_pos + bet_offset;
+                    let bg_color = if p.is_folded {
+                        Color32::from_rgba_unmultiplied(25, 25, 25, 220)
+                    } else {
+                        Color32::from_rgba_unmultiplied(16, 20, 24, 240)
+                    };
+
+                    painter.rect_filled(seat_rect, 10.0, bg_color);
+                    painter.rect_stroke(seat_rect, 10.0, Stroke::new(if is_actor { 3.5 } else { 1.5 }, border_color));
+
+                    // Name & Position Badge
+                    let p_name = if is_hero { "Hero (You)".to_string() } else { format!("Bot_{}", i) };
+                    let pos_badge = if i == self.button_idx { format!("{} [D]", format!("{:?}", pos_name)) } else { format!("{:?}", pos_name) };
+
                     painter.text(
-                        bet_pos,
+                        egui::pos2(seat_pos.x, seat_pos.y - 34.0),
                         egui::Align2::CENTER_CENTER,
-                        format!("🪙 {}", p.current_bet),
-                        egui::FontId::proportional(14.0),
-                        Color32::from_rgb(255, 235, 110),
+                        format!("{} ({})", p_name, pos_badge),
+                        egui::FontId::proportional(13.0),
+                        if is_hero { Color32::from_rgb(120, 210, 255) } else { Color32::WHITE },
                     );
+
+                    // Chips & BB
+                    let stack_bb = p.stack as f32 / self.env.state.bb_size as f32;
+                    painter.text(
+                        egui::pos2(seat_pos.x, seat_pos.y - 16.0),
+                        egui::Align2::CENTER_CENTER,
+                        format!("{} chips ({:.1} BB)", p.stack, stack_bb),
+                        egui::FontId::proportional(13.0),
+                        Color32::from_rgb(110, 240, 110),
+                    );
+
+                    // Hole Cards or Status
+                    if p.is_folded {
+                        painter.text(
+                            egui::pos2(seat_pos.x, seat_pos.y + 16.0),
+                            egui::Align2::CENTER_CENTER,
+                            "FOLDED",
+                            egui::FontId::proportional(15.0),
+                            Color32::GRAY,
+                        );
+                    } else if p.is_all_in {
+                        painter.text(
+                            egui::pos2(seat_pos.x, seat_pos.y + 16.0),
+                            egui::Align2::CENTER_CENTER,
+                            "ALL-IN!",
+                            egui::FontId::proportional(16.0),
+                            Color32::RED,
+                        );
+                    } else if is_hero || !self.hand_in_progress {
+                        if let (Some(c0), Some(c1)) = (p.hole_cards[0], p.hole_cards[1]) {
+                            draw_medium_card(painter, egui::pos2(seat_pos.x - 26.0, seat_pos.y + 16.0), c0);
+                            draw_medium_card(painter, egui::pos2(seat_pos.x + 26.0, seat_pos.y + 16.0), c1);
+                        }
+                    } else {
+                        draw_card_back(painter, egui::pos2(seat_pos.x - 22.0, seat_pos.y + 16.0));
+                        draw_card_back(painter, egui::pos2(seat_pos.x + 22.0, seat_pos.y + 16.0));
+                    }
+
+                    // Bet chips in front of player
+                    if p.current_bet > 0 {
+                        let bet_offset = Vec2::new(-angle.cos() * 54.0, -angle.sin() * 54.0);
+                        let bet_pos = seat_pos + bet_offset;
+                        painter.text(
+                            bet_pos,
+                            egui::Align2::CENTER_CENTER,
+                            format!("🪙 {}", p.current_bet),
+                            egui::FontId::proportional(14.0),
+                            Color32::from_rgb(255, 235, 110),
+                        );
+                    }
                 }
             }
 
@@ -495,16 +587,27 @@ impl eframe::App for PokerGuiApp {
             ui.add_space(table_height);
             ui.separator();
 
-            let is_hero_turn = self.env.state.current_player_idx == self.hero_seat && self.hand_in_progress;
+            let hero_alive = self.env.state.players[self.hero_seat].stack > 0;
+            let is_hero_turn = self.env.state.current_player_idx == self.hero_seat && self.hand_in_progress && hero_alive && !self.tournament_over;
             let mask = self.env.get_action_mask();
 
             ui.horizontal(|ui| {
-                if !self.hand_in_progress {
-                    if ui.button(RichText::new("🃏 Deal Next Hand").size(18.0).strong().color(Color32::GREEN)).clicked() {
+                if self.tournament_over {
+                    if let Some(ann) = &self.winner_announcement {
+                        ui.label(RichText::new(ann).color(Color32::from_rgb(250, 220, 80)).size(17.0).strong());
+                    }
+                    if ui.button(RichText::new("🔄 Start New Tournament").size(16.0).color(Color32::GREEN).strong()).clicked() {
+                        self.start_new_tournament(self.selected_num_seats);
+                    }
+                } else if !self.hand_in_progress {
+                    if ui.button(RichText::new("🃏 Deal Next Hand").size(17.0).strong().color(Color32::GREEN)).clicked() {
                         self.start_next_hand();
                     }
                     if let Some(ann) = &self.winner_announcement {
-                        ui.label(RichText::new(ann).color(Color32::from_rgb(250, 220, 80)).size(16.0).strong());
+                        ui.label(RichText::new(ann).color(Color32::from_rgb(250, 220, 80)).size(15.0).strong());
+                    }
+                    if !hero_alive {
+                        ui.label(RichText::new("💀 You have busted! Spectating bots or click 'New Tournament' above.").color(Color32::from_rgb(255, 120, 120)));
                     }
                 } else if is_hero_turn {
                     ui.label(RichText::new("👉 YOUR TURN:").size(17.0).color(Color32::YELLOW).strong());
@@ -572,17 +675,14 @@ fn draw_large_card(painter: &egui::Painter, pos: egui::Pos2, card: Card) {
         Suit::Spades | Suit::Clubs => Color32::from_rgb(18, 18, 18),
     };
 
-    // Draw rank in top-left
-    let rank_str = format!("{}", card.rank().char_code());
     painter.text(
         egui::pos2(pos.x - 16.0, pos.y - 24.0),
         egui::Align2::CENTER_CENTER,
-        rank_str,
+        format!("{}", card.rank().char_code()),
         egui::FontId::proportional(20.0),
         suit_color,
     );
 
-    // Draw suit symbol in center
     painter.text(
         egui::pos2(pos.x, pos.y + 6.0),
         egui::Align2::CENTER_CENTER,
@@ -606,7 +706,6 @@ fn draw_medium_card(painter: &egui::Painter, pos: egui::Pos2, card: Card) {
         Suit::Spades | Suit::Clubs => Color32::from_rgb(18, 18, 18),
     };
 
-    // Rank on top
     painter.text(
         egui::pos2(pos.x - 12.0, pos.y - 16.0),
         egui::Align2::CENTER_CENTER,
@@ -615,7 +714,6 @@ fn draw_medium_card(painter: &egui::Painter, pos: egui::Pos2, card: Card) {
         suit_color,
     );
 
-    // Suit in center
     painter.text(
         egui::pos2(pos.x + 4.0, pos.y + 6.0),
         egui::Align2::CENTER_CENTER,
@@ -631,7 +729,7 @@ fn draw_card_back(painter: &egui::Painter, pos: egui::Pos2) {
     let h = 54.0;
     let card_rect = egui::Rect::from_center_size(pos, Vec2::new(w, h));
 
-    painter.rect_filled(card_rect, 4.0, Color32::from_rgb(30, 80, 180)); // Royal blue back
+    painter.rect_filled(card_rect, 4.0, Color32::from_rgb(30, 80, 180));
     painter.rect_stroke(card_rect, 4.0, Stroke::new(1.5, Color32::WHITE));
 
     painter.text(
