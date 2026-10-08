@@ -58,6 +58,15 @@ fn main() {
     let total_train_time = train_start.elapsed().as_secs_f64();
     println!("   ✅ Deep CFR Training Complete in {:.2}s!", total_train_time);
 
+    let model_path = "deep_cfr_model.json";
+    if let Ok(net) = trainer.advantage_net.read() {
+        if let Err(e) = net.save_to_file(model_path) {
+            println!("   ⚠️ Failed to save model: {}", e);
+        } else {
+            println!("   💾 Model successfully saved to '{}'!", model_path);
+        }
+    }
+
     // 3. Inspect Trained Policy Decisions & GTO Real-time Probs
     println!("\n[3] 🎯 Inspecting GTO Action Probabilities on a 6-Player Tournament Hand...");
     let trained_policy = Arc::new(trainer.get_policy(false));

@@ -141,6 +141,19 @@ impl MLP {
         }
     }
 
+    pub fn save_to_file<P: AsRef<std::path::Path>>(&self, path: P) -> std::io::Result<()> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(path, json)
+    }
+
+    pub fn load_from_file<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<Self> {
+        let json = std::fs::read_to_string(path)?;
+        let mlp = serde_json::from_str(&json)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(mlp)
+    }
+
     /// High-speed inference for a single sample (tree traversal)
     #[inline(always)]
     pub fn forward(&self, input: &[f32]) -> Vec<f32> {
