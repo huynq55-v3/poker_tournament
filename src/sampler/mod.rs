@@ -4,6 +4,14 @@ use rand_distr::{Distribution, Gamma, LogNormal};
 pub struct TournamentStackSampler;
 
 impl TournamentStackSampler {
+
+    /// Stack bằng nhau (đầu giải / cash game) với độ sâu ngẫu nhiên
+pub fn sample_equal_stacks<R: Rng>(rng: &mut R, num_players: usize, bb_size: u32) -> Vec<u32> {
+    const DEPTHS: [u32; 6] = [15, 25, 40, 50, 75, 100];
+    let d = DEPTHS[rng.gen_range(0..DEPTHS.len())];
+    vec![d * bb_size; num_players]
+}
+
     /// Sample asymmetric stacks using a Dirichlet distribution approximation via Gamma distributions.
     /// Range: 5 BB to 200 BB per player.
     pub fn sample_dirichlet_stacks<R: Rng>(

@@ -6,6 +6,8 @@ pub mod gui_bridge;
 pub mod neural_network;
 pub mod deep_cfr;
 pub mod gui;
+pub mod equity;
+pub mod benchmark;
 
 pub use poker_core::{Card, Deck, Rank, Suit, evaluate_7_cards, HandRank, HandCategory};
 pub use environment::{Action, ActionMask, Environment, GameState, PlayerState, Street};

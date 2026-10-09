@@ -1,5 +1,6 @@
 use crate::environment::action::{Action, ActionMask, NUM_ACTIONS};
 use crate::environment::engine::Environment;
+use crate::environment::state::Street;
 use crate::sampler::TournamentStackSampler;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use rand::seq::SliceRandom;
@@ -22,11 +23,11 @@ pub trait Policy: Send + Sync {
     /// Select action given features and valid action mask
     fn select_action(&self, features: &[f32], mask: &ActionMask) -> Action;
 
-    /// Get probability distribution over 6 actions for GTO visualizer
+    /// Get probability distribution over actions for GTO visualizer
     fn get_action_probs(&self, features: &[f32], mask: &ActionMask) -> [f32; NUM_ACTIONS];
 }
 
-/// Baseline Random Masked Policy (used for initial self-play exploration & pipeline benchmarking)
+/// Baseline Random Masked Policy
 pub struct UniformRandomPolicy;
 
 impl Policy for UniformRandomPolicy {
@@ -65,7 +66,6 @@ impl SelfPlayEngine {
         }
     }
 
-    /// Run parallel worker simulation generating experience transitions
     pub fn run_parallel_simulation<P: Policy + 'static>(
         &self,
         policy: Arc<P>,
@@ -79,7 +79,6 @@ impl SelfPlayEngine {
         let running = Arc::clone(&self.running);
         let hand_counter = Arc::clone(&self.total_simulated_hands);
 
-        // Spawn parallel Rayon workers
         std::thread::spawn(move || {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(num_workers)
@@ -93,14 +92,15 @@ impl SelfPlayEngine {
                     let sb_size = 50u32;
 
                     while running.load(Ordering::Relaxed) {
-                        let current_count = hand_counter.fetch_add(1, Ordering::Relaxed);
-                        if current_count >= hands_to_simulate {
+                        // ✅ FIX: chiếm slot nguyên tử, không bao giờ vượt hands_to_simulate
+                        let claimed = hand_counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                            if c < hands_to_simulate { Some(c + 1) } else { None }
+                        });
+                        if claimed.is_err() {
                             running.store(false, Ordering::Relaxed);
                             break;
                         }
 
-                        // Domain Randomization:
-                        // Randomize table size (2 to 8 players)
                         let num_players = rand::Rng::gen_range(&mut rng, 2..=8);
                         let button_idx = rand::Rng::gen_range(&mut rng, 0..num_players);
                         let stacks = TournamentStackSampler::sample_dirichlet_stacks(&mut rng, num_players, bb_size);
@@ -109,29 +109,27 @@ impl SelfPlayEngine {
                         let mut env = Environment::new(num_players, &stacks, bb_size, sb_size, button_idx);
                         env.reset_hand(&mut rng, button_idx);
 
-                        let mut episode_transitions: Vec<(usize, Vec<f32>, ActionMask, Action)> = Vec::new();
+                        let mut episode: Vec<(usize, Vec<f32>, ActionMask, Action)> = Vec::new();
 
-                        // Run Hand steps
-                        loop {
+                        while env.state.street != Street::Showdown {
                             let curr_p = env.state.current_player_idx;
                             let mask = env.get_action_mask();
+                            if mask.0 == 0 {
+                                break;
+                            }
                             let features = env.state.encode_features(curr_p);
 
                             let action = policy.select_action(&features, &mask);
-                            episode_transitions.push((curr_p, features, mask, action));
+                            episode.push((curr_p, features, mask, action));
 
                             match env.step(action) {
-                                Ok(terminal) => {
-                                    if terminal {
-                                        break;
-                                    }
-                                }
+                                Ok(true) => break,
+                                Ok(false) => {}
                                 Err(_) => break,
                             }
                         }
 
-                        // Calculate Payoffs (Rewards) = End Stack - Starting Stack (in BB)
-                        for (p_idx, feat, mask, act) in episode_transitions {
+                        for (p_idx, feat, mask, act) in episode {
                             let start_s = starting_stacks[p_idx] as f32;
                             let end_s = env.state.players[p_idx].stack as f32;
                             let reward_bb = (end_s - start_s) / (bb_size as f32);
@@ -145,7 +143,7 @@ impl SelfPlayEngine {
                             };
 
                             if sender.send(transition).is_err() {
-                                return; // Receiver dropped, terminate worker
+                                return;
                             }
                         }
                     }
