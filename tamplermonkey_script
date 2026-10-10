@@ -1,0 +1,50 @@
+// ==UserScript==
+// @name         PokerNow to Localhost Forwarder (Full Frame Capture)
+// @namespace    http://tampermonkey.net/
+// @version      6.0
+// @description  Bat tron 100% goi tin lon va nho
+// @match        *://pokernow.com/*
+// @match        *://*.pokernow.com/*
+// @match        *://pokernow.club/*
+// @match        *://*.pokernow.club/*
+// @include      *pokernow*
+// @run-at       document-start
+// @grant        unsafeWindow
+// @grant        GM_xmlhttpRequest
+// @connect      127.0.0.1
+// @connect      localhost
+// ==/UserScript==
+
+(function() {
+    'use strict';
+    console.log("⚡ [Tampermonkey v6.0] Bắt đầu bắt trọn vẹn 100% gói tin!");
+
+    function sendToRust(payload) {
+        GM_xmlhttpRequest({
+            method: "POST",
+            url: "http://127.0.0.1:3000/packet",
+            headers: { "Content-Type": "application/json" },
+            data: payload
+        });
+    }
+
+    const win = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    const OrigWebSocket = win.WebSocket;
+
+    win.WebSocket = function(...args) {
+        const ws = new OrigWebSocket(...args);
+
+        ws.addEventListener('message', (event) => {
+            const raw = event.data;
+            if (typeof raw === 'string') {
+                // Bắt mọi gói tin sự kiện Socket.io: 42[..., 420[..., 421[...
+                const match = raw.match(/^42\d*(\[.+\])$/s);
+                if (match) {
+                    sendToRust(match[1]);
+                }
+            }
+        });
+
+        return ws;
+    };
+})();

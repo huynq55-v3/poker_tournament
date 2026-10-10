@@ -13,27 +13,33 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 const ADV_MODEL_PATH: &str = "deep_cfr_model.json";
-const STRAT_MODEL_PATH: &str = "deep_cfr_strategy.json";
 
 fn new_untrained_net() -> MLP {
     MLP::new(&[FEATURE_DIM, 256, 256, 128, NUM_ACTIONS])
 }
 
-/// Load advantage net + (tùy chọn) strategy net, kiểm tra tương thích số chiều input.
+/// Nạp 1 model tùy ý từ đường dẫn chỉ định
+fn load_model_from_path(path: &std::path::Path) -> Result<(MLP, String), String> {
+    match MLP::load_from_file(path) {
+        Ok(adv) if adv.input_dim() == FEATURE_DIM => {
+            let filename = path.file_name().unwrap_or_default().to_string_lossy();
+            Ok((adv, format!("🟢 Loaded: {}", filename)))
+        }
+        Ok(adv) => Err(format!(
+            "🔴 Input dim không khớp: model có {} chiều, yêu cầu {} chiều!",
+            adv.input_dim(),
+            FEATURE_DIM
+        )),
+        Err(e) => Err(format!("🔴 Lỗi đọc file: {}", e)),
+    }
+}
+
+/// Load advantage net mặc định từ ADV_MODEL_PATH
 fn load_models() -> (MLP, Option<MLP>, String) {
     match MLP::load_from_file(ADV_MODEL_PATH) {
         Ok(adv) if adv.input_dim() == FEATURE_DIM => {
-            /// let strat = MLP::load_from_file(STRAT_MODEL_PATH)
-            ///    .ok()
-            ///    .filter(|m| m.input_dim() == FEATURE_DIM);
-            
-            let strat: Option<MLP> = None; // advantage net (regret matching) đang chơi tốt hơn
-            
-            let status = if strat.is_some() {
-                "🟢 Loaded Advantage + Strategy nets"
-            } else {
-                "🟡 Loaded Advantage net only (no strategy net -> regret matching)"
-            };
+            let strat: Option<MLP> = None; // Advantage net (regret matching) chơi sắc bén nhất
+            let status = "🟢 Loaded Advantage Net (Regret Matching)";
             (adv, strat, status.to_string())
         }
         Ok(_) => (
@@ -44,7 +50,7 @@ fn load_models() -> (MLP, Option<MLP>, String) {
         Err(_) => (
             new_untrained_net(),
             None,
-            "🟡 Untrained Model (Click 'Train AI' or run main to train)".to_string(),
+            "🟡 Untrained Model (Nạp model hoặc train mới)".to_string(),
         ),
     }
 }
@@ -73,8 +79,8 @@ pub struct PokerGuiApp {
 
 impl PokerGuiApp {
     pub fn new(num_seats: usize) -> Self {
-            let _ = crate::equity::preflop_table(); // build/load trước để không đứng ở frame đầu
-            
+        let _ = crate::equity::preflop_table(); // Build/load trước để không giật ở frame đầu
+
         let num_seats = num_seats.clamp(2, 8);
         let schedule = TournamentBlindSchedule::new(num_seats);
         let current_blind = schedule.current_level();
@@ -89,7 +95,6 @@ impl PokerGuiApp {
 
         let (adv, strat, status) = load_models();
         let advantage_net = Arc::new(RwLock::new(adv));
-        // Bot dùng chiến lược ngẫu nhiên hóa (sample), không phải argmax -> khó bị khai thác hơn
         let policy = DeepCFRPolicy::with_strategy(Arc::clone(&advantage_net), strat, false);
 
         let mut app = Self {
@@ -121,7 +126,34 @@ impl PokerGuiApp {
         app
     }
 
-    /// Reset and start a completely new tournament with `seats` players (2 to 8)
+    /// Mở native file dialog cho phép chọn model .json bất kỳ
+    pub fn open_file_and_load_model(&mut self) {
+        let file_opt = rfd::FileDialog::new()
+            .add_filter("Neural Network Model (*.json)", &["json"])
+            .set_title("Chọn model Deep CFR để nạp...")
+            .pick_file();
+
+        if let Some(path) = file_opt {
+            match load_model_from_path(&path) {
+                Ok((adv, status_msg)) => {
+                    if let Ok(mut net) = self.policy.advantage_net.write() {
+                        *net = adv;
+                    }
+                    if let Ok(mut strat) = self.policy.strategy_net.write() {
+                        *strat = None;
+                    }
+                    self.model_status = status_msg.clone();
+                    self.action_logs.push(format!("💾 Đã nạp thành công: {:?}", path.file_name().unwrap()));
+                }
+                Err(err_msg) => {
+                    self.model_status = err_msg.clone();
+                    self.action_logs.push(format!("⚠️ {}", err_msg));
+                }
+            }
+        }
+    }
+
+    /// Reset và bắt đầu giải đấu hoàn toàn mới
     pub fn start_new_tournament(&mut self, seats: usize) {
         self.num_seats = seats.clamp(2, 8);
         self.selected_num_seats = self.num_seats;
@@ -162,8 +194,6 @@ impl PokerGuiApp {
         ));
     }
 
-    /// Gọi ngay sau env.reset_hand(). Xử lý cả trường hợp hand kết thúc ngay
-    /// (ví dụ tất cả đã all-in vì blind).
     fn begin_hand(&mut self) {
         self.env.state.players[self.hero_seat].is_bot = false;
         self.hand_in_progress = true;
@@ -179,6 +209,7 @@ impl PokerGuiApp {
     fn start_next_hand(&mut self) {
         let surviving = self.surviving_players();
 
+        // Chỉ còn 1 người có chip -> Tournament kết thúc
         if surviving.len() <= 1 {
             self.tournament_over = true;
             self.hand_in_progress = false;
@@ -196,10 +227,15 @@ impl PokerGuiApp {
         }
 
         self.hand_number += 1;
-        // ✅ FIX: tiến button từ button THỰC TẾ của engine (đã map sang người còn sống)
-        self.button_idx = (self.env.state.button_idx + 1) % self.num_seats;
 
-        // ✅ FIX: blind chỉ áp dụng từ đầu ván mới, không đổi giữa hand
+        // Tiến button: Chỉ trao button cho người THỰC SỰ CÒN CHIP (stack > 0)
+        let curr_btn = self.env.state.button_idx;
+        let mut next_btn = (curr_btn + 1) % self.num_seats;
+        while self.env.state.players[next_btn].stack == 0 {
+            next_btn = (next_btn + 1) % self.num_seats;
+        }
+        self.button_idx = next_btn;
+
         let curr_bl = self.blind_schedule.current_level();
         self.env.state.bb_size = curr_bl.bb;
         self.env.state.sb_size = curr_bl.sb;
@@ -220,7 +256,7 @@ impl PokerGuiApp {
     fn execute_action(&mut self, action: Action) {
         let actor = self.env.state.current_player_idx;
         let name = self.player_name(actor);
-        let street = self.env.state.street; // street TRƯỚC khi step
+        let street = self.env.state.street;
 
         let result = self.env.step(action);
         self.action_logs.push(format!("[{:?}] {} performed {}", street, name, action.name()));
@@ -246,11 +282,21 @@ impl PokerGuiApp {
         let announcement = format!("Hand ended. Remaining in hand: {}", remaining.join(", "));
         self.action_logs.push(announcement.clone());
 
-        // ✅ FIX: chỉ log ELIMINATED một lần cho mỗi người
+        // CHỈ GHI NHẬN ELIMINATED KHI VÁN BÀI ĐÃ CHIA XONG POT
+        // (Ai All-in mà THẮNG thì stack đã > 0, ai All-in mà THUA thì stack mới thực sự = 0)
         for i in 0..self.num_seats {
-            if self.env.state.players[i].stack == 0 && !self.eliminated_logged[i] {
+            let p = &mut self.env.state.players[i];
+            if p.stack == 0 && !self.eliminated_logged[i] {
                 self.eliminated_logged[i] = true;
-                let name = if i == self.hero_seat { "Hero (You)".to_string() } else { format!("Bot_{}", i) };
+                p.is_folded = true;
+                p.is_all_in = false;
+                p.hole_cards = [None, None];
+
+                let name = if i == self.hero_seat {
+                    "Hero (You)".to_string()
+                } else {
+                    format!("Bot_{}", i)
+                };
                 self.action_logs.push(format!("💀 {} ran out of chips and is ELIMINATED!", name));
             }
         }
@@ -282,8 +328,6 @@ impl PokerGuiApp {
         self.action_logs.push("💾 Neural Network reloaded from disk.".to_string());
     }
 
-    /// Train nhanh trong nền. KHÔNG ghi đè file model trên đĩa
-    /// (tránh phá model tốt đã train từ main). Dùng "Reload Model" để quay lại model trên đĩa.
     pub fn start_background_training(&mut self) {
         if self.is_training.load(Ordering::SeqCst) {
             return;
@@ -330,7 +374,7 @@ impl PokerGuiApp {
 
 impl eframe::App for PokerGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 1. Blind timer: chỉ báo, blind mới áp dụng từ ván sau
+        // 1. Blind timer
         if self.blind_schedule.update() {
             let nb = self.blind_schedule.current_level();
             self.action_logs.push(format!(
@@ -434,7 +478,10 @@ impl eframe::App for PokerGuiApp {
                         if ui.button("🏋️ Quick Train (10 Iter)").clicked() {
                             self.start_background_training();
                         }
-                        if ui.button("📂 Reload Model").clicked() {
+                        if ui.button("📂 Chọn & Nạp Model...").clicked() {
+                            self.open_file_and_load_model();
+                        }
+                        if ui.button("🔄 Reload Mặc Định").clicked() {
                             self.reload_model();
                         }
                     }
@@ -455,6 +502,16 @@ impl eframe::App for PokerGuiApp {
                 let mask = self.env.get_action_mask();
                 let feat = self.env.state.encode_features(curr_actor);
                 let probs = self.policy.get_action_probs(&feat, &mask);
+                
+                // SỬA THÀNH:
+                if curr_actor == self.hero_seat && self.hand_in_progress && !self.tournament_over {
+                    let raw = self.policy.advantage_net.read().unwrap().forward(&feat);
+                    println!("\n🔍 [DEBUG HERO]:");
+                    println!("   🃏 Bài tẩy : {:?}", self.env.state.players[curr_actor].hole_cards);
+                    println!("   🎭 Action Mask : {:?}", mask.to_bool_array());
+                    println!("   🧠 Raw Regrets : {:?}", &raw[..6]);
+                    println!("   📊 Probs xuất ra: {:?}", &probs[..6]);
+                }
 
                 for a_idx in 0..NUM_ACTIONS {
                     let act = Action::from_index(a_idx).unwrap();
@@ -529,9 +586,18 @@ impl eframe::App for PokerGuiApp {
                 let p = &self.env.state.players[i];
                 let is_actor = i == self.env.state.current_player_idx && self.hand_in_progress && !self.tournament_over;
                 let is_hero = i == self.hero_seat;
-                // ✅ FIX: người all-in rồi thua (stack = 0 sau khi hand kết thúc) phải hiện ELIMINATED
+
+                // CHUẨN XÁC: Chỉ Busted khi ván bài đã kết thúc VÀ stack = 0, HOẶC đã fold và stack = 0
+                // (Nếu đang all-in trong ván thì chưa tính là busted!)
                 let is_busted = p.stack == 0 && (!self.hand_in_progress || p.is_folded);
-                let pos_name = Position::for_seat(i, engine_button, num_p);
+                let alive_seats: Vec<usize> = self.env.state
+    .players
+    .iter()
+    .enumerate()
+    .filter(|(_, p)| p.stack > 0 || p.is_all_in)
+    .map(|(idx, _)| idx)
+    .collect();
+let pos_name = Position::for_seat_alive(i, engine_button, &alive_seats);
 
                 let seat_rect = egui::Rect::from_center_size(seat_pos, Vec2::new(138.0, 96.0));
 

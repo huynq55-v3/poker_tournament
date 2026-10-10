@@ -4,14 +4,8 @@ use serde::{Deserialize, Serialize};
 use crate::equity;
 use crate::poker_core::evaluator::evaluate_7_cards;
 
-pub const FEATURE_DIM: usize = 172; // 164 + 8 đặc trưng equity/draw/board
-
+pub const FEATURE_DIM: usize = 172;
 pub const MAX_PLAYERS: usize = 8;
-
-/// Số chiều vector đặc trưng (xem encode_features):
-/// 5 (sức mạnh bài) + 52 (hole) + 52 (board) + 8 (vị trí) + 2 (số người sống, heads-up)
-/// + 4 (street) + 4 (pot, to_call, my_stack, pot_odds) + 28 (7 đối thủ x 4) + 2 (raises, người trong ván)
-/// pub const FEATURE_DIM: usize = 157;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[repr(u8)]
@@ -36,23 +30,22 @@ pub enum Position {
 }
 
 impl Position {
-    pub fn for_seat(seat: usize, button: usize, num_players: usize) -> Self {
-        let rel_pos = (seat + num_players - button) % num_players;
-        if num_players == 2 {
-            // Heads-Up: Button is SB, Other is BB
-            if rel_pos == 0 {
-                Position::SB
-            } else {
-                Position::BB
-            }
+    pub fn for_seat_alive(seat: usize, button: usize, alive_seats: &[usize]) -> Self {
+        let num_alive = alive_seats.len().max(2);
+        let btn_pos = alive_seats.iter().position(|&s| s == button).unwrap_or(0);
+        let my_pos = alive_seats.iter().position(|&s| s == seat).unwrap_or(0);
+        let rel_pos = (my_pos + num_alive - btn_pos) % num_alive;
+
+        if num_alive == 2 {
+            if rel_pos == 0 { Position::SB } else { Position::BB }
         } else {
             match rel_pos {
                 0 => Position::BTN,
                 1 => Position::SB,
                 2 => Position::BB,
                 3 => Position::UTG,
-                4 => if num_players > 5 { Position::UTG1 } else { Position::CO },
-                5 => if num_players > 6 { Position::MP } else { Position::CO },
+                4 => if num_alive > 5 { Position::UTG1 } else { Position::CO },
+                5 => if num_alive > 6 { Position::MP } else { Position::CO },
                 6 => Position::HJ,
                 _ => Position::CO,
             }
@@ -122,8 +115,6 @@ pub struct GameState {
 }
 
 impl GameState {
-
-        /// (category/9, điểm mạnh 0..1). Preflop dùng công thức Chen, postflop dùng evaluator.
     fn hand_strength(&self, player_idx: usize) -> (f32, f32) {
         let p = &self.players[player_idx];
         let (Some(c0), Some(c1)) = (p.hole_cards[0], p.hole_cards[1]) else {
@@ -141,16 +132,14 @@ impl GameState {
             (0.0, chen_score(c0, c1))
         }
     }
-    
-        /// [equity, equity - pot_odds, equity x số người (so với phần chia công bằng),
-    ///  flush draw, straight draw, board có đôi, max cùng chất board, lá cao board]
+
     fn equity_features(&self, player_idx: usize, to_call: u32) -> [f32; 8] {
         let me = &self.players[player_idx];
         let (Some(c0), Some(c1)) = (me.hole_cards[0], me.hole_cards[1]) else {
             return [0.0; 8];
         };
         let in_hand = self.players.iter().filter(|p| p.is_in_hand()).count().max(1);
-        let eq = equity::equity_vs_random([c0, c1], &self.community_cards, in_hand - 1);
+        let eq = equity::equity_vs_random([c0, c1], &self.community_cards, in_hand.saturating_sub(1));
 
         let pot_odds = if to_call > 0 {
             to_call as f32 / (self.pot + to_call) as f32
@@ -171,7 +160,6 @@ impl GameState {
         ]
     }
 
-    /// Compute effective stack of `player_idx` vs all remaining opponents in BB
     pub fn effective_stack_bb(&self, player_idx: usize) -> f32 {
         let player_stack = self.players[player_idx].stack + self.players[player_idx].current_bet;
         let mut max_opp_stack = 0u32;
@@ -187,9 +175,8 @@ impl GameState {
         eff_chips as f32 / self.bb_size as f32
     }
 
-    /// Vector đặc trưng theo góc nhìn của `player_idx` (độ dài = FEATURE_DIM).
-    /// Đối thủ được sắp xếp XOAY theo ghế của người chơi (ghế kế tiếp theo chiều kim đồng hồ
-    /// là slot 0) nên mạng không phải học lại cùng một tình huống cho từng ghế tuyệt đối.
+    /// Mã hóa vector đặc trưng chuẩn xác:
+    /// Nén và đồng bộ tuyệt đối giữa số người còn sống thực tế và mạng lúc train.
     pub fn encode_features(&self, player_idx: usize) -> Vec<f32> {
         let mut f = Vec::with_capacity(FEATURE_DIM);
         let bb = self.bb_size as f32;
@@ -222,7 +209,7 @@ impl GameState {
         }
         f.extend_from_slice(&board_vec);
 
-        // 3. Vị trí tương đối so với button trong số người còn sống (8) + số người sống + cờ heads-up (2)
+        // 3. Vị trí tương đối dựa trên danh sách người THỰC SỰ CÒN SỐNG (8 + 2)
         let alive: Vec<usize> = self
             .players
             .iter()
@@ -254,20 +241,31 @@ impl GameState {
         let denom = (self.pot + to_call) as f32;
         f.push(if denom > 0.0 { to_call as f32 / denom } else { 0.0 });
 
-        // 6. 7 đối thủ theo thứ tự xoay: stack, bet hiện tại, còn trong ván, all-in (28)
-        for k in 1..MAX_PLAYERS {
-            if k < self.num_players {
-                let o = &self.players[(player_idx + k) % self.num_players];
+        // 6. 7 đối thủ theo thứ tự xoay tròn:
+        // CHỈ LẤY CÁC ĐỐI THỦ CÒN SỐNG TRONG VÒNG BÀN (BỎ QUA GHẾ BỊ ELIMINATED)
+        // Điều này đảm bảo vector luôn tương thích 100% với môi trường lúc train!
+        let mut opp_count = 0;
+        let mut step = 1;
+        while opp_count < (MAX_PLAYERS - 1) && step < self.num_players {
+            let seat = (player_idx + step) % self.num_players;
+            let o = &self.players[seat];
+            if o.stack > 0 || o.is_all_in {
                 f.push(o.stack as f32 / (bb * 100.0));
                 f.push(o.current_bet as f32 / (bb * 20.0));
                 f.push(if o.is_in_hand() { 1.0 } else { 0.0 });
                 f.push(if o.is_all_in { 1.0 } else { 0.0 });
-            } else {
-                f.extend_from_slice(&[0.0; 4]);
+                opp_count += 1;
             }
+            step += 1;
         }
 
-        // 7. Tóm tắt lịch sử: số lần raise trong street hiện tại, số người còn trong ván (2)
+        // Đệm 0.0 cho các slot trống còn lại
+        while opp_count < (MAX_PLAYERS - 1) {
+            f.extend_from_slice(&[0.0; 4]);
+            opp_count += 1;
+        }
+
+        // 7. Tóm tắt lịch sử (2)
         let raises = self
             .action_history
             .iter()
@@ -282,8 +280,8 @@ impl GameState {
         f.push((raises as f32 / 4.0).min(1.0));
         let in_hand = self.players.iter().filter(|p| p.is_in_hand()).count();
         f.push(in_hand as f32 / MAX_PLAYERS as f32);
-        
-                // 8. Ngữ cảnh push/fold & sức mạnh bài (7)
+
+        // 8. Ngữ cảnh push/fold & sức mạnh bài (7)
         let eff_bb = self.effective_stack_bb(player_idx);
         f.push((eff_bb / 100.0).min(1.0));
         f.push(if eff_bb < 12.0 { 1.0 } else { 0.0 });
@@ -291,20 +289,19 @@ impl GameState {
         let my_stack = me.stack as f32;
         f.push(if my_stack > 0.0 { (to_call as f32 / my_stack).min(1.0) } else { 1.0 });
         let pot_after = (self.pot + to_call) as f32;
-        f.push(if pot_after > 0.0 { (my_stack / pot_after / 20.0).min(1.0) } else { 0.0 }); // SPR
+        f.push(if pot_after > 0.0 { (my_stack / pot_after / 20.0).min(1.0) } else { 0.0 });
         let (cat, strength) = self.hand_strength(player_idx);
         f.push(cat);
         f.push(strength);
-        
-                // 9. Equity & draw & board texture (8)
+
+        // 9. Equity & draw & board texture (8)
         f.extend_from_slice(&self.equity_features(player_idx, to_call));
 
-                assert_eq!(f.len(), FEATURE_DIM, "encode_features length mismatch");
+        debug_assert_eq!(f.len(), FEATURE_DIM, "encode_features length mismatch");
         f
     }
 }
 
-/// Công thức Chen chuẩn hóa về 0..1
 fn chen_score(c0: Card, c1: Card) -> f32 {
     fn pts(r: u8) -> f32 {
         match r {

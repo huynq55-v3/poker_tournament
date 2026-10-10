@@ -46,7 +46,8 @@ impl TableViewModel {
             Street::Turn => "Turn",
             Street::River => "River",
             Street::Showdown => "Showdown",
-        }.to_string();
+        }
+        .to_string();
 
         let board_strs: Vec<String> = state
             .community_cards
@@ -56,8 +57,17 @@ impl TableViewModel {
 
         let mut player_vms = Vec::with_capacity(state.num_players);
 
+        // Lấy danh sách những người thực sự còn sống để gán vị trí chuẩn
+        let alive_seats: Vec<usize> = state
+            .players
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.stack > 0 || p.is_all_in)
+            .map(|(idx, _)| idx)
+            .collect();
+
         for (i, p) in state.players.iter().enumerate() {
-            let pos = Position::for_seat(i, state.button_idx, state.num_players);
+            let pos = Position::for_seat_alive(i, state.button_idx, &alive_seats);
             let pos_str = format!("{:?}", pos);
 
             let cards = if reveal_all_cards || !p.is_bot || state.street == Street::Showdown {
@@ -83,7 +93,11 @@ impl TableViewModel {
 
             player_vms.push(PlayerViewModel {
                 seat_idx: i,
-                name: if p.is_bot { format!("Bot_{}", i) } else { format!("Hero_{}", i) },
+                name: if p.is_bot {
+                    format!("Bot_{}", i)
+                } else {
+                    format!("Hero_{}", i)
+                },
                 position: pos_str,
                 stack: p.stack,
                 stack_bb: p.stack as f32 / state.bb_size as f32,
@@ -110,7 +124,10 @@ impl TableViewModel {
             .map(|rec| {
                 format!(
                     "[{:?}] Player {} -> {} (chips: {})",
-                    rec.street, rec.player_idx, rec.action.name(), rec.amount
+                    rec.street,
+                    rec.player_idx,
+                    rec.action.name(),
+                    rec.amount
                 )
             })
             .collect();

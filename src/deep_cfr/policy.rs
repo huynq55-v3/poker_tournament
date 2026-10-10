@@ -8,7 +8,6 @@ use std::sync::{Arc, RwLock};
 
 pub struct DeepCFRPolicy {
     pub advantage_net: Arc<RwLock<MLP>>,
-    /// Mạng chiến lược trung bình (nếu có thì dùng để chơi; nếu None thì dùng regret matching)
     pub strategy_net: Arc<RwLock<Option<MLP>>>,
     pub is_greedy: bool,
 }
@@ -34,20 +33,10 @@ impl DeepCFRPolicy {
         }
     }
 
-    fn uniform_over_legal(mask: &ActionMask) -> [f32; NUM_ACTIONS] {
-        let mut probs = [0.0f32; NUM_ACTIONS];
-        let legal = mask.valid_actions();
-        if !legal.is_empty() {
-            let p = 1.0 / legal.len() as f32;
-            for a in legal {
-                probs[a.to_index()] = p;
-            }
-        }
-        probs
-    }
-
-    /// Regret matching chuẩn: tỉ lệ theo regret dương; nếu không có regret dương
-    /// -> phân phối ĐỀU trên các action hợp lệ (tổng luôn = 1).
+    /// Regret Matching chuẩn:
+    /// - Nếu có Regret dương đáng kể (> 1e-4) -> chuẩn hóa tỉ lệ.
+    /// - Nếu toàn bộ Regret âm hoặc sát 0 -> chọn hành động có Regret cao nhất (Argmax / EV cao nhất),
+    ///   hoặc Sharp Softmax (T = 0.03) để tránh việc chia đều xác suất cho All-in/Fold rác.
     pub fn compute_regret_matching_probs(
         raw_advantages: &[f32],
         mask: &ActionMask,
@@ -63,34 +52,69 @@ impl DeepCFRPolicy {
             }
         }
 
-        if pos_sum > 1e-6 {
+        if pos_sum > 1e-4 {
             for p in &mut probs {
                 *p /= pos_sum;
             }
             probs
         } else {
-            Self::uniform_over_legal(mask)
+            // Khi toàn bộ Regret đều âm hoặc trong ngưỡng nhiễu:
+            // Tìm hành động hợp lệ có giá trị regret lớn nhất (Argmax)
+            let mut best_idx = None;
+            let mut best_val = f32::NEG_INFINITY;
+
+            for (a_idx, &adv) in raw_advantages.iter().enumerate().take(NUM_ACTIONS) {
+                if mask.is_index_valid(a_idx) && adv > best_val {
+                    best_val = adv;
+                    best_idx = Some(a_idx);
+                }
+            }
+
+            if let Some(idx) = best_idx {
+                probs[idx] = 1.0;
+            } else if let Some(first) = mask.valid_actions().first() {
+                probs[first.to_index()] = 1.0;
+            }
+
+            probs
         }
     }
 
-    /// Output của strategy net -> xác suất hợp lệ (clamp >= 0, mask, chuẩn hóa)
+    /// Trích xuất xác suất từ Strategy Net (Average Strategy)
     pub fn compute_strategy_probs(raw: &[f32], mask: &ActionMask) -> [f32; NUM_ACTIONS] {
         let mut probs = [0.0f32; NUM_ACTIONS];
         let mut sum = 0.0f32;
+
         for (a_idx, &v) in raw.iter().enumerate().take(NUM_ACTIONS) {
             if mask.is_index_valid(a_idx) {
-                let p = v.max(0.0);
+                // Chỉ lấy các giá trị dương thực sự, bỏ qua nhiễu cận 0
+                let p = if v > 0.005 { v } else { 0.0 };
                 probs[a_idx] = p;
                 sum += p;
             }
         }
-        if sum > 1e-6 {
+
+        if sum > 1e-4 {
             for p in &mut probs {
                 *p /= sum;
             }
             probs
         } else {
-            Self::uniform_over_legal(mask)
+            // Fallback: chọn hành động hợp lệ có giá trị lớn nhất trong output
+            let mut best_idx = None;
+            let mut best_val = f32::NEG_INFINITY;
+            for (a_idx, &v) in raw.iter().enumerate().take(NUM_ACTIONS) {
+                if mask.is_index_valid(a_idx) && v > best_val {
+                    best_val = v;
+                    best_idx = Some(a_idx);
+                }
+            }
+            if let Some(idx) = best_idx {
+                probs[idx] = 1.0;
+            } else if let Some(first) = mask.valid_actions().first() {
+                probs[first.to_index()] = 1.0;
+            }
+            probs
         }
     }
 }
@@ -116,12 +140,7 @@ impl Policy for DeepCFRPolicy {
             let chosen_idx = dist.sample(&mut rng);
             Action::from_index(chosen_idx).unwrap_or(Action::Fold)
         } else {
-            let valid = mask.valid_actions();
-            if valid.is_empty() {
-                Action::Fold
-            } else {
-                valid[0]
-            }
+            mask.valid_actions().first().copied().unwrap_or(Action::Fold)
         }
     }
 

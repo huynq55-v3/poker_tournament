@@ -12,80 +12,33 @@ use rand::Rng;
 use rayon::prelude::*;
 use std::sync::{Arc, RwLock};
 
-/// Số node của traverser được rẽ nhánh đầy đủ trên một đường đi
-const MAX_BRANCH_DEPTH: usize = 4;
-const ICM_SCALE: f32 = 10.0;
+/// Độ sâu tối đa cho traverser rẽ nhánh. 8 lượt đủ bao quát Preflop, Flop, Turn và River
+/// (mỗi vòng 2 lượt hành động kể cả re-raise) mà không bị bùng nổ vì đối thủ chỉ sample 1 nhánh.
+const MAX_BRANCH_DEPTH: usize = 8;
 
-fn payout_structure(num_players: usize) -> Vec<f32> {
-    match num_players {
-        0..=2 => vec![1.0],
-        3 => vec![0.65, 0.35],
-        4..=5 => vec![0.5, 0.3, 0.2],
-        _ => vec![0.4, 0.3, 0.2, 0.1],
-    }
-}
-
-/// ICM Malmuth-Harville
-pub fn icm_equity(stacks: &[f32], payouts: &[f32]) -> Vec<f32> {
-    fn rec(stacks: &[f32], remaining: u32, place: usize, prob: f32, payouts: &[f32], eq: &mut [f32]) {
-        if place >= payouts.len() {
-            return;
-        }
-        let mut total = 0.0f32;
-        for (i, &s) in stacks.iter().enumerate() {
-            if remaining & (1 << i) != 0 {
-                total += s;
-            }
-        }
-        if total <= 0.0 {
-            return;
-        }
-        for i in 0..stacks.len() {
-            if remaining & (1 << i) != 0 && stacks[i] > 0.0 {
-                let p = prob * stacks[i] / total;
-                eq[i] += p * payouts[place];
-                rec(stacks, remaining & !(1 << i), place + 1, p, payouts, eq);
-            }
-        }
-    }
-    let n = stacks.len();
-    let mut eq = vec![0.0f32; n];
-    let all = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
-    rec(stacks, all, 0, 1.0, payouts, &mut eq);
-    eq
-}
-
-/// Hàm thưởng cho 1 traverser trong 1 ván. `before` (equity ICM ban đầu) tính 1 lần.
+/// Hàm thưởng cho 1 traverser: Chip-EV chuẩn hóa chia cho 10 BB
 struct Payoff {
     traverser: usize,
     start_stack: f32,
-    payouts: Vec<f32>,
-    before: f32,
-    use_icm: bool,
     bb: f32,
 }
 
 impl Payoff {
-    fn new(start: &[f32], traverser: usize, use_icm: bool, bb: f32) -> Self {
-        let payouts = payout_structure(start.len());
-        let before = if use_icm { icm_equity(start, &payouts)[traverser] } else { 0.0 };
-        Payoff { traverser, start_stack: start[traverser], payouts, before, use_icm, bb }
+    fn new(start: &[f32], traverser: usize, bb: f32) -> Self {
+        Payoff {
+            traverser,
+            start_stack: start[traverser],
+            bb,
+        }
     }
 
+    #[inline(always)]
     fn eval(&self, env: &Environment) -> f32 {
-        if self.use_icm {
-            let end: Vec<f32> = env.state.players.iter().map(|p| p.stack as f32).collect();
-            let after = icm_equity(&end, &self.payouts)[self.traverser];
-            (after - self.before) * 100.0 / ICM_SCALE
-        } else {
-            // chip-EV, đơn vị BB / 10 (cùng bậc độ lớn với ICM)
-            let end = env.state.players[self.traverser].stack as f32;
-            (end - self.start_stack) / self.bb / 10.0
-        }
+        let end = env.state.players[self.traverser].stack as f32;
+        (end - self.start_stack) / self.bb / 10.0
     }
 }
 
-/// Ngữ cảnh của 1 luồng traversal: mạng chỉ đọc + buffer riêng
 struct Ctx<'a> {
     net: &'a MLP,
     adv_out: Vec<AdvantageSample>,
@@ -139,6 +92,7 @@ fn traverse<R: Rng>(env: &mut Environment, ctx: &mut Ctx, pay: &Payoff, rng: &mu
     let strat = DeepCFRPolicy::compute_regret_matching_probs(&raw, &mask);
 
     if curr == pay.traverser {
+        // Nếu vượt quá độ sâu tối đa, chỉ lấy mẫu 1 hành động đi tiếp
         if depth >= MAX_BRANCH_DEPTH {
             let a = sample_action(&strat, &mask, rng);
             return step_and_continue(env, a, ctx, pay, rng, depth);
@@ -168,6 +122,7 @@ fn traverse<R: Rng>(env: &mut Environment, ctx: &mut Ctx, pay: &Payoff, rng: &mu
         });
         expected
     } else {
+        // Đối thủ chỉ lấy mẫu 1 nhánh theo chiến lược hiện tại
         ctx.strat_out.push(StrategySample {
             features,
             action_probs: strat.to_vec(),
@@ -188,16 +143,10 @@ pub struct DeepCFRTrainer {
     pub iteration: usize,
     pub lr: f32,
     pub weight_decay: f32,
-    /// false = chip-EV (giai đoạn đầu), true = ICM
-    pub use_icm: bool,
-    /// Some(n) = luôn train bàn n người; None = ngẫu nhiên 2..=8
     pub fixed_players: Option<usize>,
 }
 
 impl DeepCFRTrainer {
-
-    /// Nạp 2 mạng từ file để train tiếp. Replay buffer vẫn rỗng, optimizer được reset.
-    /// Trả về Ok(true) nếu nạp được cả strategy net.
     pub fn load_models(&mut self, adv_path: &str, strat_path: &str) -> Result<bool, String> {
         let expected = self.advantage_net.read().unwrap().layer_dims();
 
@@ -222,7 +171,7 @@ impl DeepCFRTrainer {
             _ => Ok(false),
         }
     }
-    
+
     pub fn new(input_dim: usize, hidden_dims: &[usize], capacity: usize) -> Self {
         let mut dims = Vec::with_capacity(hidden_dims.len() + 2);
         dims.push(input_dim);
@@ -238,7 +187,6 @@ impl DeepCFRTrainer {
             iteration: 0,
             lr: 0.001,
             weight_decay: 1e-4,
-            use_icm: false,
             fixed_players: None,
         }
     }
@@ -260,7 +208,6 @@ impl DeepCFRTrainer {
         n.train_batch(&inputs, &targets, Some(&norm), Some(&masks), loss, lr, weight_decay)
     }
 
-    /// Trả về adv_loss trung bình. Traversal và gradient đều chạy song song.
     pub fn step_iteration<R: Rng>(
         &mut self,
         num_traversals: usize,
@@ -272,22 +219,27 @@ impl DeepCFRTrainer {
         let iter_weight = self.iteration as f32; // Linear CFR
         let bb_size = 100u32;
         let sb_size = 50u32;
-        let use_icm = self.use_icm;
         let fixed = self.fixed_players;
 
-        // 1. Traversal song song trên snapshot của mạng
         let snapshot: MLP = self.advantage_net.read().unwrap().clone();
         let results: Vec<(Vec<AdvantageSample>, Vec<StrategySample>)> = (0..num_traversals)
             .into_par_iter()
             .map(|_| {
                 let mut trng = rand::thread_rng();
-                let n = fixed.unwrap_or_else(|| trng.gen_range(2..=8));
+                let n = fixed.unwrap_or_else(|| {
+                    // Ưu tiên bàn 6 đến 8 người nhiều hơn (70% bàn 6-8 người)
+                    if trng.gen_bool(0.70) {
+                        trng.gen_range(6..=8)
+                    } else {
+                        trng.gen_range(2..=5)
+                    }
+                });
                 let button = trng.gen_range(0..n);
-                let stacks = if trng.gen_bool(0.35) {
-    TournamentStackSampler::sample_equal_stacks(&mut trng, n, bb_size)
-} else {
-    TournamentStackSampler::sample_dirichlet_stacks(&mut trng, n, bb_size)
-};
+                let stacks = if trng.gen_bool(0.40) {
+                    TournamentStackSampler::sample_equal_stacks(&mut trng, n, bb_size)
+                } else {
+                    TournamentStackSampler::sample_dirichlet_stacks(&mut trng, n, bb_size)
+                };
                 let start: Vec<f32> = stacks.iter().map(|&s| s as f32).collect();
 
                 let mut ctx = Ctx {
@@ -299,7 +251,7 @@ impl DeepCFRTrainer {
                 for t in 0..n {
                     let mut env = Environment::new(n, &stacks, bb_size, sb_size, button);
                     env.reset_hand(&mut trng, button);
-                    let pay = Payoff::new(&start, t, use_icm, bb_size as f32);
+                    let pay = Payoff::new(&start, t, bb_size as f32);
                     traverse(&mut env, &mut ctx, &pay, &mut trng, 0);
                 }
                 (ctx.adv_out, ctx.strat_out)
@@ -315,7 +267,7 @@ impl DeepCFRTrainer {
             }
         }
 
-        // 2. Train advantage net
+        // Train Advantage Network (Huber Loss)
         let mut adv_loss = 0.0f32;
         if self.adv_memory.len() >= batch_size && train_steps_per_iter > 0 {
             for _ in 0..train_steps_per_iter {
@@ -331,7 +283,7 @@ impl DeepCFRTrainer {
             adv_loss /= train_steps_per_iter as f32;
         }
 
-        // 3. Train strategy net (average strategy)
+        // Train Strategy Network (MSE)
         if train_steps_per_iter > 0 && self.strategy_memory.len() >= batch_size {
             let steps = (train_steps_per_iter / 2).max(1);
             for _ in 0..steps {
@@ -363,20 +315,5 @@ impl DeepCFRTrainer {
             }
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_icm_sums_to_one() {
-        let stacks = vec![1000.0, 500.0, 300.0, 200.0];
-        let payouts = vec![0.5, 0.3, 0.2];
-        let eq = icm_equity(&stacks, &payouts);
-        let sum: f32 = eq.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-4, "sum = {}", sum);
-        assert!(eq[0] > eq[1] && eq[1] > eq[2]);
     }
 }
