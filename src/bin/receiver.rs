@@ -1,4 +1,5 @@
 use poker_tournament::deep_cfr::DeepCFRPolicy;
+use poker_tournament::environment::state::ActionRecord;
 use poker_tournament::environment::{Action, Environment, PlayerState, Street};
 use poker_tournament::neural_network::MLP;
 use poker_tournament::poker_core::card::Card;
@@ -47,6 +48,9 @@ struct HandState {
     min_raise: u32,
     bb_size: u32,
     sb_size: u32,
+    dealer_id: Option<String>,
+    dealer_seat: Option<usize>,
+    action_history: Vec<ActionRecord>,
     players: HashMap<String, PlayerTracker>,
     player_order: Vec<String>,
     has_evaluated_this_decision: bool,
@@ -65,6 +69,9 @@ impl HandState {
             min_raise: 20,
             bb_size: 20,
             sb_size: 10,
+            dealer_id: None,
+            dealer_seat: None,
+            action_history: Vec::new(),
             players: HashMap::new(),
             player_order: Vec::new(),
             has_evaluated_this_decision: false,
@@ -82,6 +89,9 @@ impl HandState {
         self.highest_bet = 0;
         self.street = Street::Preflop;
         self.has_evaluated_this_decision = false;
+        self.dealer_id = None;
+        self.dealer_seat = None;
+        self.action_history.clear();
         for p in self.players.values_mut() {
             p.current_bet = 0;
             p.is_folded = false;
@@ -275,6 +285,14 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
         }
     }
 
+    // Cập nhật vị trí Button (Dealer)
+    if let Some(did) = payload.get("dealerID").and_then(|v| v.as_str()) {
+        state.dealer_id = Some(did.to_string());
+    }
+    if let Some(dseat) = payload.get("dealerSeat").and_then(|v| v.as_u64()) {
+        state.dealer_seat = Some(dseat as usize);
+    }
+
     // Cập nhật mức cược hiện tại của từng người chơi (tB)
     if let Some(tb_obj) = payload.get("tB").and_then(|v| v.as_object()) {
         for (pid, bval) in tb_obj {
@@ -282,8 +300,20 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
                 id: pid.clone(),
                 ..Default::default()
             });
+            let prev_bet = entry.current_bet;
             if let Some(amt) = bval.as_u64() {
-                entry.current_bet = amt as u32;
+                let new_bet = amt as u32;
+                if new_bet > prev_bet && new_bet > state.bb_size {
+                    // Xác định player_idx trong player_order để tạo ActionRecord
+                    let p_idx = state.player_order.iter().position(|id| id == pid).unwrap_or(0);
+                    state.action_history.push(ActionRecord {
+                        player_idx: p_idx,
+                        street: state.street,
+                        action: Action::BetPot100, // Đại diện cho hành động raise/bet được tính trong encode_features
+                        amount: new_bet,
+                    });
+                }
+                entry.current_bet = new_bet;
             } else if bval.as_str() == Some("<D>") {
                 entry.current_bet = 0;
             }
@@ -421,7 +451,16 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
         env_players.push(ps);
     }
 
-    let mut env = Environment::new(num_players, &initial_stacks, state.bb_size, state.sb_size, 0);
+    // Xác định vị trí Dealer Button trong số các ghế hiện tại
+    let button_idx = if let Some(ref did) = state.dealer_id {
+        seat_ids.iter().position(|id| id == did).unwrap_or(0)
+    } else if let Some(dseat) = state.dealer_seat {
+        dseat.saturating_sub(1).min(num_players - 1)
+    } else {
+        0
+    };
+
+    let mut env = Environment::new(num_players, &initial_stacks, state.bb_size, state.sb_size, button_idx);
 
     // 2. Đồng bộ toàn bộ trạng thái thực tế vào env
     let total_pot = state.total_pot().max(state.bb_size + state.sb_size);
@@ -430,6 +469,8 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     env.state.community_cards = state.community_cards.clone();
     env.state.street = state.street;
     env.state.current_player_idx = hero_seat;
+    env.state.button_idx = button_idx;
+    env.state.action_history = state.action_history.clone();
     env.state.players = env_players; // <-- NẠP TOÀN BỘ ĐỐI THỦ THẬT VÀO ĐÂY!
 
     let hero_bet = state.players.get(&state.hero_id).map(|p| p.current_bet).unwrap_or(0);
