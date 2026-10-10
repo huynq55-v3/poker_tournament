@@ -361,13 +361,20 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
     if let Some(gt_arr) = payload.get("gT").and_then(|v| v.as_array()) {
         if gt_arr.len() >= 2 {
             if let Some(st_num) = gt_arr[1].as_u64() {
-                state.street = match st_num {
+                let new_street = match st_num {
                     0 => Street::Preflop,
                     1 => Street::Flop,
                     2 => Street::Turn,
                     3 => Street::River,
                     _ => Street::Showdown,
                 };
+                if new_street != state.street {
+                    state.street = new_street;
+                    state.highest_bet = 0;
+                    for p in state.players.values_mut() {
+                        p.current_bet = 0;
+                    }
+                }
             }
         }
     }
@@ -423,16 +430,31 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
 
 /// ĐỒNG BỘ 100% ĐỐI THỦ VÀO MÔI TRƯỜNG & CHẠY GTO
 fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy) {
-    let seat_ids: Vec<String> = if !state.player_order.is_empty() {
+    // 1. Chỉ lấy danh sách người chơi THỰC SỰ ĐANG CÓ MẶT TRÊN BÀN (bỏ qua người đã bị loại khỏi bàn)
+    let ordered_ids: Vec<String> = if !state.player_order.is_empty() {
         state.player_order.clone()
     } else {
         state.players.keys().cloned().collect()
     };
 
+    let seat_ids: Vec<String> = ordered_ids
+        .into_iter()
+        .filter(|id| {
+            if id == &state.hero_id {
+                return true;
+            }
+            if let Some(p) = state.players.get(id) {
+                p.stack > 0 || p.current_bet > 0 || p.is_all_in
+            } else {
+                false
+            }
+        })
+        .collect();
+
     let num_players = seat_ids.len().clamp(2, 8);
     let hero_seat = seat_ids.iter().position(|id| id == &state.hero_id).unwrap_or(0).min(num_players - 1);
 
-    // 1. Tạo danh sách PlayerState thật cho toàn bộ bàn đấu
+    // 2. Tạo danh sách PlayerState thật cho toàn bộ bàn đấu
     let mut initial_stacks = Vec::with_capacity(num_players);
     let mut env_players = Vec::with_capacity(num_players);
 
@@ -451,7 +473,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
         env_players.push(ps);
     }
 
-    // Xác định vị trí Dealer Button trong số các ghế hiện tại
+    // Xác định vị trí Dealer Button chuẩn xác theo ghế thực tế còn trên bàn
     let button_idx = if let Some(ref did) = state.dealer_id {
         seat_ids.iter().position(|id| id == did).unwrap_or(0)
     } else if let Some(dseat) = state.dealer_seat {
@@ -462,25 +484,30 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
 
     let mut env = Environment::new(num_players, &initial_stacks, state.bb_size, state.sb_size, button_idx);
 
-    // 2. Đồng bộ toàn bộ trạng thái thực tế vào env
+    // 3. Đồng bộ toàn bộ trạng thái thực tế vào env
     let total_pot = state.total_pot().max(state.bb_size + state.sb_size);
     env.state.pot = total_pot;
     env.state.current_highest_bet = state.highest_bet;
+    env.state.min_raise = state.min_raise.max(state.bb_size);
     env.state.community_cards = state.community_cards.clone();
     env.state.street = state.street;
     env.state.current_player_idx = hero_seat;
     env.state.button_idx = button_idx;
     env.state.action_history = state.action_history.clone();
-    env.state.players = env_players; // <-- NẠP TOÀN BỘ ĐỐI THỦ THẬT VÀO ĐÂY!
+    env.state.players = env_players;
 
     let hero_bet = state.players.get(&state.hero_id).map(|p| p.current_bet).unwrap_or(0);
     let hero_stack = state.players.get(&state.hero_id).map(|p| p.stack).unwrap_or(1000);
     let to_call = state.highest_bet.saturating_sub(hero_bet);
 
-    // 3. Tính toán GTO
+    // 4. Tính toán GTO & Trích xuất Raw Advantages
     let mask = env.get_action_mask();
     let features = env.state.encode_features(hero_seat);
     let probs = policy.get_action_probs(&features, &mask);
+    let raw_adv = {
+        let net = policy.advantage_net.read().unwrap();
+        net.forward(&features)
+    };
 
     println!("\n============================================================");
     println!("🎯 [ĐẾN LƯỢT BẠN HÀNH ĐỘNG] - VÒNG: {:?}", state.street);
@@ -489,14 +516,21 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
         let board_str: Vec<String> = state.community_cards.iter().map(|c| format!("{}", c)).collect();
         println!("🎴 Bài chung: [ {} ]", board_str.join(" "));
     }
-    println!("💰 Tổng Pot: {} chip | Cần Call: {} chip | Stack: {} chip", total_pot, to_call, hero_stack);
+    println!("💰 Tổng Pot: {} chip | Cần Call: {} chip | Stack: {} chip | Vị trí Button: Ghế {}",
+        total_pot, to_call, hero_stack, button_idx + 1);
 
     // In danh sách trực quan tình trạng các đối thủ trên bàn
     println!("------------------------------------------------------------");
-    println!("👥 TRẠNG THÁI CÁC GHẾ TRÊN BÀN:");
+    println!("👥 TRẠNG THÁI CÁC GHẾ TRÊN BÀN ({} NGƯỜI):", num_players);
     for (idx, pid) in seat_ids.iter().take(num_players).enumerate() {
         let p = state.players.get(pid).cloned().unwrap_or_default();
-        let role = if pid == &state.hero_id { "⭐ HERO (Bạn)" } else { "Đối thủ" };
+        let role = if pid == &state.hero_id {
+            "⭐ HERO (Bạn)"
+        } else if idx == button_idx {
+            "🔘 Dealer"
+        } else {
+            "Đối thủ"
+        };
         let status = if p.is_folded {
             "🛑 Đã Fold"
         } else if p.is_all_in {
@@ -506,7 +540,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
         } else {
             "🟢 Đang theo"
         };
-        println!("   [Ghế {}] {:<14} | {:<12} | Stack: {:>5} | Bet: {:>4} | {}", 
+        println!("   [Ghế {}] {:<14} | {:<13} | Stack: {:>5} | Bet: {:>4} | {}", 
             idx + 1, p.name, role, p.stack, p.current_bet, status);
     }
 
@@ -527,8 +561,9 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
         let is_valid = mask.is_index_valid(i);
         let rec = if i == best_idx { " ⭐ KHUYÊN DÙNG" } else { "" };
         let status = if is_valid { "" } else { " (Không hợp lệ)" };
+        let raw_val = raw_adv.get(i).copied().unwrap_or(0.0);
 
-        println!("   {:<14}: {:>5.1}%{}{}", act.name(), p * 100.0, rec, status);
+        println!("   {:<14}: {:>5.1}% (Raw EV: {:>+6.2}){}{}", act.name(), p * 100.0, raw_val, rec, status);
     }
     println!("============================================================\n");
 }
