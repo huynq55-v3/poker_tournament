@@ -34,16 +34,16 @@ fn main() {
     let mut trainer = DeepCFRTrainer::new(FEATURE_DIM, &hidden_dims, 2_000_000);
     trainer.fixed_players = None; // Trainer tự ưu tiên 70% bàn 6-8 max trong trainer.rs
 
-    let total_iterations = 500;
+    let total_iterations = 1000;
     let traversals_per_iter = 400;
-    let train_steps_per_iter = 200;
+    let train_steps_per_iter = 300;
     let batch_size = 512;
 
-    let bench_every = 10;
-    let arena_hands = 6000;
+    let bench_every = 5;
+    let arena_hands = 12000;
     let arena_stack_bb = 50;
-    let bench_hands = 2000;
-    let depths = [50u32, 25u32];
+    let bench_hands = 12000;
+    let depths = [50u32, 25u32, 12u32];
 
     let _ = std::fs::remove_file(BENCH_CSV);
 
