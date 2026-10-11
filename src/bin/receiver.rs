@@ -10,6 +10,10 @@ use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, RwLock};
+use std::{thread, time::Duration};
+
+// Thư viện điều khiển bàn phím tự động
+use enigo::{Enigo, Key, Keyboard, Settings};
 
 const ADV_MODEL_PATH: &str = "deep_cfr_model.json";
 const STRAT_MODEL_PATH: &str = "deep_cfr_strategy.json";
@@ -137,9 +141,64 @@ fn parse_cards_array(val: &Value) -> Option<[Card; 2]> {
     if cards.len() == 2 { Some([cards[0], cards[1]]) } else { None }
 }
 
+// Hàm thực hiện tự động gõ phím vào cửa sổ đang focus
+fn execute_bot_action(action: Action, to_call: u32, target_total: u32, hero_stack: u32) {
+    let mut enigo = Enigo::new(&Settings::default()).unwrap();
+
+    // Chờ một nhịp nhỏ để ổn định giao diện
+    thread::sleep(Duration::from_millis(300));
+
+    match action {
+        Action::Fold => {
+            println!("🤖 [BOT] Thao tác: FOLD (Bấm F)");
+            let _ = enigo.key(Key::Unicode('f'), enigo::Direction::Click);
+        }
+        Action::CheckCall => {
+            if to_call == 0 {
+                println!("🤖 [BOT] Thao tác: CHECK (Bấm K)");
+                let _ = enigo.key(Key::Unicode('k'), enigo::Direction::Click);
+            } else {
+                println!("🤖 [BOT] Thao tác: CALL {} chip (Bấm C)", to_call);
+                let _ = enigo.key(Key::Unicode('c'), enigo::Direction::Click);
+            }
+        }
+        Action::AllIn => {
+            println!("🤖 [BOT] Thao tác: ALL-IN {} chip (Bấm R, nhập số, Enter)", hero_stack);
+            let _ = enigo.key(Key::Unicode('r'), enigo::Direction::Click);
+            thread::sleep(Duration::from_millis(100));
+            for ch in hero_stack.to_string().chars() {
+                let _ = enigo.key(Key::Unicode(ch), enigo::Direction::Click);
+                thread::sleep(Duration::from_millis(30));
+            }
+            let _ = enigo.key(Key::Return, enigo::Direction::Click);
+        }
+        Action::BetPot33 | Action::BetPot66 | Action::BetPot100 => {
+            let final_bet = target_total.min(hero_stack);
+            if final_bet >= hero_stack {
+                println!("🤖 [BOT] Stack không đủ, đổi thành ALL-IN {} chip", hero_stack);
+                let _ = enigo.key(Key::Unicode('r'), enigo::Direction::Click);
+                thread::sleep(Duration::from_millis(100));
+                for ch in hero_stack.to_string().chars() {
+                    let _ = enigo.key(Key::Unicode(ch), enigo::Direction::Click);
+                    thread::sleep(Duration::from_millis(30));
+                }
+            } else {
+                println!("🤖 [BOT] Thao tác: RAISE lên {} chip (Bấm R, nhập số, Enter)", final_bet);
+                let _ = enigo.key(Key::Unicode('r'), enigo::Direction::Click);
+                thread::sleep(Duration::from_millis(100));
+                for ch in final_bet.to_string().chars() {
+                    let _ = enigo.key(Key::Unicode(ch), enigo::Direction::Click);
+                    thread::sleep(Duration::from_millis(30));
+                }
+            }
+            let _ = enigo.key(Key::Return, enigo::Direction::Click);
+        }
+    }
+}
+
 fn main() {
     println!("============================================================");
-    println!("⚡ POKERNOW REAL-TIME GTO ASSISTANT (HIGH PRECISION v3)");
+    println!("⚡ POKERNOW REAL-TIME GTO ASSISTANT & AUTO-BOT (v3)");
     println!("============================================================");
 
     print!("📐 Nạp bảng Preflop Equity... ");
@@ -157,7 +216,7 @@ fn main() {
 
     let listener = TcpListener::bind("127.0.0.1:3000").expect("Không thể mở cổng 3000");
     println!("🌐 Server sẵn sàng tại http://127.0.0.1:3000");
-    println!("👀 Đang theo dõi và đồng bộ PokerNow...\n");
+    println!("👀 Đang theo dõi, đồng bộ PokerNow và bật Auto-Bot...\n");
 
     let mut state = HandState::new();
 
@@ -404,9 +463,6 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     let num_players = active_seats.len().clamp(2, 8);
     let hero_seat = active_seats.iter().position(|id| id == &state.hero_id).unwrap_or(0);
 
-    // ====================================================================
-    // 1. QUÉT DỮ LIỆU THỰC TẾ TRÊN BÀN (CHIP CƯỢC & POT)
-    // ====================================================================
     let mut actual_highest_bet = state.highest_bet;
     let mut sum_current_bets = 0;
 
@@ -416,7 +472,6 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     for (seat_idx, pid) in active_seats.iter().enumerate() {
         let p_track = state.players.get(pid).cloned().unwrap_or_default();
         
-        // Quét tìm mức bet cao nhất hiện tại
         if p_track.current_bet > actual_highest_bet {
             actual_highest_bet = p_track.current_bet;
         }
@@ -438,10 +493,6 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     let button_idx = if let Some(ref did) = state.dealer_id { active_seats.iter().position(|id| id == did).unwrap_or(0) } else { 0 };
     let mut env = Environment::new(num_players, &initial_stacks, state.bb_size, state.sb_size, button_idx);
 
-    // ====================================================================
-    // 2. TÍNH POT CHUẨN XÁC (KHÔNG BỊ ĐẾM TRÙNG, KHÔNG BỊ THIẾU)
-    // ====================================================================
-    // Tổng số chip thực sự đang có trên bàn = Main Pot (vòng trước) + Toàn bộ tiền cược vòng này
     let true_table_pot = (state.pn_total_pot + sum_current_bets).max(state.bb_size + state.sb_size);
     let safe_min_raise = state.min_raise.max(state.bb_size);
     
@@ -458,9 +509,6 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     let hero_stack_behind = env.state.players[hero_seat].stack; 
     let to_call = actual_highest_bet.saturating_sub(hero_bet);
 
-    // ====================================================================
-    // 3. SUY LUẬN AI (DEEP CFR GTO)
-    // ====================================================================
     let mask = env.get_action_mask();
     let features = env.state.encode_features(hero_seat);
     let mut probs = policy.get_action_probs(&features, &mask);
@@ -483,9 +531,6 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
         if sum_exp > 0.0 { for p in &mut probs { *p /= sum_exp; } }
     }
 
-    // ====================================================================
-    // 4. HIỂN THỊ THÔNG TIN VÁN BÀI
-    // ====================================================================
     println!("\n============================================================");
     println!("🎯 [ĐẾN LƯỢT BẠN] - VÒNG: {:?}", state.street);
     println!("🃏 Bài tẩy : [ {} {} ]", hole[0], hole[1]);
@@ -506,9 +551,6 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
         }
     }
 
-    // ====================================================================
-    // 5. TÍNH TOÁN CON SỐ CHIP TỐ THEO CHUẨN POT-LIMIT (KHỚP 100% POKERNOW)
-    // ====================================================================
     let get_action_desc = |act: Action| -> String {
         match act {
             Action::Fold => "0".to_string(),
@@ -524,13 +566,8 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
                     Action::BetPot66 => 0.66, 
                     _ => 1.0 
                 };
-                
-                // Công thức chuẩn quốc tế:
-                // Pot sau khi Call = Pot hiện tại trên bàn + Số tiền mình phải bỏ ra để Call
                 let pot_after_call = true_table_pot + to_call;
                 let raise_by = ((pot_after_call as f32) * frac).round() as u32;
-                
-                // Tổng số cược đẩy ra = Mức cược đối thủ + Tiền tố thêm (Tối thiểu bằng Min Raise)
                 let target_total = actual_highest_bet + raise_by.max(safe_min_raise);
                 format!("Tố lên {}", target_total)
             }
@@ -559,7 +596,27 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
         let raw_val = raw_adv.get(i).copied().unwrap_or(0.0);
         let chip_desc = get_action_desc(act);
 
-        println!("   {:<14}: {:>5.1}% (EV: {:>+6.2}) | [{:<15}]{}{}", act.name(), p * 100.0, raw_val, chip_desc, rec, status);
+        println!("    {:<14}: {:>5.1}% (EV: {:>+6.2}) | [{:<15}]{}{}", act.name(), p * 100.0, raw_val, chip_desc, rec, status);
     }
     println!("============================================================\n");
+
+    // TỰ ĐỘNG THỰC THI HÀNH ĐỘNG TỐT NHẤT LÊN GIAO DIỆN
+    if let Some(best_action) = Action::from_index(best_idx) {
+        let mut target_total = actual_highest_bet;
+        match best_action {
+            Action::BetPot33 | Action::BetPot66 | Action::BetPot100 => {
+                let frac = match best_action {
+                    Action::BetPot33 => 0.33,
+                    Action::BetPot66 => 0.66,
+                    _ => 1.0,
+                };
+                let pot_after_call = true_table_pot + to_call;
+                let raise_by = ((pot_after_call as f32) * frac).round() as u32;
+                target_total = actual_highest_bet + raise_by.max(safe_min_raise);
+            }
+            _ => {}
+        }
+
+        execute_bot_action(best_action, to_call, target_total, hero_stack_behind);
+    }
 }
