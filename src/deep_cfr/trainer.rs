@@ -11,6 +11,7 @@ use rand::prelude::Distribution;
 use rand::Rng;
 use rayon::prelude::*;
 use std::sync::{Arc, RwLock};
+use crate::equity::icm::{calculate_icm_ev, SNG_PAYOUTS_8MAX};
 
 /// Độ sâu tối đa cho traverser rẽ nhánh. 8 lượt đủ bao quát Preflop, Flop, Turn và River
 /// (mỗi vòng 2 lượt hành động kể cả re-raise) mà không bị bùng nổ vì đối thủ chỉ sample 1 nhánh.
@@ -19,23 +20,91 @@ const MAX_BRANCH_DEPTH: usize = 8;
 /// Hàm thưởng cho 1 traverser: Chip-EV chuẩn hóa chia cho 10 BB
 struct Payoff {
     traverser: usize,
-    start_stack: f32,
+    start_icm_ev: f32,
+    start_stacks: Vec<f32>,
+    use_icm: bool,
     bb: f32,
 }
 
 impl Payoff {
-    fn new(start: &[f32], traverser: usize, bb: f32) -> Self {
+    fn new(start: &[f32], traverser: usize, bb: f32, use_icm: bool) -> Self {
+        let start_stacks = start.to_vec();
+        // Heads-up (2 người) trong tournament không có áp lực ICM vì cả 2 đã cầm chắc Top 2.
+        // Do đó, chỉ áp dụng ICM khi bàn có từ 3 người trở lên.
+        let is_hu = start_stacks.len() <= 2;
+        let start_icm_ev = if use_icm && !is_hu {
+            let evs = calculate_icm_ev(&start_stacks, &SNG_PAYOUTS_8MAX);
+            evs[traverser]
+        } else {
+            0.0
+        };
+
         Payoff {
             traverser,
-            start_stack: start[traverser],
+            start_icm_ev,
+            start_stacks,
+            use_icm: use_icm && !is_hu,
             bb,
         }
     }
 
     #[inline(always)]
     fn eval(&self, env: &Environment) -> f32 {
-        let end = env.state.players[self.traverser].stack as f32;
-        (end - self.start_stack) / self.bb / 10.0
+        if self.use_icm {
+            // Lấy stack kết thúc của tất cả người chơi
+            let mut end_stacks: Vec<f32> = env.state.players.iter().map(|p| p.stack as f32).collect();
+
+            // Nếu pot còn dư (trường hợp terminal do fold hết nhưng pot chưa kịp giải ngân)
+            if env.state.pot > 0 {
+                let remaining_in_hand: Vec<usize> = env
+                    .state
+                    .players
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| p.is_in_hand())
+                    .map(|(i, _)| i)
+                    .collect();
+
+                // Người duy nhất còn lại trên bàn ôm trọn pot
+                if remaining_in_hand.len() == 1 {
+                    end_stacks[remaining_in_hand[0]] += env.state.pot as f32;
+                } else if !remaining_in_hand.is_empty() {
+                    // Nếu nhiều người còn lại, chia đều phần pot tạm thời
+                    let share = env.state.pot as f32 / remaining_in_hand.len() as f32;
+                    for &idx in &remaining_in_hand {
+                        end_stacks[idx] += share;
+                    }
+                }
+            }
+
+            // Tính ICM EV cho toàn bộ bàn với stack sau ván bài
+            let end_evs = calculate_icm_ev(&end_stacks, &SNG_PAYOUTS_8MAX);
+            
+            // Chênh lệch giá trị giải thưởng của traverser trước và sau ván đấu
+            let diff_ev = end_evs[self.traverser] - self.start_icm_ev;
+
+            // Nhân 10.0 để thang đo nằm trong khoảng [-5.0, +5.0], tối ưu cho Huber Loss
+            diff_ev * 10.0
+        } else {
+            // CHIP-EV MODE: Chuẩn hóa theo số big blind
+            let mut end = env.state.players[self.traverser].stack as f32;
+            // Nếu pot còn dư khi ván kết thúc (do fold terminal)
+            if env.state.pot > 0 {
+                let in_hand: Vec<usize> = env
+                    .state
+                    .players
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| p.is_in_hand())
+                    .map(|(i, _)| i)
+                    .collect();
+                if in_hand.contains(&self.traverser) {
+                    end += env.state.pot as f32 / in_hand.len() as f32;
+                }
+            }
+            let start = self.start_stacks[self.traverser];
+            (end - start) / self.bb / 10.0
+        }
     }
 }
 
@@ -144,6 +213,7 @@ pub struct DeepCFRTrainer {
     pub lr: f32,
     pub weight_decay: f32,
     pub fixed_players: Option<usize>,
+    pub use_icm: bool,
 }
 
 impl DeepCFRTrainer {
@@ -172,7 +242,7 @@ impl DeepCFRTrainer {
         }
     }
 
-    pub fn new(input_dim: usize, hidden_dims: &[usize], capacity: usize) -> Self {
+    pub fn new(input_dim: usize, hidden_dims: &[usize], capacity: usize, use_icm: bool) -> Self {
         let mut dims = Vec::with_capacity(hidden_dims.len() + 2);
         dims.push(input_dim);
         dims.extend_from_slice(hidden_dims);
@@ -188,6 +258,7 @@ impl DeepCFRTrainer {
             lr: 0.001,
             weight_decay: 1e-4,
             fixed_players: None,
+            use_icm,
         }
     }
 
@@ -227,11 +298,14 @@ impl DeepCFRTrainer {
             .map(|_| {
                 let mut trng = rand::thread_rng();
                 let n = fixed.unwrap_or_else(|| {
-                    // Ưu tiên bàn 6 đến 8 người nhiều hơn (70% bàn 6-8 người)
-                    if trng.gen_bool(0.70) {
+                    // Dành 25% ván chuyên sâu cho Heads-Up (2 người) để bot không bị yếu đấu tay đôi.
+                    // 55% cho bàn đông 6-8 max và 20% cho bàn ngắn 3-5 max.
+                    if trng.gen_bool(0.25) {
+                        2
+                    } else if trng.gen_bool(0.70) {
                         trng.gen_range(6..=8)
                     } else {
-                        trng.gen_range(2..=5)
+                        trng.gen_range(3..=5)
                     }
                 });
                 let button = trng.gen_range(0..n);
@@ -251,7 +325,7 @@ impl DeepCFRTrainer {
                 for t in 0..n {
                     let mut env = Environment::new(n, &stacks, bb_size, sb_size, button);
                     env.reset_hand(&mut trng, button);
-                    let pay = Payoff::new(&start, t, bb_size as f32);
+                    let pay = Payoff::new(&start, t, bb_size as f32, self.use_icm);
                     traverse(&mut env, &mut ctx, &pay, &mut trng, 0);
                 }
                 (ctx.adv_out, ctx.strat_out)

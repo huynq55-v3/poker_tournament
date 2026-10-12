@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::equity;
 use crate::poker_core::evaluator::evaluate_7_cards;
 
-pub const FEATURE_DIM: usize = 172;
+pub const FEATURE_DIM: usize = 176;
 pub const MAX_PLAYERS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -209,7 +209,7 @@ impl GameState {
         }
         f.extend_from_slice(&board_vec);
 
-        // 3. Vị trí tương đối dựa trên danh sách người THỰC SỰ CÒN SỐNG (8 + 2)
+        // 3. Vị trí và trạng thái sống còn thực tế (8 + 2 + 4 Tournament Features = 14)
         let alive: Vec<usize> = self
             .players
             .iter()
@@ -223,10 +223,36 @@ impl GameState {
         let rel_pos = (my_pos + num_alive - btn_pos) % num_alive;
 
         let mut pos_vec = [0.0f32; 8];
-        pos_vec[rel_pos.min(7)] = 1.0;
+        if num_alive == 2 {
+            // Heads-Up: BTN (rel_pos == 0) vừa là BTN vừa là SB -> pos_vec[0] = 1.0 (BTN).
+            // Người còn lại (rel_pos == 1) là Big Blind -> pos_vec[2] = 1.0 (BB), tránh nhầm với SB của 8-max.
+            if rel_pos == 0 {
+                pos_vec[0] = 1.0;
+            } else {
+                pos_vec[2] = 1.0;
+            }
+        } else {
+            pos_vec[rel_pos.min(7)] = 1.0;
+        }
         f.extend_from_slice(&pos_vec);
         f.push(num_alive as f32 / MAX_PLAYERS as f32);
         f.push(if num_alive == 2 { 1.0 } else { 0.0 });
+
+        // 🟢 CÁC ĐẶC TRƯNG TOURNAMENT ICM BỔ SUNG (4 chiều):
+        // a. Đang ở vòng Bubble tranh Top 4 (5 người còn sống)
+        f.push(if num_alive == 5 { 1.0 } else { 0.0 });
+        // b. Đã lọt vào Top 4 có điểm (<= 4 người)
+        f.push(if num_alive <= 4 { 1.0 } else { 0.0 });
+        // c. Xếp hạng stack của mình so với những người còn sống (0.0: nghèo nhất, 1.0: giàu nhất bàn)
+        let my_chips = me.stack + me.current_bet;
+        let smaller_stacks_count = alive.iter().filter(|&&seat| {
+            let opp_chips = self.players[seat].stack + self.players[seat].current_bet;
+            my_chips > opp_chips
+        }).count();
+        f.push(smaller_stacks_count as f32 / (num_alive - 1).max(1) as f32);
+        // d. Tỉ lệ tổng chip của mình so với toàn bộ chip trên bàn (Chip Share 0.0 .. 1.0)
+        let total_chips_on_table: f32 = self.players.iter().map(|p| (p.stack + p.current_bet) as f32).sum::<f32>().max(1.0);
+        f.push((my_chips as f32 / total_chips_on_table).clamp(0.0, 1.0));
 
         // 4. Street one-hot (4)
         let mut street_vec = [0.0f32; 4];
@@ -241,9 +267,7 @@ impl GameState {
         let denom = (self.pot + to_call) as f32;
         f.push(if denom > 0.0 { to_call as f32 / denom } else { 0.0 });
 
-        // 6. 7 đối thủ theo thứ tự xoay tròn:
-        // CHỈ LẤY CÁC ĐỐI THỦ CÒN SỐNG TRONG VÒNG BÀN (BỎ QUA GHẾ BỊ ELIMINATED)
-        // Điều này đảm bảo vector luôn tương thích 100% với môi trường lúc train!
+        // 6. 7 đối thủ theo thứ tự xoay tròn (7 * 4 = 28)
         let mut opp_count = 0;
         let mut step = 1;
         while opp_count < (MAX_PLAYERS - 1) && step < self.num_players {
@@ -259,7 +283,6 @@ impl GameState {
             step += 1;
         }
 
-        // Đệm 0.0 cho các slot trống còn lại
         while opp_count < (MAX_PLAYERS - 1) {
             f.extend_from_slice(&[0.0; 4]);
             opp_count += 1;
@@ -273,7 +296,10 @@ impl GameState {
                 r.street == self.street
                     && matches!(
                         r.action,
-                        Action::BetPot33 | Action::BetPot66 | Action::BetPot100 | Action::AllIn
+                            | Action::BetPot33
+                            | Action::BetPot66
+                            | Action::BetPot100
+                            | Action::AllIn
                     )
             })
             .count();

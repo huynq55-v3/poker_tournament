@@ -12,13 +12,13 @@ pub mod arena;
 pub use arena::{evaluate_against_champion, ArenaMatchResult};
 
 // ---- Vị trí các đặc trưng trong encode_features (đổi layout thì phải cập nhật; có test kiểm tra) ----
-const F_STREET_PREFLOP: usize = 119;
-const F_POT_ODDS: usize = 126;
-const F_IN_HAND: usize = 156;
-const F_PUSHFOLD: usize = 158;
-const F_FACING_BET: usize = 159;
-const F_HAND_STRENGTH: usize = 163; // preflop: điểm Chen 0..1
-const F_EQUITY: usize = 164;
+const F_STREET_PREFLOP: usize = 123;
+const F_POT_ODDS: usize = 130;
+const F_IN_HAND: usize = 160;
+const F_PUSHFOLD: usize = 162;
+const F_FACING_BET: usize = 163;
+const F_HAND_STRENGTH: usize = 167; // preflop: điểm Chen 0..1
+const F_EQUITY: usize = 168;
 
 /// Bài rác preflop: điểm Chen chuẩn hóa dưới ngưỡng này
 const TRASH_CHEN: f32 = 0.30;

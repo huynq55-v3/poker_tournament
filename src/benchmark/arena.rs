@@ -5,8 +5,8 @@ use crate::self_play::Policy;
 use rand::{thread_rng, Rng};
 use rayon::prelude::*;
 
-const F_STREET_PREFLOP: usize = 119;
-const F_HAND_STRENGTH: usize = 163;
+const F_STREET_PREFLOP: usize = 123;
+const F_HAND_STRENGTH: usize = 167;
 const TRASH_CHEN: f32 = 0.30;
 const ARENA_PLAYERS: usize = 8;
 

@@ -341,7 +341,7 @@ impl PokerGuiApp {
 
         std::thread::spawn(move || {
             let mut rng = thread_rng();
-            let mut trainer = DeepCFRTrainer::new(FEATURE_DIM, &[256, 256, 128], 30_000);
+            let mut trainer = DeepCFRTrainer::new(FEATURE_DIM, &[256, 256, 128], 30_000, true);
             let total_iters = 10;
 
             for iter in 1..=total_iters {

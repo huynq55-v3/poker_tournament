@@ -6,7 +6,6 @@ use poker_tournament::poker_core::{Card, Rank, Suit};
 use poker_tournament::Policy;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, RwLock};
@@ -99,6 +98,12 @@ impl HandState {
         self.dealer_id = None;
         self.dealer_seat = None;
         self.action_history.clear();
+
+        // 🟢 FIX: Nếu có danh sách ghế ngồi thực tế từ PokerNow (seats_order),
+        // chỉ giữ lại những player ID đang thực sự có mặt ở bàn này!
+        if !self.seats_order.is_empty() {
+            self.players.retain(|id, _| self.seats_order.contains(id));
+        }
 
         for p in self.players.values_mut() {
             p.current_bet = 0;
@@ -302,7 +307,8 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
                 };
                 if new_street != state.street {
                     for p in state.players.values_mut() {
-                        p.stack = p.stack.saturating_sub(p.current_bet);
+                        // PokerNow cập nhật stack thực tế liên tục qua players.stack và mAVTB,
+                        // chỉ reset current_bet về 0 ở vòng mới, không trừ đúp stack!
                         p.current_bet = 0;
                     }
                     state.highest_bet = 0;
@@ -476,7 +482,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
             actual_highest_bet = p_track.current_bet;
         }
         
-        let true_stack_behind = p_track.stack.saturating_sub(p_track.current_bet);
+        let true_stack_behind = p_track.stack;
         let starting_stack = true_stack_behind + p_track.current_bet;
         initial_stacks.push(starting_stack.max(state.bb_size));
 
@@ -489,6 +495,10 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
         sum_current_bets += p_track.current_bet;
         env_players.push(ps);
     }
+
+    let in_hand_count = active_seats.iter().filter(|pid| {
+        state.players.get(*pid).map_or(false, |pl| !pl.is_folded)
+    }).count();
 
     let button_idx = if let Some(ref did) = state.dealer_id { active_seats.iter().position(|id| id == did).unwrap_or(0) } else { 0 };
     let mut env = Environment::new(num_players, &initial_stacks, state.bb_size, state.sb_size, button_idx);
@@ -533,6 +543,11 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
 
     println!("\n============================================================");
     println!("🎯 [ĐẾN LƯỢT BẠN] - VÒNG: {:?}", state.street);
+    if in_hand_count <= 2 {
+        println!("⚔️  [ĐỐI ĐẦU 1-VS-1 HEADS-UP] Chỉ còn 2 người trong ván bài!");
+    } else {
+        println!("👥 Số người còn trong ván: {} / Tổng số ghế: {}", in_hand_count, num_players);
+    }
     println!("🃏 Bài tẩy : [ {} {} ]", hole[0], hole[1]);
     if !state.community_cards.is_empty() {
         let board_str: Vec<String> = state.community_cards.iter().map(|c| format!("{}", c)).collect();
@@ -543,13 +558,46 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     println!("💰 Tổng Pot thực tế: {} chip | Cần Call: {} chip {}", true_table_pot, to_call, call_status);
     println!("------------------------------------------------------------");
 
-    let mut best_idx = 0;
-    let mut best_p = -1.0f32;
-    for (i, &p) in probs.iter().enumerate() {
-        if mask.is_index_valid(i) && p > best_p {
-            best_p = p; best_idx = i;
+    // LỌC VÀ CHUẨN HÓA XÁC SUẤT THEO GTO MIXED STRATEGY
+    let mut clean_probs = [0.0f32; 6];
+    let mut sum_clean = 0.0f32;
+    for (i, &p) in probs.iter().enumerate().take(6) {
+        if mask.is_index_valid(i) {
+            let val = if p > 0.02 { p } else { 0.0 };
+            clean_probs[i] = val;
+            sum_clean += val;
         }
     }
+    if sum_clean <= 1e-4 {
+        for (i, &p) in probs.iter().enumerate().take(6) {
+            if mask.is_index_valid(i) {
+                clean_probs[i] = p.max(0.01);
+                sum_clean += clean_probs[i];
+            }
+        }
+    }
+    if sum_clean > 0.0 {
+        for p in &mut clean_probs {
+            *p /= sum_clean;
+        }
+    }
+
+    // QUAY SỐ NGẪU NHIÊN THEO TRỌNG SỐ (GTO RANDOM ROLL)
+    let mut rng = rand::thread_rng();
+    let chosen_idx = if let Ok(dist) = rand::distributions::WeightedIndex::new(&clean_probs) {
+        use rand::distributions::Distribution;
+        dist.sample(&mut rng)
+    } else {
+        let mut b_idx = 0;
+        let mut b_p = -1.0;
+        for (i, &p) in clean_probs.iter().enumerate() {
+            if mask.is_index_valid(i) && p > b_p {
+                b_p = p;
+                b_idx = i;
+            }
+        }
+        b_idx
+    };
 
     let get_action_desc = |act: Action| -> String {
         match act {
@@ -574,11 +622,11 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
         }
     };
 
-    println!("📊 KHUYẾN NGHỊ TỪ GTO SOLVER:");
+    println!("📊 KHUYẾN NGHỊ TỪ GTO SOLVER (MIXED STRATEGY):");
     for (i, &p) in probs.iter().enumerate() {
         let act = Action::from_index(i).unwrap();
         let is_valid = mask.is_index_valid(i);
-        let rec = if is_valid && i == best_idx { " ⭐ TỐT NHẤT" } else { "" };
+        let rec = if is_valid && i == chosen_idx { " ⭐ ĐÃ ROLL TRÚNG" } else { "" };
         
         let status = if is_valid { 
             "" 
@@ -598,10 +646,14 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
 
         println!("    {:<14}: {:>5.1}% (EV: {:>+6.2}) | [{:<15}]{}{}", act.name(), p * 100.0, raw_val, chip_desc, rec, status);
     }
+    
+    if let Some(act) = Action::from_index(chosen_idx) {
+        println!("🎲 [GTO RANDOM ROLL] Đã tung xúc xắc chọn -> {:?} (Tần suất lý thuyết: {:.1}%)", act, clean_probs[chosen_idx] * 100.0);
+    }
     println!("============================================================\n");
 
-    // TỰ ĐỘNG THỰC THI HÀNH ĐỘNG TỐT NHẤT LÊN GIAO DIỆN
-    if let Some(best_action) = Action::from_index(best_idx) {
+    // TỰ ĐỘNG THỰC THI HÀNH ĐỘNG ĐÃ ROLL ĐƯỢC LÊN GIAO DIỆN
+    if let Some(best_action) = Action::from_index(chosen_idx) {
         let mut target_total = actual_highest_bet;
         match best_action {
             Action::BetPot33 | Action::BetPot66 | Action::BetPot100 => {

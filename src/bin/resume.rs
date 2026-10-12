@@ -56,7 +56,7 @@ fn main() {
     let _ = poker_tournament::equity::preflop_table();
 
     let mut rng = rand::thread_rng();
-    let mut trainer = DeepCFRTrainer::new(FEATURE_DIM, &HIDDEN, 1_000_000);
+    let mut trainer = DeepCFRTrainer::new(FEATURE_DIM, &HIDDEN, 1_000_000, false);
     trainer.fixed_players = None;
     trainer.use_icm = false; // Winner-takes-all: luôn dùng Chip-EV thuần
     trainer.lr = lr;

@@ -29,21 +29,27 @@ fn main() {
     let _ = poker_tournament::equity::preflop_table();
     println!("   ✅ Ready in {:.1}s", t0.elapsed().as_secs_f64());
 
-    println!("\n[1] 🏋️ Deep CFR training with 8-Max Arena Gating...");
+    println!("\n[1] 🏋️ Deep CFR training with 8-Max Arena Gating & Tournament ICM...");
+    
+    // Kiến trúc mạng nơ-ron: 3 tầng ẩn đủ sâu cho 176 features
     let hidden_dims = [256, 256, 128];
-    let mut trainer = DeepCFRTrainer::new(FEATURE_DIM, &hidden_dims, 2_000_000);
-    trainer.fixed_players = None; // Trainer tự ưu tiên 70% bàn 6-8 max trong trainer.rs
+    
+    // Capacity 1.5M - 2M mẫu là vừa vặn bộ nhớ RAM
+    let mut trainer = DeepCFRTrainer::new(FEATURE_DIM, &hidden_dims, 1_500_000, true);
+    trainer.fixed_players = None; // Tiếp tục ưu tiên bàn 6-8 max
+    trainer.use_icm = true;       // 🟢 BẮT BUỘC: Bật hàm thưởng Tournament ICM
+    trainer.lr = 0.0005;          // 🟢 Giảm nhẹ learning rate để tránh dao động All-in rác
 
-    let total_iterations = 1000;
-    let traversals_per_iter = 400;
-    let train_steps_per_iter = 300;
-    let batch_size = 512;
+    let total_iterations = 600;       // 600 iter với cấu hình mới tương đương 1500 iter cũ
+    let traversals_per_iter = 250;    // 🟢 Giảm từ 400 -> 250 (Giảm 40% thời gian duyệt cây mỗi iter)
+    let train_steps_per_iter = 400;   // 🟢 Tăng từ 300 -> 400 (Ép mạng học kỹ hơn các tình huống ICM)
+    let batch_size = 512;             // Giữ nguyên 512 (Kích thước vàng cho SIMD/Rayon)
 
-    let bench_every = 5;
-    let arena_hands = 12000;
-    let arena_stack_bb = 50;
-    let bench_hands = 12000;
-    let depths = [50u32, 25u32, 12u32];
+    let bench_every = 10;             // 🟢 Tăng từ 5 -> 10 (Đỡ tốn thời gian benchmark vô ích)
+    let arena_hands = 6000;           // 🟢 Giảm từ 12k -> 6k (Đủ tin cậy để soán ngôi Champion)
+    let arena_stack_bb = 35;          // 🟢 Đổi từ 50 -> 35 BB (Mức stack thực chiến phổ biến nhất của SNG)
+    let bench_hands = 6000;           // 🟢 Giảm từ 12k -> 6k (Chạy nhanh gấp đôi)
+    let depths = [50u32, 25u32, 12u32]; // 🟢 BẮT BUỘC có 12 BB để kiểm tra chế độ Push/Fold sinh tử!
 
     let _ = std::fs::remove_file(BENCH_CSV);
 

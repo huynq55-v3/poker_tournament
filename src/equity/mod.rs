@@ -8,6 +8,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
+pub mod icm;
 pub const PREFLOP_CLASSES: usize = 169;
 pub const MAX_OPP: usize = 7;
 pub const PREFLOP_TABLE_PATH: &str = "preflop_equity.json";
@@ -358,6 +359,6 @@ mod tests {
     fn test_draw_features() {
         // flush draw: 2 lá cơ trên tay + 2 lá cơ trên flop
         let f = board_and_draw_features([c("As"), c("Ks")], &[c("2s"), c("7s"), c("9h")]);
-        assert_eq!(f[0], 0.0); // chỉ 4 lá spade? A,K,2,7 spade = 4 -> có draw
+        assert_eq!(f[0], 1.0); // A,K,2,7 spade = 4 lá spade -> có flush draw
     }
 }
