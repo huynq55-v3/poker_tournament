@@ -1,0 +1,196 @@
+// ==UserScript==
+// @name         PokerNow SNG 1-Tab Auto Loop (Network & Games)
+// @namespace    http://tampermonkey.net/
+// @version      3.7
+// @description  Tự động Join giải, F5 mỗi 5s nếu chưa có tour mới, KHÔNG click Close bảng kết thúc mà chuyển thẳng về đăng ký
+// @match        https://network.pokernow.com/*
+// @match        https://www.pokernow.com/games/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    const SNG_REGISTER_URL = "https://network.pokernow.com/sng_tournaments";
+    const currentUrl = window.location.href;
+    let isRedirecting = false;
+
+    console.log("🔥 [SNG-BOT] Script v3.7 đang chạy tại: " + currentUrl);
+
+    // =========================================================================
+    // HÀM CHUYỂN HƯỚNG VỀ LẠI TRANG ĐĂNG KÝ
+    // =========================================================================
+    function returnToRegisterPage(reason) {
+        if (isRedirecting) return;
+        isRedirecting = true;
+
+        console.log(`🏆 [SNG-BOT] ${reason}`);
+        console.log("⏳ [SNG-BOT] Đang chuyển hướng về trang đăng ký ngay lập tức...");
+
+        setTimeout(() => {
+            window.location.href = SNG_REGISTER_URL + "?from_game=" + Date.now();
+        }, 1500); // Đợi 1.5s là chuyển ngay, không cần đợi lâu
+    }
+
+    // =========================================================================
+    // 0. TỰ ĐỘNG BẤM OK ĐÓNG CÁC POPUP THÔNG THƯỜNG (BỎ QUA KHI KẾT THÚC GAME)
+    // =========================================================================
+    window.alert = function() { return true; };
+    window.confirm = function() { return true; };
+
+    function autoDismissPopups() {
+        if (isRedirecting) return;
+
+        // KIỂM TRA TRƯỚC: Nếu toàn trang hoặc bất kỳ modal nào chứa chữ báo kết thúc -> CHUYỂN TRANG NGAY
+        const pageText = document.body ? document.body.innerText.toLowerCase() : "";
+        if (pageText.includes('tournament finished') ||
+            pageText.includes('you were eliminated') ||
+            pageText.includes('you finished in') ||
+            document.querySelector('h1.title.tournament-finished')) {
+            returnToRegisterPage("Phát hiện giải đấu đã kết thúc!");
+            return;
+        }
+
+        // Chỉ đóng các popup thông thường (VD: thông báo mạng, tip, xác nhận thông thường)
+        const modalContainers = document.querySelectorAll(
+            '.modal, .dialog, .alert, .swal2-container, .popup, [role="dialog"], [role="alertdialog"], .confirm-modal'
+        );
+
+        if (modalContainers.length > 0) {
+            modalContainers.forEach(modal => {
+                const text = modal.innerText.toLowerCase();
+
+                // TUYỆT ĐỐI KHÔNG CLICK VÀO BẢNG KẾT QUẢ
+                if (text.includes('tournament') || text.includes('eliminated') || text.includes('finished')) {
+                    returnToRegisterPage("Phát hiện modal kết quả giải đấu!");
+                    return;
+                }
+
+                const buttons = Array.from(modal.querySelectorAll('button, a, input[type="button"]'));
+                const okBtn = buttons.find(b => {
+                    const txt = b.textContent.trim().toLowerCase();
+                    // BỎ 'close' RA KHỎI ĐÂY để không bao giờ vô tình tắt bảng kết quả nữa!
+                    return txt === 'ok' || txt === 'confirm' || txt === 'got it' || txt === 'yes' || txt.includes('accept');
+                });
+
+                if (okBtn) {
+                    console.log("🟢 [SNG-BOT] Bấm tắt popup thông báo: " + okBtn.textContent.trim());
+                    okBtn.click();
+                }
+            });
+        }
+    }
+
+    // Quét popup mỗi 500ms
+    setInterval(autoDismissPopups, 500);
+
+    // =========================================================================
+    // 1. TRANG ĐĂNG KÝ HÀNG CHỜ (network.pokernow.com)
+    // =========================================================================
+    if (currentUrl.includes('network.pokernow.com')) {
+        console.log("🤖 [SNG-BOT] Đang ở trang đăng ký Sit & Go...");
+
+        // Ép mở bàn trên tab hiện tại
+        const originalOpen = window.open;
+        window.open = function(url) {
+            if (url) {
+                console.log("🚀 [SNG-BOT] Bắt được link mở bàn mới, chuyển hướng: " + url);
+                window.location.href = url;
+                return null;
+            }
+            return originalOpen.apply(this, arguments);
+        };
+
+        // Vòng lặp kiểm tra mỗi 5s
+        setInterval(() => {
+            const allElements = Array.from(document.querySelectorAll('button, a'));
+
+            // A. KIỂM TRA NÚT VÀO BÀN CHƠI (KHI ĐÃ ĐỦ NGƯỜI)
+            const tableEnterBtn = allElements.find(el => {
+                const txt = el.textContent.trim().toLowerCase();
+                const href = el.getAttribute('href') || '';
+                return href.includes('/games/') ||
+                       txt.includes('go to') ||
+                       txt.includes('enter') ||
+                       txt.includes('play now') ||
+                       txt.includes('open table');
+            });
+
+            if (tableEnterBtn) {
+                console.log("🎉 [SNG-BOT] Bàn đã đủ người! Vào bàn ngay...");
+                const link = tableEnterBtn.getAttribute('href');
+                if (link && link.includes('/games/')) {
+                    window.location.href = link.startsWith('http') ? link : ('https://www.pokernow.com' + link);
+                } else {
+                    tableEnterBtn.removeAttribute('target');
+                    tableEnterBtn.click();
+                }
+                return;
+            }
+
+            // B. KIỂM TRA XEM ĐÃ Ở HÀNG CHỜ CHƯA (NÚT CANCEL)
+            const isWaitingInQueue = allElements.some(el => {
+                const txt = el.textContent.trim().toLowerCase();
+                return txt.includes('cancel participation') || txt.includes('cancel');
+            });
+
+            if (isWaitingInQueue) {
+                console.log("⏳ [SNG-BOT] Đang ở hàng chờ, đợi đủ người...");
+                return;
+            }
+
+            // C. TÌM VÀ BẤM NÚT "Join on this Tournament"
+            let joinBtn = document.querySelector('button.button-1.big.blue');
+            if (!joinBtn) {
+                joinBtn = allElements.find(el => {
+                    const txt = el.textContent.trim().toLowerCase();
+                    return txt.includes('join on this tournament');
+                });
+            }
+
+            if (joinBtn) {
+                console.log("📝 [SNG-BOT] Tìm thấy giải đấu! Đang bấm Join...");
+                joinBtn.focus();
+                joinBtn.click();
+                joinBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                joinBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                joinBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            } else {
+                // D. NẠP LẠI TRANG CƯỠNG BỨC
+                console.log("🔄 [SNG-BOT] Chưa có tour mới. Nạp lại trang với request mới...");
+                window.location.href = SNG_REGISTER_URL + "?refresh=" + Date.now();
+            }
+        }, 5000);
+    }
+
+    // =========================================================================
+    // 2. TRANG PHÒNG CHƠI (www.pokernow.com/games/...)
+    // =========================================================================
+    if (currentUrl.includes('/games/')) {
+        console.log("♠️ [SNG-BOT] Đang ở trong phòng chơi poker...");
+
+        // Focus bàn chơi sau khi tải xong
+        setTimeout(() => {
+            console.log("🎯 [SNG-BOT] Click kích hoạt Focus bàn chơi...");
+            const tableElement = document.querySelector('.table') || document.body;
+            tableElement.click();
+        }, 3000);
+
+        // Quét liên tục kiểm tra trạng thái hết ván
+        setInterval(() => {
+            if (isRedirecting) return;
+
+            const finishedHeader = document.querySelector('h1.title.tournament-finished');
+            const bodyText = document.body ? document.body.innerText : "";
+
+            if (finishedHeader ||
+                bodyText.includes("Tournament Finished") ||
+                bodyText.includes("You were eliminated") ||
+                bodyText.includes("You finished in") ||
+                bodyText.includes("Tournament is over")) {
+                returnToRegisterPage("Phát hiện giải kết thúc từ vòng lặp phòng chơi!");
+            }
+        }, 1000);
+    }
+})();

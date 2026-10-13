@@ -179,7 +179,15 @@ impl Environment {
         }
         mask.enable(Action::CheckCall);
 
-        if player.stack > to_call {
+        let opponents_can_respond = self
+            .state
+            .players
+            .iter()
+            .enumerate()
+            .any(|(i, opp)| i != p_idx && opp.is_active());
+        let can_raise = player.stack > to_call && opponents_can_respond;
+
+        if can_raise {
             mask.enable(Action::AllIn);
         }
 
@@ -188,7 +196,7 @@ impl Environment {
             return mask;
         }
 
-        if player.stack > to_call {
+        if can_raise {
             let min_raise_total = self.state.current_highest_bet + self.state.min_raise;
             let mut last_target = 0u32;
             for &(act, frac) in RAISE_ACTIONS.iter() {

@@ -1,0 +1,75 @@
+// ==UserScript==
+// @name         PokerNow to Localhost Forwarder (Stable v8.0)
+// @namespace    http://tampermonkey.net/
+// @version      8.0
+// @description  Bắt trọn 100% gói tin gửi về receiver.rs mượt mà, không chặn WebSocket
+// @match        *://pokernow.com/games/*
+// @match        *://www.pokernow.com/games/*
+// @match        *://pokernow.club/games/*
+// @match        *://*.pokernow.club/games/*
+// @run-at       document-start
+// @grant        unsafeWindow
+// @grant        GM_xmlhttpRequest
+// @connect      127.0.0.1
+// @connect      localhost
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    if (!window.location.href.includes('/games/')) {
+        return;
+    }
+
+    console.log("⚡ [Tampermonkey v8.0] Đã gắn hook WebSocket cho phòng chơi!");
+
+    // Gửi sang Rust bằng GM_xmlhttpRequest (Bỏ qua rào cản HTTPS -> HTTP)
+    function sendToRust(payload) {
+        GM_xmlhttpRequest({
+            method: "POST",
+            url: "http://127.0.0.1:3000/packet",
+            headers: { "Content-Type": "application/json" },
+            data: payload,
+            timeout: 2000,
+            onerror: function() {},
+            ontimeout: function() {}
+        });
+    }
+
+    const win = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    const NativeWebSocket = win.WebSocket;
+
+    // Ghi đè hàm khởi tạo WebSocket một cách trong suốt
+    function CustomWebSocket(...args) {
+        const ws = new NativeWebSocket(...args);
+
+        // Lắng nghe sự kiện message mà KHÔNG làm gián đoạn game
+        ws.addEventListener('message', function(event) {
+            const raw = event.data;
+
+            // Xử lý chuỗi siêu tốc: Bỏ qua Regex, dùng slice/indexOf
+            if (typeof raw === 'string' && raw.length > 3 && raw.charCodeAt(0) === 52 && raw.charCodeAt(1) === 50) { // '42'
+                const startIdx = raw.indexOf('[');
+                if (startIdx !== -1 && raw.endsWith(']')) {
+                    const packet = raw.substring(startIdx);
+
+                    // Bắn sang Rust không đồng bộ
+                    setTimeout(() => {
+                        sendToRust(packet);
+                    }, 0);
+                }
+            }
+        }, false);
+
+        return ws;
+    }
+
+    // Bảo toàn 100% Prototype và Hằng số chuẩn (OPEN, CLOSED, CONNECTING...)
+    CustomWebSocket.prototype = NativeWebSocket.prototype;
+    CustomWebSocket.CONNECTING = NativeWebSocket.CONNECTING;
+    CustomWebSocket.OPEN = NativeWebSocket.OPEN;
+    CustomWebSocket.CLOSING = NativeWebSocket.CLOSING;
+    CustomWebSocket.CLOSED = NativeWebSocket.CLOSED;
+
+    win.WebSocket = CustomWebSocket;
+})();
