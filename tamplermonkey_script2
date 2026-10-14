@@ -92,27 +92,76 @@
         }
     }
 
+    function pressEnterOn(target) {
+        const el = target || document.activeElement || document.body;
+        try { el.focus(); } catch(e) {}
+        const eventParams = {
+            key: 'Enter',
+            code: 'Enter',
+            keyCode: 13,
+            which: 13,
+            charCode: 13,
+            bubbles: true,
+            cancelable: true
+        };
+        el.dispatchEvent(new KeyboardEvent('keydown', eventParams));
+        el.dispatchEvent(new KeyboardEvent('keypress', eventParams));
+        el.dispatchEvent(new KeyboardEvent('keyup', eventParams));
+        document.dispatchEvent(new KeyboardEvent('keydown', eventParams));
+        window.dispatchEvent(new KeyboardEvent('keydown', eventParams));
+    }
+
+    function findBetInput() {
+        // 1. Selector đặc thù thường gặp của PokerNow
+        let el = document.querySelector('input.bet-value, .raise-controller input, .action-buttons input, input.bet-input');
+        if (el && el.offsetParent !== null) return el;
+
+        // 2. Quét toàn bộ input trên trang, loại trừ ô chat và tìm kiếm
+        const allInputs = Array.from(document.querySelectorAll('input'));
+        for (const input of allInputs) {
+            if (input.type === 'hidden' || input.type === 'checkbox' || input.type === 'radio') continue;
+            const cls = (input.className || '').toLowerCase();
+            const placeholder = (input.placeholder || '').toLowerCase();
+            const name = (input.name || '').toLowerCase();
+            const id = (input.id || '').toLowerCase();
+
+            if (cls.includes('chat') || placeholder.includes('chat') || placeholder.includes('message') ||
+                id.includes('chat') || cls.includes('search') || placeholder.includes('search')) {
+                continue;
+            }
+
+            if (input.offsetParent !== null) {
+                return input;
+            }
+        }
+        return null;
+    }
+
     // Gán giá trị cược tương thích 100% với React.js (bypass React Synthetic Event wrapper)
     function setReactInputValue(input, val) {
         if (!input) return false;
         try {
             input.focus();
+            const strVal = String(val);
             const proto = (typeof unsafeWindow !== 'undefined' && unsafeWindow.HTMLInputElement)
                 ? unsafeWindow.HTMLInputElement.prototype
                 : window.HTMLInputElement.prototype;
             const nativeInputValueSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set
                 || Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
             if (nativeInputValueSetter) {
-                nativeInputValueSetter.call(input, val);
+                nativeInputValueSetter.call(input, strVal);
             } else {
-                input.value = val;
+                input.value = strVal;
+            }
+            if (input._valueTracker) {
+                input._valueTracker.setValue("");
             }
             input.dispatchEvent(new Event('input', { bubbles: true }));
             input.dispatchEvent(new Event('change', { bubbles: true }));
             return true;
         } catch (e) {
             try {
-                input.value = val;
+                input.value = String(val);
                 input.dispatchEvent(new Event('input', { bubbles: true }));
                 input.dispatchEvent(new Event('change', { bubbles: true }));
                 return true;
@@ -155,7 +204,7 @@
             return visibleButtons.find(b => {
                 const txt = b.textContent.trim().toLowerCase();
                 const cls = b.className.toLowerCase();
-                return txt.includes('all in') || txt.includes('all-in') || cls.includes('all-in') || cls.includes('allin');
+                return txt.includes('all in') || txt.includes('all-in') || cls.includes('all-in') || cls.includes('allin') || txt === 'max';
             });
         }
 
@@ -168,6 +217,83 @@
         }
 
         return null;
+    }
+
+    // Quy trình thực hiện Tố / Cược / All-In theo đúng thao tác bàn cờ PokerNow:
+    // 1. Nhấn 'r' (hoặc click nút Raise) để mở thanh cược
+    // 2. Điền số vào ô input
+    // 3. Bấm phím Enter TRỰC TIẾP tại ô input (và bổ trợ click nút xác nhận)
+    function performRaiseOrBet(amount, isAllIn = false) {
+        console.log(`🎯 [SILENT BOT] Bắt đầu thao tác ${isAllIn ? 'ALL-IN' : 'RAISE'}: ${amount} chip`);
+
+        // Bước 1: Mở thanh cược
+        pressKeyInPage('r');
+
+        const raiseToggleBtn = findActionButton('raise');
+        let input = findBetInput();
+        if (!input && raiseToggleBtn) {
+            clickElement(raiseToggleBtn);
+        }
+
+        // Bước 2: Đợi thanh cược mở (60ms) rồi điền số và Enter
+        setTimeout(() => {
+            input = findBetInput();
+
+            // Với All-In: Nếu có nút shortcut MAX / ALL IN thì click luôn
+            if (isAllIn) {
+                const maxBtn = Array.from(document.querySelectorAll('button, a.button, div[role="button"]')).find(b => {
+                    const txt = b.textContent.trim().toLowerCase();
+                    return b.offsetParent !== null && !b.disabled && (txt === 'max' || txt === 'all in' || txt === 'all-in');
+                });
+                if (maxBtn) {
+                    console.log("🚀 [SILENT BOT] Click nút MAX / ALL-IN!");
+                    clickElement(maxBtn);
+                }
+            }
+
+            if (input) {
+                // Focus và điền con số
+                input.focus();
+                setReactInputValue(input, amount);
+                console.log(`✍️ [SILENT BOT] Đã nhập ${amount} vào ô cược`);
+
+                // Bước 3: Bấm Enter TRỰC TIẾP tại ô input
+                setTimeout(() => {
+                    input.focus();
+                    pressEnterOn(input);
+                    console.log("⚡ [SILENT BOT] Đã bấm Enter tại ô cược!");
+
+                    // Dự phòng bước 4: Nếu có nút xác nhận cược chính ("Raise to...", "Bet...", "All-In") thì click hỗ trợ
+                    setTimeout(() => {
+                        const submitBtn = Array.from(document.querySelectorAll('button, a.button, div[role="button"]')).find(b => {
+                            if (b.offsetParent === null || b.disabled) return false;
+                            const txt = b.textContent.trim().toLowerCase();
+                            if (txt.includes('fold') || txt.includes('check') || txt.startsWith('call')) return false;
+                            if (txt === 'min' || txt === 'pot' || txt === 'max' || txt === '1/2' || txt === 'half') return false;
+                            return txt.startsWith('raise') || txt.startsWith('bet') || txt.includes('all-in') || txt.includes('all in');
+                        });
+                        if (submitBtn) {
+                            console.log(`🎯 [SILENT BOT] Bổ trợ click nút cược: "${submitBtn.textContent.trim()}"`);
+                            clickElement(submitBtn);
+                        }
+                    }, 50);
+                }, 50);
+            } else {
+                console.warn("⚠️ [SILENT BOT] Đang tìm lại ô cược...");
+                setTimeout(() => {
+                    const retryInput = findBetInput();
+                    if (retryInput) {
+                        retryInput.focus();
+                        setReactInputValue(retryInput, amount);
+                        pressEnterOn(retryInput);
+                    } else {
+                        pressEnterOn(null);
+                        const submitBtn = findActionButton('raise');
+                        if (submitBtn) clickElement(submitBtn);
+                    }
+                }, 80);
+            }
+        }, 60);
     }
 
     function executeSilentAction(cmd, attempt = 0) {
@@ -202,31 +328,16 @@
                 console.log("✅ [SILENT BOT] Đã click nút CALL!");
             }
         } else if (act === 'all_in') {
-            const allInBtn = findActionButton('all_in');
-            if (allInBtn) {
-                clickElement(allInBtn);
-                done = true;
+            // Kiểm tra nút All-In trực tiếp trước (nếu đối thủ đã bet hết stack mình)
+            const directAllIn = findActionButton('all_in');
+            if (directAllIn && (directAllIn.textContent.trim().toLowerCase().includes('all') || directAllIn.textContent.trim().toLowerCase() === 'max')) {
+                clickElement(directAllIn);
                 console.log("✅ [SILENT BOT] Đã click nút ALL-IN trực tiếp!");
-            } else {
-                pressKeyInPage('r');
-                const input = document.querySelector('input.bet-value, .raise-controller input, .action-buttons input, input[type="number"]');
-                if (input) setReactInputValue(input, cmd.amount);
-                setTimeout(() => {
-                    const raiseBtn = findActionButton('raise');
-                    if (raiseBtn) clickElement(raiseBtn);
-                    pressKeyInPage('Enter');
-                }, 80);
-                done = true;
             }
+            performRaiseOrBet(cmd.amount, true);
+            done = true;
         } else if (act === 'raise') {
-            pressKeyInPage('r');
-            const input = document.querySelector('input.bet-value, .raise-controller input, .action-buttons input, input[type="number"]');
-            if (input) setReactInputValue(input, cmd.amount);
-            setTimeout(() => {
-                const raiseBtn = findActionButton('raise');
-                if (raiseBtn) clickElement(raiseBtn);
-                pressKeyInPage('Enter');
-            }, 80);
+            performRaiseOrBet(cmd.amount, false);
             done = true;
         }
 
