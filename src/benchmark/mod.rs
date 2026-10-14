@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn test_feature_indices() {
         let mut rng = StdRng::seed_from_u64(7);
-        let mut env = Environment::new(6, &vec![10_000; 6], 100, 50, 0);
+        let mut env = Environment::new(6, &[10_000; 6], 100, 50, 0);
         env.reset_hand(&mut rng, 0);
         let cur = env.state.current_player_idx;
         let f = env.state.encode_features(cur);

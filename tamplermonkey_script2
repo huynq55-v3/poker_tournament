@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         PokerNow to Localhost Forwarder (Stable v8.0)
+// @name         PokerNow to Localhost Forwarder (Stable v8.7 Silent React Bot)
 // @namespace    http://tampermonkey.net/
-// @version      8.0
-// @description  Bắt trọn 100% gói tin gửi về receiver.rs mượt mà, không chặn WebSocket
+// @version      8.7
+// @description  Bắt trọn 100% gói tin gửi về receiver.rs & Tự chơi ngầm 100% trong tab (React DOM Clicker - Không chiếm chuột, không chiếm phím)
 // @match        *://pokernow.com/games/*
 // @match        *://www.pokernow.com/games/*
 // @match        *://pokernow.club/games/*
@@ -21,9 +21,225 @@
         return;
     }
 
-    console.log("⚡ [Tampermonkey v8.0] Đã gắn hook WebSocket cho phòng chơi!");
+    console.log("⚡ [Tampermonkey v8.7] Silent React In-Page Bot đã kích hoạt!");
 
-    // Gửi sang Rust bằng GM_xmlhttpRequest (Bỏ qua rào cản HTTPS -> HTTP)
+    // =========================================================================
+    // 🥷 CÁC HÀM THỰC THI HÀNH ĐỘNG NGẦM TRONG TAB (ZERO MOUSE & KEYBOARD HIJACKING)
+    // =========================================================================
+
+    function pressKeyInPage(keyChar) {
+        const codeMap = {
+            'f': { key: 'f', code: 'KeyF', keyCode: 70 },
+            'k': { key: 'k', code: 'KeyK', keyCode: 75 },
+            'c': { key: 'c', code: 'KeyC', keyCode: 67 },
+            'r': { key: 'r', code: 'KeyR', keyCode: 82 },
+            'Enter': { key: 'Enter', code: 'Enter', keyCode: 13 }
+        };
+        const info = codeMap[keyChar];
+        if (!info) return;
+
+        const target = document.activeElement || document.body || window;
+        const down = new KeyboardEvent('keydown', {
+            key: info.key,
+            code: info.code,
+            keyCode: info.keyCode,
+            which: info.keyCode,
+            bubbles: true,
+            cancelable: true
+        });
+        const up = new KeyboardEvent('keyup', {
+            key: info.key,
+            code: info.code,
+            keyCode: info.keyCode,
+            which: info.keyCode,
+            bubbles: true,
+            cancelable: true
+        });
+
+        window.dispatchEvent(down);
+        document.dispatchEvent(down);
+        target.dispatchEvent(down);
+        window.dispatchEvent(up);
+        document.dispatchEvent(up);
+        target.dispatchEvent(up);
+    }
+
+    function clickElement(el) {
+        if (!el) return false;
+        try {
+            el.focus();
+            ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(evtName => {
+                try {
+                    const ev = new MouseEvent(evtName, {
+                        bubbles: true,
+                        cancelable: true
+                    });
+                    el.dispatchEvent(ev);
+                } catch (err) {}
+            });
+            if (typeof el.click === 'function') {
+                el.click();
+            }
+            return true;
+        } catch (e) {
+            try {
+                el.click();
+                return true;
+            } catch (e2) {
+                console.error("❌ [SILENT BOT] Lỗi click nút:", e2);
+                return false;
+            }
+        }
+    }
+
+    // Gán giá trị cược tương thích 100% với React.js (bypass React Synthetic Event wrapper)
+    function setReactInputValue(input, val) {
+        if (!input) return false;
+        try {
+            input.focus();
+            const proto = (typeof unsafeWindow !== 'undefined' && unsafeWindow.HTMLInputElement)
+                ? unsafeWindow.HTMLInputElement.prototype
+                : window.HTMLInputElement.prototype;
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set
+                || Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+            if (nativeInputValueSetter) {
+                nativeInputValueSetter.call(input, val);
+            } else {
+                input.value = val;
+            }
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+        } catch (e) {
+            try {
+                input.value = val;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                return true;
+            } catch (e2) {
+                console.error("❌ [SILENT BOT] Lỗi set input React:", e2);
+                return false;
+            }
+        }
+    }
+
+    function findActionButton(type) {
+        const allButtons = Array.from(document.querySelectorAll('button, a.button, div[role="button"]'));
+        const visibleButtons = allButtons.filter(b => b.offsetParent !== null && !b.disabled);
+
+        if (type === 'fold') {
+            return visibleButtons.find(b => {
+                const txt = b.textContent.trim().toLowerCase();
+                const cls = b.className.toLowerCase();
+                return txt === 'fold' || cls.includes('fold') || txt.includes('fold');
+            });
+        }
+
+        if (type === 'check') {
+            return visibleButtons.find(b => {
+                const txt = b.textContent.trim().toLowerCase();
+                const cls = b.className.toLowerCase();
+                return txt === 'check' || cls.includes('check');
+            });
+        }
+
+        if (type === 'call') {
+            return visibleButtons.find(b => {
+                const txt = b.textContent.trim().toLowerCase();
+                const cls = b.className.toLowerCase();
+                return txt.startsWith('call') || cls.includes('call') || txt.includes('call');
+            });
+        }
+
+        if (type === 'all_in') {
+            return visibleButtons.find(b => {
+                const txt = b.textContent.trim().toLowerCase();
+                const cls = b.className.toLowerCase();
+                return txt.includes('all in') || txt.includes('all-in') || cls.includes('all-in') || cls.includes('allin');
+            });
+        }
+
+        if (type === 'raise') {
+            return visibleButtons.find(b => {
+                const txt = b.textContent.trim().toLowerCase();
+                const cls = b.className.toLowerCase();
+                return txt.includes('raise') || txt.includes('bet') || cls.includes('raise') || cls.includes('bet');
+            });
+        }
+
+        return null;
+    }
+
+    function executeSilentAction(cmd, attempt = 0) {
+        if (!cmd || !cmd.action) return;
+        const act = cmd.action.toLowerCase();
+        console.log(`🥷 [SILENT BOT] Thực thi hành động ngầm: ${act.toUpperCase()} (Chip: ${cmd.amount || 0})`);
+
+        let done = false;
+
+        if (act === 'fold') {
+            pressKeyInPage('f');
+            const btn = findActionButton('fold');
+            if (btn) {
+                clickElement(btn);
+                done = true;
+                console.log("✅ [SILENT BOT] Đã click nút FOLD!");
+            }
+        } else if (act === 'check') {
+            pressKeyInPage('k');
+            const btn = findActionButton('check');
+            if (btn) {
+                clickElement(btn);
+                done = true;
+                console.log("✅ [SILENT BOT] Đã click nút CHECK!");
+            }
+        } else if (act === 'call') {
+            pressKeyInPage('c');
+            const btn = findActionButton('call');
+            if (btn) {
+                clickElement(btn);
+                done = true;
+                console.log("✅ [SILENT BOT] Đã click nút CALL!");
+            }
+        } else if (act === 'all_in') {
+            const allInBtn = findActionButton('all_in');
+            if (allInBtn) {
+                clickElement(allInBtn);
+                done = true;
+                console.log("✅ [SILENT BOT] Đã click nút ALL-IN trực tiếp!");
+            } else {
+                pressKeyInPage('r');
+                const input = document.querySelector('input.bet-value, .raise-controller input, .action-buttons input, input[type="number"]');
+                if (input) setReactInputValue(input, cmd.amount);
+                setTimeout(() => {
+                    const raiseBtn = findActionButton('raise');
+                    if (raiseBtn) clickElement(raiseBtn);
+                    pressKeyInPage('Enter');
+                }, 80);
+                done = true;
+            }
+        } else if (act === 'raise') {
+            pressKeyInPage('r');
+            const input = document.querySelector('input.bet-value, .raise-controller input, .action-buttons input, input[type="number"]');
+            if (input) setReactInputValue(input, cmd.amount);
+            setTimeout(() => {
+                const raiseBtn = findActionButton('raise');
+                if (raiseBtn) clickElement(raiseBtn);
+                pressKeyInPage('Enter');
+            }, 80);
+            done = true;
+        }
+
+        // Nếu bàn chơi đang trong hoạt ảnh chưa kịp hiện nút, thử lại sau 120ms (tối đa 4 lần)
+        if (!done && attempt < 4) {
+            setTimeout(() => executeSilentAction(cmd, attempt + 1), 120);
+        }
+    }
+
+    // =========================================================================
+    // 🌐 GIAO TIẾP VỚI RUST BACKEND (:3000)
+    // =========================================================================
+
     function sendToRust(payload) {
         GM_xmlhttpRequest({
             method: "POST",
@@ -31,29 +247,53 @@
             headers: { "Content-Type": "application/json" },
             data: payload,
             timeout: 2000,
-            onerror: function() {},
+            onload: function(response) {
+                try {
+                    const data = JSON.parse(response.responseText);
+                    if (data && data.bot_action) {
+                        console.log("📥 [SILENT BOT] Nhận lệnh từ Rust:", data.bot_action);
+                        executeSilentAction(data.bot_action);
+                    }
+                } catch(e) {
+                    console.error("❌ Lỗi parse response từ Rust:", e);
+                }
+            },
+            onerror: function(err) {
+                // Server chưa bật hoặc lỗi kết nối
+            },
             ontimeout: function() {}
         });
     }
 
+    // Kiểm tra và gửi lại gói registered đã lưu trong sessionStorage nếu có (phòng khi Rust restart)
+    try {
+        const cachedReg = sessionStorage.getItem('pn_registered_packet');
+        if (cachedReg) {
+            setTimeout(() => {
+                console.log("🔄 [SILENT BOT] Đồng bộ lại thông tin người chơi từ Cache...");
+                sendToRust(cachedReg);
+            }, 1000);
+        }
+    } catch(e) {}
+
     const win = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
     const NativeWebSocket = win.WebSocket;
 
-    // Ghi đè hàm khởi tạo WebSocket một cách trong suốt
     function CustomWebSocket(...args) {
         const ws = new NativeWebSocket(...args);
 
-        // Lắng nghe sự kiện message mà KHÔNG làm gián đoạn game
         ws.addEventListener('message', function(event) {
             const raw = event.data;
-
-            // Xử lý chuỗi siêu tốc: Bỏ qua Regex, dùng slice/indexOf
             if (typeof raw === 'string' && raw.length > 3 && raw.charCodeAt(0) === 52 && raw.charCodeAt(1) === 50) { // '42'
                 const startIdx = raw.indexOf('[');
                 if (startIdx !== -1 && raw.endsWith(']')) {
                     const packet = raw.substring(startIdx);
 
-                    // Bắn sang Rust không đồng bộ
+                    // Lưu cache gói registered
+                    if (packet.includes('"registered"') || packet.includes('"currentPlayer"')) {
+                        try { sessionStorage.setItem('pn_registered_packet', packet); } catch(e) {}
+                    }
+
                     setTimeout(() => {
                         sendToRust(packet);
                     }, 0);
@@ -64,7 +304,6 @@
         return ws;
     }
 
-    // Bảo toàn 100% Prototype và Hằng số chuẩn (OPEN, CLOSED, CONNECTING...)
     CustomWebSocket.prototype = NativeWebSocket.prototype;
     CustomWebSocket.CONNECTING = NativeWebSocket.CONNECTING;
     CustomWebSocket.OPEN = NativeWebSocket.OPEN;

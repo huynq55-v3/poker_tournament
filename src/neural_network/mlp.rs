@@ -393,6 +393,33 @@ impl MLP {
     }
 }
 
+/// Gradient của cả mạng, dùng làm bộ cộng dồn cho từng luồng
+struct Grads {
+    w: Vec<Vec<f32>>,
+    b: Vec<Vec<f32>>,
+}
+
+impl Grads {
+    fn zeros(layers: &[DenseLayer]) -> Self {
+        Grads {
+            w: layers.iter().map(|l| vec![0.0; l.in_features * l.out_features]).collect(),
+            b: layers.iter().map(|l| vec![0.0; l.out_features]).collect(),
+        }
+    }
+    fn add(&mut self, o: &Grads) {
+        for (a, b) in self.w.iter_mut().zip(&o.w) {
+            for (x, y) in a.iter_mut().zip(b) {
+                *x += *y;
+            }
+        }
+        for (a, b) in self.b.iter_mut().zip(&o.b) {
+            for (x, y) in a.iter_mut().zip(b) {
+                *x += *y;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,32 +462,5 @@ mod tests {
         let inputs = vec![vec![0.1, 0.2, 0.3]];
         let targets = vec![vec![1.0, 0.0]];
         let _ = loaded.train_batch(&inputs, &targets, None, None, LossType::MSE, 0.01, 0.0);
-    }
-}
-
-/// Gradient của cả mạng, dùng làm bộ cộng dồn cho từng luồng
-struct Grads {
-    w: Vec<Vec<f32>>,
-    b: Vec<Vec<f32>>,
-}
-
-impl Grads {
-    fn zeros(layers: &[DenseLayer]) -> Self {
-        Grads {
-            w: layers.iter().map(|l| vec![0.0; l.in_features * l.out_features]).collect(),
-            b: layers.iter().map(|l| vec![0.0; l.out_features]).collect(),
-        }
-    }
-    fn add(&mut self, o: &Grads) {
-        for (a, b) in self.w.iter_mut().zip(&o.w) {
-            for (x, y) in a.iter_mut().zip(b) {
-                *x += *y;
-            }
-        }
-        for (a, b) in self.b.iter_mut().zip(&o.b) {
-            for (x, y) in a.iter_mut().zip(b) {
-                *x += *y;
-            }
-        }
     }
 }

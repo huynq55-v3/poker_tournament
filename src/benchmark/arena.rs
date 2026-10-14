@@ -69,7 +69,7 @@ fn play_arena_hand<R: Rng>(
         }
 
         let feats = env.state.encode_features(cur);
-        let is_challenger = cur % 2 == 0;
+        let is_challenger = cur.is_multiple_of(2);
 
         let action = if is_challenger {
             let a = challenger.select_action(&feats, &mask);

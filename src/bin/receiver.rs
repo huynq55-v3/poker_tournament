@@ -24,6 +24,13 @@ enum DecisionMode {
     PureGtoRoll,   // --roll: 100% GTO Roll nguyên bản
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct InPageAction {
+    pub action: String, // "fold", "check", "call", "all_in", "raise"
+    pub amount: u32,
+    pub to_call: u32,
+}
+
 #[derive(Clone, Debug)]
 struct PlayerTracker {
     id: String,
@@ -172,12 +179,214 @@ fn type_bet_amount(enigo: &mut Enigo, amount: u32) {
     let _ = enigo.key(Key::Return, enigo::Direction::Click);
 }
 
+// =========================================================================
+// 🪟 WINDOW FOCUS MODULE (KHÔNG CHIẾM CHUỘT / KHÔNG DI CHUỘT)
+// =========================================================================
+
+static TARGET_GAME_ID: RwLock<String> = RwLock::new(String::new());
+
+pub fn set_target_game(url_or_id: &str) {
+    let id = if let Some(idx) = url_or_id.rfind("/games/") {
+        &url_or_id[idx + 7..]
+    } else {
+        url_or_id
+    };
+    let clean_id = id.trim_matches('/').to_string();
+    if let Ok(mut lock) = TARGET_GAME_ID.write() {
+        *lock = clean_id;
+    }
+}
+
+pub fn get_target_game_keywords() -> Vec<String> {
+    let mut kw = vec![
+        "Poker Now".to_string(),
+        "pokernow".to_string(),
+    ];
+    if let Ok(lock) = TARGET_GAME_ID.read() {
+        if !lock.is_empty() {
+            kw.insert(0, lock.clone());
+        }
+    }
+    kw
+}
+
+#[cfg(target_os = "windows")]
+mod win_focus {
+    use std::ffi::c_void;
+
+    type HWND = *mut c_void;
+    type BOOL = i32;
+    type DWORD = u32;
+    type LPARAM = isize;
+    type WNDENUMPROC = Option<unsafe extern "system" fn(HWND, LPARAM) -> BOOL>;
+
+    const SW_RESTORE: i32 = 9;
+    const SW_SHOW: i32 = 5;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumWindows(lpEnumFunc: WNDENUMPROC, lParam: LPARAM) -> BOOL;
+        fn IsWindowVisible(hWnd: HWND) -> BOOL;
+        fn GetWindowTextW(hWnd: HWND, lpString: *mut u16, nMaxCount: i32) -> i32;
+        fn GetForegroundWindow() -> HWND;
+        fn GetWindowThreadProcessId(hWnd: HWND, lpdwProcessId: *mut DWORD) -> DWORD;
+        fn AttachThreadInput(idAttach: DWORD, idAttachTo: DWORD, fAttach: BOOL) -> BOOL;
+        fn ShowWindow(hWnd: HWND, nCmdShow: i32) -> BOOL;
+        fn SetForegroundWindow(hWnd: HWND) -> BOOL;
+        fn BringWindowToTop(hWnd: HWND) -> BOOL;
+        fn SetFocus(hWnd: HWND) -> HWND;
+        fn IsIconic(hWnd: HWND) -> BOOL;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThreadId() -> DWORD;
+    }
+
+    struct SearchContext {
+        keywords: Vec<String>,
+        target_hwnd: Option<HWND>,
+    }
+
+    unsafe extern "system" fn enum_window_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let ctx = &mut *(lparam as *mut SearchContext);
+        if IsWindowVisible(hwnd) == 0 {
+            return 1;
+        }
+
+        let mut buf = [0u16; 512];
+        let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), 512);
+        if len > 0 {
+            let title = String::from_utf16_lossy(&buf[..len as usize]).to_lowercase();
+            for kw in &ctx.keywords {
+                if title.contains(&kw.to_lowercase()) {
+                    ctx.target_hwnd = Some(hwnd);
+                    return 0; // Tìm thấy cửa sổ khớp, dừng duyệt
+                }
+            }
+        }
+        1
+    }
+
+    pub fn focus_window(keywords: &[String]) -> bool {
+        let mut ctx = SearchContext {
+            keywords: keywords.to_vec(),
+            target_hwnd: None,
+        };
+
+        unsafe {
+            EnumWindows(Some(enum_window_callback), &mut ctx as *mut _ as LPARAM);
+
+            if let Some(hwnd) = ctx.target_hwnd {
+                let fg_wnd = GetForegroundWindow();
+                let fg_thread = GetWindowThreadProcessId(fg_wnd, std::ptr::null_mut());
+                let cur_thread = GetCurrentThreadId();
+
+                if fg_thread != cur_thread && fg_thread != 0 {
+                    AttachThreadInput(cur_thread, fg_thread, 1);
+                }
+
+                if IsIconic(hwnd) != 0 {
+                    ShowWindow(hwnd, SW_RESTORE);
+                } else {
+                    ShowWindow(hwnd, SW_SHOW);
+                }
+
+                SetForegroundWindow(hwnd);
+                BringWindowToTop(hwnd);
+                SetFocus(hwnd);
+
+                if fg_thread != cur_thread && fg_thread != 0 {
+                    AttachThreadInput(cur_thread, fg_thread, 0);
+                }
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux_focus {
+    use std::process::Command;
+
+    pub fn focus_window(keywords: &[String]) -> bool {
+        // 1. Thử dùng wmctrl nếu có (chuẩn X11 / Xwayland)
+        for kw in keywords {
+            if let Ok(status) = Command::new("wmctrl").args(["-a", kw]).status() {
+                if status.success() {
+                    return true;
+                }
+            }
+        }
+
+        // 2. Thử dùng xdotool nếu có
+        for kw in keywords {
+            if let Ok(output) = Command::new("xdotool").args(["search", "--name", kw]).output() {
+                if output.status.success() {
+                    let wids = String::from_utf8_lossy(&output.stdout);
+                    if let Some(first_id) = wids.lines().next() {
+                        let trimmed = first_id.trim();
+                        if !trimmed.is_empty() {
+                            let _ = Command::new("xdotool").args(["windowactivate", trimmed]).status();
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. GNOME Wayland / Desktop Apps (Kích hoạt cửa sổ trình duyệt đang chạy)
+        for app in &["google-chrome", "google-chrome.desktop", "brave-browser", "firefox", "chromium"] {
+            if let Ok(status) = Command::new("gtk-launch").arg(app).status() {
+                if status.success() {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+}
+
+/// Tự động đưa cửa sổ PokerNow lên foreground mà KHÔNG chiếm chuột, KHÔNG di chuyển trỏ chuột
+pub fn focus_pokernow_window() {
+    let keywords = get_target_game_keywords();
+
+    #[cfg(target_os = "windows")]
+    {
+        if win_focus::focus_window(&keywords) {
+            println!("🪟 [FOCUS] Đã tự động focus cửa sổ PokerNow (Windows - không chiếm chuột)!");
+        } else {
+            println!("⚠️ [FOCUS] Chưa tìm thấy cửa sổ PokerNow trên Windows.");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if linux_focus::focus_window(&keywords) {
+            println!("🪟 [FOCUS] Đã kích hoạt cửa sổ PokerNow trên Linux (không chiếm chuột)!");
+        } else {
+            println!("⚠️ [FOCUS] Đã gửi lệnh kích hoạt cửa sổ trình duyệt (Linux).");
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        println!("ℹ️ Nền tảng chưa hỗ trợ window focus tự động.");
+    }
+}
+
 // Hàm thực hiện tự động gõ phím vào cửa sổ đang focus
 fn execute_bot_action(action: Action, to_call: u32, target_total: u32, max_total_bet: u32, can_raise: bool) {
-    let mut enigo = Enigo::new(&Settings::default()).unwrap();
+    // 🪟 TỰ ĐỘNG FOCUS CỬA SỔ POKERNOW (KHÔNG CHIẾM CHUỘT / KHÔNG DI CHUỘT)
+    focus_pokernow_window();
 
-    // Chờ một nhịp nhỏ để ổn định giao diện
-    thread::sleep(Duration::from_millis(300));
+    // Chờ 250ms để cửa sổ nhận focus trọn vẹn và giao diện sẵn sàng nhận phím
+    thread::sleep(Duration::from_millis(250));
+
+    let mut enigo = Enigo::new(&Settings::default()).unwrap();
 
     // 🛡️ BẢO VỆ TUYỆT ĐỐI: Nếu bàn không thể Tố (đối thủ đã All-In hoặc không còn ai có chip),
     // tự động chuyển hướng an toàn: nếu to_call == 0 thì CHECK, nếu to_call > 0 thì CALL!
@@ -228,6 +437,24 @@ fn main() {
     println!("⚡ POKERNOW REAL-TIME GTO ASSISTANT & AUTO-BOT (v3)");
     println!("============================================================");
 
+    // Cấu hình URL / ID phòng game để tự động focus
+    let default_game = "https://www.pokernow.com/games/pglq3HyXKRV6Klg6v5XNQA0_i";
+    let mut target_url = default_game.to_string();
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if (args[i] == "--game-url" || args[i] == "--game-id" || args[i] == "-g") && i + 1 < args.len() {
+            target_url = args[i + 1].clone();
+            i += 1;
+        }
+        i += 1;
+    }
+    set_target_game(&target_url);
+    println!("🎮 Target Game URL: {}", target_url);
+    if let Ok(id) = TARGET_GAME_ID.read() {
+        println!("🔑 Target Game ID:  [{}]", *id);
+    }
+
     print!("📐 Nạp bảng Preflop Equity... ");
     std::io::stdout().flush().unwrap();
     let _ = poker_tournament::equity::preflop_table();
@@ -247,6 +474,7 @@ fn main() {
     } else {
         DecisionMode::GuardedMixing
     };
+    let use_os_enigo = std::env::args().any(|a| a == "--enigo" || a == "--use-enigo");
 
     let listener = TcpListener::bind("127.0.0.1:3000").expect("Không thể mở cổng 3000");
     println!("🌐 Server sẵn sàng tại http://127.0.0.1:3000");
@@ -256,18 +484,18 @@ fn main() {
         DecisionMode::PureGtoRoll => "🎲 PURE GTO ROLL (Tung xúc xắc theo % GTO nguyên bản)",
     };
     println!("🎯 Chế độ ra quyết định: {}", mode_desc);
+    println!("🔇 Chế độ thực thi: {}", if use_os_enigo { "🖥️ OS Keyboard (Enigo - Cần cửa sổ focus)" } else { "🥷 100% SILENT IN-PAGE (Tampermonkey DOM - Không chiếm chuột, không chiếm phím, vừa làm việc vừa chơi)" });
     println!("👀 Đang theo dõi, đồng bộ PokerNow và bật Auto-Bot...\n");
 
     let mut state = HandState::new();
 
-    for stream in listener.incoming() {
-        if let Ok(mut stream) = stream {
-            let mut raw_data = Vec::with_capacity(16384);
-            let mut temp_buf = [0u8; 8192];
+    for mut stream in listener.incoming().flatten() {
+        let mut raw_data = Vec::with_capacity(16384);
+        let mut temp_buf = [0u8; 8192];
 
-            while let Ok(n) = stream.read(&mut temp_buf) {
-                if n == 0 { break; }
-                raw_data.extend_from_slice(&temp_buf[..n]);
+        while let Ok(n) = stream.read(&mut temp_buf) {
+            if n == 0 { break; }
+            raw_data.extend_from_slice(&temp_buf[..n]);
 
                 if let Some(header_end) = raw_data.windows(4).position(|w| w == b"\r\n\r\n") {
                     let header_str = String::from_utf8_lossy(&raw_data[..header_end]);
@@ -292,13 +520,13 @@ fn main() {
                         let body_str = String::from_utf8_lossy(body_slice);
                         let trimmed = body_str.trim();
 
+                        let mut pending_action: Option<InPageAction> = None;
                         if !trimmed.is_empty() {
                             if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
                                 if let Some(arr) = val.as_array() {
                                     if arr.len() >= 2 {
                                         let event_name = arr[0].as_str().unwrap_or("");
                                         let payload = &arr[1];
-
                                         if event_name == "registered" {
                                             if let Some(cp) = payload.get("currentPlayer") {
                                                 if let Some(id) = cp.get("id").and_then(|v| v.as_str()) {
@@ -308,27 +536,39 @@ fn main() {
                                                 }
                                             }
                                             if let Some(gs) = payload.get("gameState") {
-                                                process_game_update(&mut state, gs, &policy, decision_mode);
+                                                pending_action = process_game_update(&mut state, gs, &policy, decision_mode, use_os_enigo);
                                             }
                                         } else if event_name == "gC" {
-                                            process_game_update(&mut state, payload, &policy, decision_mode);
+                                            pending_action = process_game_update(&mut state, payload, &policy, decision_mode, use_os_enigo);
                                         }
                                     }
                                 }
                             }
                         }
 
-                        let response = "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\nContent-Length: 2\r\n\r\nOK";
+                        let resp_body = if let Some(ref cmd) = pending_action {
+                            serde_json::to_string(&serde_json::json!({
+                                "status": "ok",
+                                "bot_action": cmd
+                            })).unwrap_or_else(|_| r#"{"status":"ok"}"#.to_string())
+                        } else {
+                            r#"{"status":"ok"}"#.to_string()
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                            resp_body.len(),
+                            resp_body
+                        );
                         let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
                         break;
                     }
                 }
-            }
         }
     }
 }
 
-fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRPolicy, mode: DecisionMode) {
+fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRPolicy, mode: DecisionMode, use_os_enigo: bool) -> Option<InPageAction> {
     if let Some(hi) = payload.get("hI").and_then(|v| v.as_str()) {
         if state.hand_id != hi { state.start_new_hand(hi); }
     }
@@ -358,7 +598,7 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
     if let Some(arr) = payload.get("seats").and_then(|v| v.as_array()) {
         let mut v: Vec<(u64, String)> = arr.iter().filter_map(|s| {
             let a = s.as_array()?;
-            Some((a.get(0)?.as_u64()?, a.get(1)?.as_str()?.to_string()))
+            Some((a.first()?.as_u64()?, a.get(1)?.as_str()?.to_string()))
         }).collect();
         v.sort();
         state.seats_order = v.into_iter().map(|(_, id)| id).collect();
@@ -402,8 +642,8 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
             let prev_bet = entry.current_bet;
             if let Some(amt) = bval.as_u64() {
                 let new_bet = amt as u32;
-                if new_bet > prev_bet && new_bet > state.bb_size {
-                    if pid != &state.hero_id { state.has_evaluated_this_decision = false; }
+                if new_bet > prev_bet && new_bet > state.bb_size && pid != &state.hero_id {
+                    state.has_evaluated_this_decision = false;
                 }
                 entry.current_bet = new_bet;
             } else if bval.as_str() == Some("<D>") {
@@ -450,7 +690,10 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
 
     if let Some(pc_obj) = payload.get("pC").and_then(|v| v.as_object()) {
         for (pid, cdata) in pc_obj {
-            let is_showdown = cdata.get("cards").and_then(|c| c.as_array()).map_or(false, |arr| arr.iter().any(|item| item.get("showing") == Some(&Value::Bool(true))));
+            let is_showdown = cdata
+                .get("cards")
+                .and_then(|c| c.as_array())
+                .is_some_and(|arr| arr.iter().any(|item| item.get("showing") == Some(&Value::Bool(true))));
             if is_showdown { continue; }
 
             let cards_val = cdata.get("cards").or_else(|| cdata.get("c"));
@@ -475,11 +718,11 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
             let mavtb_u32 = mavtb as u32;
             if actor == state.hero_id {
                 state.hero_mavtb = Some(mavtb_u32);
-            }
-            if let Some(p) = state.players.get_mut(actor) {
-                // mAVTB là tổng cược tối đa hợp lệ trên PokerNow (bao gồm cả bet hiện tại).
-                // Stack còn lại sau lưng của người chơi = mAVTB - current_bet.
-                p.stack = mavtb_u32.saturating_sub(p.current_bet);
+                if let Some(p) = state.players.get_mut(actor) {
+                    // mAVTB là tổng cược tối đa hợp lệ trên PokerNow (bao gồm cả bet hiện tại).
+                    // Stack còn lại sau lưng của người chơi = mAVTB - current_bet.
+                    p.stack = mavtb_u32.saturating_sub(p.current_bet);
+                }
             }
         }
 
@@ -487,7 +730,7 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
             if !state.has_evaluated_this_decision {
                 if let Some(hole) = state.hero_cards {
                     state.has_evaluated_this_decision = true;
-                    run_gto_evaluation(state, hole, policy, mode);
+                    return run_gto_evaluation(state, hole, policy, mode, use_os_enigo);
                 } else {
                     println!("⏳ Đến lượt bạn nhưng ván này chưa nhận diện được bài tẩy!");
                 }
@@ -496,9 +739,11 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
             state.has_evaluated_this_decision = false;
         }
     }
+
+    None
 }
 
-fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy, mode: DecisionMode) {
+fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy, mode: DecisionMode, use_os_enigo: bool) -> Option<InPageAction> {
     let mut sorted_players: Vec<&PlayerTracker> = state.players.values().collect();
     sorted_players.sort_by_key(|p| p.seat_num);
 
@@ -508,7 +753,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
         .map(|p| p.id.clone())
         .collect();
 
-    if active_seats.is_empty() { return; }
+    if active_seats.is_empty() { return None; }
 
     let num_players = active_seats.len().clamp(2, 8);
     let hero_seat = active_seats.iter().position(|id| id == &state.hero_id).unwrap_or(0);
@@ -541,7 +786,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     }
 
     let in_hand_count = active_seats.iter().filter(|pid| {
-        state.players.get(*pid).map_or(false, |pl| !pl.is_folded)
+        state.players.get(*pid).is_some_and(|pl| !pl.is_folded)
     }).count();
 
     let button_idx = if let Some(ref did) = state.dealer_id { active_seats.iter().position(|id| id == did).unwrap_or(0) } else { 0 };
@@ -569,7 +814,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
         pid != &state.hero_id && !p.is_folded && !p.is_all_in && p.stack > 0
     });
     let has_chips_to_raise = hero_stack_behind > to_call;
-    let mavtb_allows_raise = state.hero_mavtb.map_or(true, |m| m > actual_highest_bet);
+    let mavtb_allows_raise = state.hero_mavtb.is_none_or(|m| m > actual_highest_bet);
     let can_raise = has_opp_with_chips && has_chips_to_raise && mavtb_allows_raise;
 
     let mut mask = env.get_action_mask();
@@ -651,11 +896,11 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
             let mut b_idx = 0;
             let mut b_ev = f32::NEG_INFINITY;
             for (i, &adv) in raw_adv.iter().enumerate().take(6) {
-                if mask.is_index_valid(i) {
-                    if adv > b_ev + 1e-4 || ((adv - b_ev).abs() <= 1e-4 && clean_probs[i] > clean_probs[b_idx]) {
-                        b_ev = adv;
-                        b_idx = i;
-                    }
+                if mask.is_index_valid(i)
+                    && (adv > b_ev + 1e-4 || ((adv - b_ev).abs() <= 1e-4 && clean_probs[i] > clean_probs[b_idx]))
+                {
+                    b_ev = adv;
+                    b_idx = i;
                 }
             }
             (b_idx, "⚡ [MAX-EV GREEDY] Luôn chọn nước có EV cao nhất".to_string())
@@ -663,7 +908,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
         DecisionMode::PureGtoRoll => {
             // 2. PURE GTO RANDOM ROLL (WeightedIndex trên toàn bộ clean_probs)
             let mut rng = rand::thread_rng();
-            let idx = if let Ok(dist) = rand::distributions::WeightedIndex::new(&clean_probs) {
+            let idx = if let Ok(dist) = rand::distributions::WeightedIndex::new(clean_probs) {
                 use rand::distributions::Distribution;
                 dist.sample(&mut rng)
             } else {
@@ -735,7 +980,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
 
                 let picked = if sum_guarded > 0.0 {
                     for p in &mut guarded_probs { *p /= sum_guarded; }
-                    if let Ok(dist) = rand::distributions::WeightedIndex::new(&guarded_probs) {
+                    if let Ok(dist) = rand::distributions::WeightedIndex::new(guarded_probs) {
                         use rand::distributions::Distribution;
                         dist.sample(&mut rng)
                     } else {
@@ -847,6 +1092,69 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
             _ => {}
         }
 
-        execute_bot_action(best_action, to_call, target_total, max_total_bet, can_raise);
+        let safe_action = if !can_raise && best_action != Action::Fold && best_action != Action::CheckCall {
+            if to_call == 0 {
+                println!("⚠️ [BẢO VỆ] Bàn không thể Tố/All-In -> Tự động chuyển thành CHECK!");
+            } else {
+                println!("⚠️ [BẢO VỆ] Bàn không thể Tố/All-In -> Tự động chuyển thành CALL!");
+            }
+            Action::CheckCall
+        } else {
+            best_action
+        };
+
+        let in_page_cmd = match safe_action {
+            Action::Fold => InPageAction {
+                action: "fold".to_string(),
+                amount: 0,
+                to_call: 0,
+            },
+            Action::CheckCall => {
+                if to_call == 0 {
+                    InPageAction {
+                        action: "check".to_string(),
+                        amount: 0,
+                        to_call: 0,
+                    }
+                } else {
+                    InPageAction {
+                        action: "call".to_string(),
+                        amount: to_call,
+                        to_call,
+                    }
+                }
+            }
+            Action::AllIn => InPageAction {
+                action: "all_in".to_string(),
+                amount: max_total_bet,
+                to_call,
+            },
+            Action::BetPot33 | Action::BetPot66 | Action::BetPot100 => {
+                let final_bet = target_total.min(max_total_bet);
+                if final_bet >= max_total_bet {
+                    InPageAction {
+                        action: "all_in".to_string(),
+                        amount: max_total_bet,
+                        to_call,
+                    }
+                } else {
+                    InPageAction {
+                        action: "raise".to_string(),
+                        amount: final_bet,
+                        to_call,
+                    }
+                }
+            }
+        };
+
+        if use_os_enigo {
+            execute_bot_action(safe_action, to_call, target_total, max_total_bet, can_raise);
+        } else {
+            println!("🥷 [SILENT MODE] Lệnh hành động đã gửi ngầm sang Browser: {:?} (Số chip: {})", in_page_cmd.action.to_uppercase(), in_page_cmd.amount);
+        }
+
+        return Some(in_page_cmd);
     }
+
+    None
 }

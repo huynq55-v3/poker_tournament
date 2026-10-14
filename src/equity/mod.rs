@@ -202,7 +202,7 @@ impl PreflopEquityTable {
 
     pub fn save(&self, path: &str) -> std::io::Result<()> {
         let json = serde_json::to_string(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         std::fs::write(path, json)
     }
 
@@ -322,7 +322,7 @@ mod tests {
     fn test_class_index_unique_and_in_range() {
         let reps = class_representatives();
         assert_eq!(reps.len(), PREFLOP_CLASSES);
-        let mut seen = vec![false; PREFLOP_CLASSES];
+        let mut seen = [false; PREFLOP_CLASSES];
         for h in &reps {
             let i = class_index(h[0], h[1]);
             assert!(i < PREFLOP_CLASSES && !seen[i]);

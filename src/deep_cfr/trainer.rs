@@ -11,7 +11,7 @@ use rand::prelude::Distribution;
 use rand::Rng;
 use rayon::prelude::*;
 use std::sync::{Arc, RwLock};
-use crate::equity::icm::{calculate_icm_ev, SNG_PAYOUTS_8MAX};
+use crate::equity::icm::{calculate_icm_ev, get_sng_payouts};
 
 /// Độ sâu tối đa cho traverser rẽ nhánh. 8 lượt đủ bao quát Preflop, Flop, Turn và River
 /// (mỗi vòng 2 lượt hành động kể cả re-raise) mà không bị bùng nổ vì đối thủ chỉ sample 1 nhánh.
@@ -33,7 +33,8 @@ impl Payoff {
         // Do đó, chỉ áp dụng ICM khi bàn có từ 3 người trở lên.
         let is_hu = start_stacks.len() <= 2;
         let start_icm_ev = if use_icm && !is_hu {
-            let evs = calculate_icm_ev(&start_stacks, &SNG_PAYOUTS_8MAX);
+            let payouts = get_sng_payouts(start_stacks.len());
+            let evs = calculate_icm_ev(&start_stacks, payouts);
             evs[traverser]
         } else {
             0.0
@@ -78,7 +79,8 @@ impl Payoff {
             }
 
             // Tính ICM EV cho toàn bộ bàn với stack sau ván bài
-            let end_evs = calculate_icm_ev(&end_stacks, &SNG_PAYOUTS_8MAX);
+            let payouts = get_sng_payouts(end_stacks.len());
+            let end_evs = calculate_icm_ev(&end_stacks, payouts);
             
             // Chênh lệch giá trị giải thưởng của traverser trước và sau ván đấu
             let diff_ev = end_evs[self.traverser] - self.start_icm_ev;

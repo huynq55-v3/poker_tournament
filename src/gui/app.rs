@@ -439,14 +439,12 @@ impl eframe::App for PokerGuiApp {
                 ui.label(RichText::new(format!("(Alive: {}/{})", surv_count, self.num_seats)).color(Color32::from_rgb(200, 200, 200)));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⏭️ Next Blind").clicked() {
-                        if self.blind_schedule.advance_level_manually() {
-                            let bl = self.blind_schedule.current_level();
-                            self.action_logs.push(format!(
-                                "⏭️ Blinds skipped to Level {}: {}/{} (applies from next hand)",
-                                bl.level_num, bl.sb, bl.bb
-                            ));
-                        }
+                    if ui.button("⏭️ Next Blind").clicked() && self.blind_schedule.advance_level_manually() {
+                        let bl = self.blind_schedule.current_level();
+                        self.action_logs.push(format!(
+                            "⏭️ Blinds skipped to Level {}: {}/{} (applies from next hand)",
+                            bl.level_num, bl.sb, bl.bb
+                        ));
                     }
                     let pause_label = if self.blind_schedule.is_paused { "▶️ Resume" } else { "⏸️ Pause" };
                     if ui.button(pause_label).clicked() {

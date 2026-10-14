@@ -136,7 +136,7 @@ impl Policy for DeepCFRPolicy {
         }
 
         let mut rng = thread_rng();
-        if let Ok(dist) = WeightedIndex::new(&probs) {
+        if let Ok(dist) = WeightedIndex::new(probs) {
             let chosen_idx = dist.sample(&mut rng);
             Action::from_index(chosen_idx).unwrap_or(Action::Fold)
         } else {
