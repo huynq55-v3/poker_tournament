@@ -3,9 +3,25 @@ use crate::poker_core::card::Card;
 use serde::{Deserialize, Serialize};
 use crate::equity;
 use crate::poker_core::evaluator::evaluate_7_cards;
+use std::cell::RefCell;
 
 pub const FEATURE_DIM: usize = 176;
 pub const MAX_PLAYERS: usize = 8;
+
+// Bộ nhớ đệm Thread-Local siêu tốc cho Equity & Draw Features (tránh tính lại Monte Carlo trên cùng 1 Street)
+thread_local! {
+    static EQUITY_CACHE: RefCell<(u64, f32, [f32; 5])> = const { RefCell::new((0, 0.0, [0.0; 5])) };
+}
+
+#[inline(always)]
+fn compute_cache_key(c0: Card, c1: Card, board: &[Card], num_opp: usize) -> u64 {
+    let mut k = ((c0.0 as u64) << 8) | (c1.0 as u64) | ((num_opp as u64) << 16) | ((board.len() as u64) << 20);
+    for (i, b) in board.iter().enumerate() {
+        k ^= (b.0 as u64 + 1) << (24 + i * 7);
+    }
+    // Đảm bảo key != 0
+    k | 0x8000_0000_0000_0000
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[repr(u8)]
@@ -139,14 +155,26 @@ impl GameState {
             return [0.0; 8];
         };
         let in_hand = self.players.iter().filter(|p| p.is_in_hand()).count().max(1);
-        let eq = equity::equity_vs_random([c0, c1], &self.community_cards, in_hand.saturating_sub(1));
+        let num_opp = in_hand.saturating_sub(1);
+
+        let key = compute_cache_key(c0, c1, &self.community_cards, num_opp);
+        let (eq, d) = EQUITY_CACHE.with(|cache| {
+            let mut c = cache.borrow_mut();
+            if c.0 == key {
+                (c.1, c.2)
+            } else {
+                let eq_val = equity::equity_vs_random([c0, c1], &self.community_cards, num_opp);
+                let draw_val = equity::board_and_draw_features([c0, c1], &self.community_cards);
+                *c = (key, eq_val, draw_val);
+                (eq_val, draw_val)
+            }
+        });
 
         let pot_odds = if to_call > 0 {
             to_call as f32 / (self.pot + to_call) as f32
         } else {
             0.0
         };
-        let d = equity::board_and_draw_features([c0, c1], &self.community_cards);
 
         [
             eq,
@@ -267,15 +295,16 @@ impl GameState {
         let denom = (self.pot + to_call) as f32;
         f.push(if denom > 0.0 { to_call as f32 / denom } else { 0.0 });
 
-        // 6. 7 đối thủ theo thứ tự xoay tròn (7 * 4 = 28)
+        // 6. 7 đối thủ theo thứ tự xoay tròn (7 * 4 = 28) -> index 131..158
         let mut opp_count = 0;
         let mut step = 1;
         while opp_count < (MAX_PLAYERS - 1) && step < self.num_players {
             let seat = (player_idx + step) % self.num_players;
             let o = &self.players[seat];
             if o.stack > 0 || o.is_all_in {
-                f.push(o.stack as f32 / (bb * 100.0));
-                f.push(o.current_bet as f32 / (bb * 20.0));
+                f.push((o.stack as f32 / (bb * 100.0)).min(2.0));
+                let opp_pressure = o.current_bet.max(o.total_contributed / 2) as f32 / (bb * 20.0);
+                f.push(opp_pressure.min(2.0));
                 f.push(if o.is_in_hand() { 1.0 } else { 0.0 });
                 f.push(if o.is_all_in { 1.0 } else { 0.0 });
                 opp_count += 1;
@@ -288,24 +317,32 @@ impl GameState {
             opp_count += 1;
         }
 
-        // 7. Tóm tắt lịch sử (2)
-        let raises = self
+        // 7. Tóm tắt lịch sử (2) -> index 159..160
+        let total_raises = self
+            .action_history
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.action,
+                    Action::BetPot33 | Action::BetPot66 | Action::BetPot100 | Action::AllIn
+                )
+            })
+            .count();
+        let street_raises = self
             .action_history
             .iter()
             .filter(|r| {
                 r.street == self.street
                     && matches!(
                         r.action,
-                            | Action::BetPot33
-                            | Action::BetPot66
-                            | Action::BetPot100
-                            | Action::AllIn
+                        Action::BetPot33 | Action::BetPot66 | Action::BetPot100 | Action::AllIn
                     )
             })
             .count();
-        f.push((raises as f32 / 4.0).min(1.0));
+        let agg_score = (street_raises as f32 * 0.35 + total_raises as f32 * 0.15).min(1.0);
+        f.push(agg_score);
         let in_hand = self.players.iter().filter(|p| p.is_in_hand()).count();
-        f.push(in_hand as f32 / MAX_PLAYERS as f32);
+        f.push(in_hand as f32 / MAX_PLAYERS as f32); // index 160: F_IN_HAND
 
         // 8. Ngữ cảnh push/fold & sức mạnh bài (7)
         let eff_bb = self.effective_stack_bb(player_idx);

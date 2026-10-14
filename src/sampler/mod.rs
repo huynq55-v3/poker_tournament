@@ -5,15 +5,15 @@ pub struct TournamentStackSampler;
 
 impl TournamentStackSampler {
 
-    /// Stack bằng nhau (đầu giải / cash game) với độ sâu ngẫu nhiên
-pub fn sample_equal_stacks<R: Rng>(rng: &mut R, num_players: usize, bb_size: u32) -> Vec<u32> {
-    const DEPTHS: [u32; 6] = [15, 25, 40, 50, 75, 100];
-    let d = DEPTHS[rng.gen_range(0..DEPTHS.len())];
-    vec![d * bb_size; num_players]
-}
+    /// Stack bằng nhau (đầu giải / cash game / benchmark) với đầy đủ các mốc Push/Fold (8, 10, 12 BB)
+    pub fn sample_equal_stacks<R: Rng>(rng: &mut R, num_players: usize, bb_size: u32) -> Vec<u32> {
+        const DEPTHS: [u32; 9] = [8, 10, 12, 15, 20, 25, 35, 50, 75];
+        let d = DEPTHS[rng.gen_range(0..DEPTHS.len())];
+        vec![d * bb_size; num_players]
+    }
 
     /// Sample asymmetric stacks using a Dirichlet distribution approximation via Gamma distributions.
-    /// Range: 5 BB to 200 BB per player.
+    /// Range: 4 BB to 150 BB per player, bao phủ dày đặc vùng mid/late stage SNG.
     pub fn sample_dirichlet_stacks<R: Rng>(
         rng: &mut R,
         num_players: usize,
@@ -21,16 +21,14 @@ pub fn sample_equal_stacks<R: Rng>(rng: &mut R, num_players: usize, bb_size: u32
     ) -> Vec<u32> {
         assert!(num_players >= 2 && num_players <= 8);
 
-        // Alpha parameters: random concentration parameter alpha between 0.5 (high variance/chip disparity)
-        // and 2.0 (more balanced stacks) to create realistic tournament dynamics
-        let alpha: f64 = rng.gen_range(0.6..1.8);
+        let alpha: f64 = rng.gen_range(0.5..1.8);
         let gamma = Gamma::new(alpha, 1.0).unwrap();
 
         let samples: Vec<f64> = (0..num_players).map(|_| gamma.sample(rng)).collect();
         let sum: f64 = samples.iter().sum();
 
-        // Target average stack in tournament: 20 BB to 80 BB
-        let avg_bb: f64 = rng.gen_range(20.0..70.0);
+        // Hạ mức trung bình xuống 10 BB .. 60 BB để xuất hiện nhiều tình huống < 12 BB hơn
+        let avg_bb: f64 = rng.gen_range(10.0..60.0);
         let total_chips = avg_bb * (num_players as f64) * (bb_size as f64);
 
         let mut stacks: Vec<u32> = samples
@@ -38,39 +36,36 @@ pub fn sample_equal_stacks<R: Rng>(rng: &mut R, num_players: usize, bb_size: u32
             .map(|&s| {
                 let proportion = s / sum;
                 let raw_chips = proportion * total_chips;
-                // Clamp between 5 BB and 200 BB
-                let min_chips = 5.0 * (bb_size as f64);
-                let max_chips = 200.0 * (bb_size as f64);
+                let min_chips = 4.0 * (bb_size as f64);
+                let max_chips = 150.0 * (bb_size as f64);
                 raw_chips.clamp(min_chips, max_chips).round() as u32
             })
             .collect();
 
-        // Ensure stacks are multiples of small blind (e.g. bb_size / 2)
         let chip_unit = (bb_size / 2).max(1);
         for s in &mut stacks {
             *s = (*s / chip_unit) * chip_unit;
-            if *s < 5 * bb_size {
-                *s = 5 * bb_size;
+            if *s < 4 * bb_size {
+                *s = 4 * bb_size;
             }
         }
 
         stacks
     }
 
-    /// Sample stack sizes via Log-Normal distribution (representing deep-stack cash / late tournament MTT)
+    /// Sample stack sizes via Log-Normal distribution
     pub fn sample_log_normal_stacks<R: Rng>(
         rng: &mut R,
         num_players: usize,
         bb_size: u32,
     ) -> Vec<u32> {
         assert!(num_players >= 2 && num_players <= 8);
-        // LogNormal with mu = ln(40 BB), sigma = 0.75
-        let log_normal = LogNormal::new(3.68, 0.75).unwrap();
+        let log_normal = LogNormal::new(3.4, 0.75).unwrap();
 
         (0..num_players)
             .map(|_| {
                 let bb_val: f64 = log_normal.sample(rng);
-                let clamped_bb = bb_val.clamp(5.0, 200.0);
+                let clamped_bb = bb_val.clamp(4.0, 150.0);
                 ((clamped_bb * bb_size as f64).round() as u32 / (bb_size / 2)) * (bb_size / 2)
             })
             .collect()

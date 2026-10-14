@@ -51,11 +51,26 @@ impl Payoff {
 
     #[inline(always)]
     fn eval(&self, env: &Environment) -> f32 {
-        if self.use_icm {
-            // Lấy stack kết thúc của tất cả người chơi
-            let mut end_stacks: Vec<f32> = env.state.players.iter().map(|p| p.stack as f32).collect();
+        // 1. Tính Chip-EV chuẩn hóa (luôn tính để làm nền tảng sát thương)
+        let mut my_end_chips = env.state.players[self.traverser].stack as f32;
+        if env.state.pot > 0 {
+            let in_hand: Vec<usize> = env
+                .state
+                .players
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.is_in_hand())
+                .map(|(i, _)| i)
+                .collect();
+            if in_hand.contains(&self.traverser) {
+                my_end_chips += env.state.pot as f32 / in_hand.len() as f32;
+            }
+        }
+        let my_start_chips = self.start_stacks[self.traverser];
+        let chip_ev = (my_end_chips - my_start_chips) / self.bb / 10.0;
 
-            // Nếu pot còn dư (trường hợp terminal do fold hết nhưng pot chưa kịp giải ngân)
+        if self.use_icm {
+            let mut end_stacks: Vec<f32> = env.state.players.iter().map(|p| p.stack as f32).collect();
             if env.state.pot > 0 {
                 let remaining_in_hand: Vec<usize> = env
                     .state
@@ -66,11 +81,9 @@ impl Payoff {
                     .map(|(i, _)| i)
                     .collect();
 
-                // Người duy nhất còn lại trên bàn ôm trọn pot
                 if remaining_in_hand.len() == 1 {
                     end_stacks[remaining_in_hand[0]] += env.state.pot as f32;
                 } else if !remaining_in_hand.is_empty() {
-                    // Nếu nhiều người còn lại, chia đều phần pot tạm thời
                     let share = env.state.pot as f32 / remaining_in_hand.len() as f32;
                     for &idx in &remaining_in_hand {
                         end_stacks[idx] += share;
@@ -78,34 +91,15 @@ impl Payoff {
                 }
             }
 
-            // Tính ICM EV cho toàn bộ bàn với stack sau ván bài
             let payouts = get_sng_payouts(end_stacks.len());
             let end_evs = calculate_icm_ev(&end_stacks, payouts);
-            
-            // Chênh lệch giá trị giải thưởng của traverser trước và sau ván đấu
-            let diff_ev = end_evs[self.traverser] - self.start_icm_ev;
+            let icm_ev = (end_evs[self.traverser] - self.start_icm_ev) * 10.0;
 
-            // Nhân 10.0 để thang đo nằm trong khoảng [-5.0, +5.0], tối ưu cho Huber Loss
-            diff_ev * 10.0
+            // Pha trộn 65% ICM + 35% Chip-EV:
+            // Giữ nguyên kỷ luật sinh tồn Bubble của SNG nhưng không bị thụ động trước TAG
+            0.65 * icm_ev + 0.35 * chip_ev
         } else {
-            // CHIP-EV MODE: Chuẩn hóa theo số big blind
-            let mut end = env.state.players[self.traverser].stack as f32;
-            // Nếu pot còn dư khi ván kết thúc (do fold terminal)
-            if env.state.pot > 0 {
-                let in_hand: Vec<usize> = env
-                    .state
-                    .players
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, p)| p.is_in_hand())
-                    .map(|(i, _)| i)
-                    .collect();
-                if in_hand.contains(&self.traverser) {
-                    end += env.state.pot as f32 / in_hand.len() as f32;
-                }
-            }
-            let start = self.start_stacks[self.traverser];
-            (end - start) / self.bb / 10.0
+            chip_ev
         }
     }
 }
@@ -257,7 +251,7 @@ impl DeepCFRTrainer {
             strategy_memory: StrategyMemory::new(capacity),
             strategy_trained: false,
             iteration: 0,
-            lr: 0.001,
+            lr: 0.0005,
             weight_decay: 1e-4,
             fixed_players: None,
             use_icm,
@@ -276,7 +270,7 @@ impl DeepCFRTrainer {
             return 0.0;
         }
         let avg = (raw_weights.iter().sum::<f32>() / raw_weights.len() as f32).max(1e-6);
-        let norm: Vec<f32> = raw_weights.iter().map(|&w| w / avg).collect();
+        let norm: Vec<f32> = raw_weights.iter().map(|&w| (w / avg).clamp(0.1, 3.0)).collect();
         let mut n = net.write().unwrap();
         n.train_batch(&inputs, &targets, Some(&norm), Some(&masks), loss, lr, weight_decay)
     }
@@ -289,10 +283,29 @@ impl DeepCFRTrainer {
         rng: &mut R,
     ) -> f32 {
         self.iteration += 1;
-        let iter_weight = self.iteration as f32; // Linear CFR
+        // Căn bậc hai (Sqrt CFR weight) giúp các iter lớn không đè bẹp hoàn toàn mẫu cũ
+        let iter_weight = (self.iteration as f32).sqrt();
         let bb_size = 100u32;
         let sb_size = 50u32;
         let fixed = self.fixed_players;
+
+        // 1. Chu kỳ Cosine Annealing (chu kỳ 50 iterations):
+        // Giúp mạng liên tục thoát khỏi cực tiểu cục bộ (local minimum), duy trì tính khám phá và hội tụ sâu
+        let cycle_len = 50;
+        let step_in_cycle = (self.iteration - 1) % cycle_len;
+
+        // Reset optimizer ở đầu mỗi chu kỳ để loại bỏ stale momentum tích tụ trong Adam, chống drift trọng số
+        if step_in_cycle == 0 && self.iteration > 1 {
+            self.advantage_net.write().unwrap().reset_optimizer();
+            self.strategy_net.write().unwrap().reset_optimizer();
+        }
+
+        // Cosine Annealing Learning Rate Schedule với Warm Restarts
+        let cycle_idx = (self.iteration - 1) / cycle_len;
+        let cycle_max_lr = (self.lr * 0.992f32.powi(cycle_idx as i32)).max(0.00015);
+        let min_lr = 0.00005;
+        let cos_ratio = (std::f32::consts::PI * step_in_cycle as f32 / cycle_len as f32).cos();
+        let effective_lr = min_lr + 0.5 * (cycle_max_lr - min_lr) * (1.0 + cos_ratio);
 
         let snapshot: MLP = self.advantage_net.read().unwrap().clone();
         let results: Vec<(Vec<AdvantageSample>, Vec<StrategySample>)> = (0..num_traversals)
@@ -300,18 +313,17 @@ impl DeepCFRTrainer {
             .map(|_| {
                 let mut trng = rand::thread_rng();
                 let n = fixed.unwrap_or_else(|| {
-                    // Dành 25% ván chuyên sâu cho Heads-Up (2 người) để bot không bị yếu đấu tay đôi.
-                    // 55% cho bàn đông 6-8 max và 20% cho bàn ngắn 3-5 max.
-                    if trng.gen_bool(0.25) {
+                    if trng.gen_bool(0.20) {
                         2
-                    } else if trng.gen_bool(0.70) {
+                    } else if trng.gen_bool(0.75) {
                         trng.gen_range(6..=8)
                     } else {
                         trng.gen_range(3..=5)
                     }
                 });
                 let button = trng.gen_range(0..n);
-                let stacks = if trng.gen_bool(0.40) {
+                // 50% Equal Stacks (bao gồm 8, 10, 12, 25, 50 BB) + 50% Dirichlet Stacks
+                let stacks = if trng.gen_bool(0.50) {
                     TournamentStackSampler::sample_equal_stacks(&mut trng, n, bb_size)
                 } else {
                     TournamentStackSampler::sample_dirichlet_stacks(&mut trng, n, bb_size)
@@ -343,28 +355,36 @@ impl DeepCFRTrainer {
             }
         }
 
+        // 2. Chống Overfitting khi buffer còn nhỏ:
+        // Cân bằng số steps tương đương 2 epoch trên buffer hiện có, tránh việc vài nghìn mẫu đầu bị train tới 80 epoch
+        let effective_steps = if self.adv_memory.len() < 50_000 {
+            (self.adv_memory.len() / batch_size * 2).clamp(10, train_steps_per_iter)
+        } else {
+            train_steps_per_iter
+        };
+
         // Train Advantage Network (Huber Loss)
         let mut adv_loss = 0.0f32;
-        if self.adv_memory.len() >= batch_size && train_steps_per_iter > 0 {
-            for _ in 0..train_steps_per_iter {
+        if self.adv_memory.len() >= batch_size && effective_steps > 0 {
+            for _ in 0..effective_steps {
                 let batch = self.adv_memory.sample_batch(rng, batch_size);
                 adv_loss += Self::train_from_batch(
                     &self.advantage_net,
                     batch,
                     LossType::Huber,
-                    self.lr,
+                    effective_lr,
                     self.weight_decay,
                 );
             }
-            adv_loss /= train_steps_per_iter as f32;
+            adv_loss /= effective_steps as f32;
         }
 
         // Train Strategy Network (MSE)
-        if train_steps_per_iter > 0 && self.strategy_memory.len() >= batch_size {
-            let steps = (train_steps_per_iter / 2).max(1);
+        if effective_steps > 0 && self.strategy_memory.len() >= batch_size {
+            let steps = (effective_steps * 2 / 3).max(1);
             for _ in 0..steps {
                 let batch = self.strategy_memory.sample_batch(rng, batch_size);
-                Self::train_from_batch(&self.strategy_net, batch, LossType::MSE, self.lr, self.weight_decay);
+                Self::train_from_batch(&self.strategy_net, batch, LossType::MSE, effective_lr, self.weight_decay);
             }
             self.strategy_trained = true;
         }

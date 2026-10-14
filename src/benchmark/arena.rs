@@ -117,7 +117,9 @@ pub fn evaluate_against_champion(
         .into_par_iter()
         .fold(ArenaAcc::default, |mut acc, _| {
             let mut rng = thread_rng();
-            play_arena_hand(challenger, champion, stack_bb, &mut acc, &mut rng);
+            // Đánh xen kẽ cả mức stack_bb (35BB) và Push/Fold (12BB) trong Arena để kiểm duyệt toàn diện
+            let actual_depth = if rng.gen_bool(0.25) { 12 } else { stack_bb };
+            play_arena_hand(challenger, champion, actual_depth, &mut acc, &mut rng);
             acc
         })
         .reduce(ArenaAcc::default, |a, b| a.merge(&b));
@@ -135,7 +137,10 @@ pub fn evaluate_against_champion(
         0.0
     };
 
-    let is_winner = bb_per_100 >= 2.0 && bb_per_100 > (se * 100.0 * 1.25);
+    // Điều kiện soán ngôi: Thắng có ý nghĩa thống kê VÀ tỷ lệ Shove bài rác phải dưới 5.0%
+    let is_winner = bb_per_100 >= 2.0
+        && bb_per_100 > (se * 100.0 * 1.25)
+        && trash_shove_pct <= 5.0;
 
     ArenaMatchResult {
         hands: acc.hands,

@@ -19,7 +19,7 @@ const BENCH_CSV: &str = "benchmark_log.csv";
 
 fn main() {
     println!("============================================================");
-    println!("🚀 POKER AI DEEP CFR (8-MAX ARENA GATING / 500 ITERATIONS) 🚀");
+    println!("🚀 POKER AI DEEP CFR (8-MAX ARENA GATING / 10,000 ITERATIONS) 🚀");
     println!("============================================================");
 
     let mut rng = rand::thread_rng();
@@ -40,16 +40,16 @@ fn main() {
     trainer.use_icm = true;       // 🟢 BẮT BUỘC: Bật hàm thưởng Tournament ICM
     trainer.lr = 0.0005;          // 🟢 Giảm nhẹ learning rate để tránh dao động All-in rác
 
-    let total_iterations = 600;       // 600 iter với cấu hình mới tương đương 1500 iter cũ
-    let traversals_per_iter = 250;    // 🟢 Giảm từ 400 -> 250 (Giảm 40% thời gian duyệt cây mỗi iter)
-    let train_steps_per_iter = 400;   // 🟢 Tăng từ 300 -> 400 (Ép mạng học kỹ hơn các tình huống ICM)
+    let total_iterations = 10_000;    // 🚀 Chạy liên tục 10,000 iterations
+    let traversals_per_iter = 250;    // 🟢 Duyệt cây mỗi iter (nhờ Equity Cache nên chạy siêu tốc)
+    let train_steps_per_iter = 400;   // 🟢 Ép mạng học kỹ các tình huống ICM
     let batch_size = 512;             // Giữ nguyên 512 (Kích thước vàng cho SIMD/Rayon)
 
-    let bench_every = 10;             // 🟢 Tăng từ 5 -> 10 (Đỡ tốn thời gian benchmark vô ích)
-    let arena_hands = 6000;           // 🟢 Giảm từ 12k -> 6k (Đủ tin cậy để soán ngôi Champion)
-    let arena_stack_bb = 35;          // 🟢 Đổi từ 50 -> 35 BB (Mức stack thực chiến phổ biến nhất của SNG)
-    let bench_hands = 6000;           // 🟢 Giảm từ 12k -> 6k (Chạy nhanh gấp đôi)
-    let depths = [50u32, 25u32, 12u32]; // 🟢 BẮT BUỘC có 12 BB để kiểm tra chế độ Push/Fold sinh tử!
+    let bench_every = 10;             // Benchmark và đấu trường Arena mỗi 10 iters
+    let arena_hands = 6000;           // Đủ tin cậy để soán ngôi Champion
+    let arena_stack_bb = 35;          // Mức stack thực chiến phổ biến nhất của SNG
+    let bench_hands = 6000;           // Đánh giá đối thủ tĩnh
+    let depths = [50u32, 25u32, 12u32]; // BẮT BUỘC có 12 BB để kiểm tra chế độ Push/Fold sinh tử!
 
     let _ = std::fs::remove_file(BENCH_CSV);
 
@@ -61,7 +61,7 @@ fn main() {
         let it0 = Instant::now();
         let adv_loss = trainer.step_iteration(traversals_per_iter, train_steps_per_iter, batch_size, &mut rng);
         println!(
-            "   📍 Iter {:03}/{} | Adv: {:7} | Strat: {:7} | Loss: {:.5} | {:.1}s",
+            "   📍 Iter {:05}/{} | Adv: {:7} | Strat: {:7} | Loss: {:.5} | {:.1}s",
             iter, total_iterations,
             trainer.adv_memory.len(), trainer.strategy_memory.len(),
             adv_loss, it0.elapsed().as_secs_f64()
@@ -98,7 +98,7 @@ fn main() {
                 current_champion_net = trainer.advantage_net.read().unwrap().clone();
                 let _ = trainer.save_models(BEST_ADV, BEST_STRAT);
             } else {
-                println!("   🛡️  Champion giữ vững ngôi vương. Chưa đủ cách biệt thống kê.");
+                println!("   🛡️  Champion giữ vững ngôi vương. Chưa đủ cách biệt thống kê (hoặc TrashShove > 5%).");
             }
 
             let r_adv = run_suite(&challenger_policy, bench_hands, &depths);
@@ -107,6 +107,17 @@ fn main() {
 
             let s = score(&r_adv);
             println!("   🧪 Benchmark log score: {:+.1} bb/100\n", s);
+
+            // Tự động lưu checkpoint mới nhất phòng khi dừng máy giữa chừng
+            let _ = trainer.save_models(LAST_ADV, LAST_STRAT);
+        }
+
+        if iter % 100 == 0 {
+            let _ = std::fs::create_dir_all("checkpoints");
+            let a = format!("checkpoints/deep_cfr_iter{:05}_model.json", iter);
+            let s = format!("checkpoints/deep_cfr_iter{:05}_strategy.json", iter);
+            let _ = trainer.save_models(&a, &s);
+            println!("   💾 Đã lưu snapshot định kỳ: {}\n", a);
         }
     }
 
