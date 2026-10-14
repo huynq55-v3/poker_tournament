@@ -111,28 +111,24 @@
         window.dispatchEvent(new KeyboardEvent('keydown', eventParams));
     }
 
+    function getElementLabel(el) {
+        if (!el) return '';
+        return ((el.value || el.textContent || el.innerText || '') + '').trim().toLowerCase();
+    }
+
     function findBetInput() {
-        // 1. Selector đặc thù thường gặp của PokerNow
-        let el = document.querySelector('input.bet-value, .raise-controller input, .action-buttons input, input.bet-input');
+        // Selector chính xác 100% của PokerNow: <input type="text" class="value" pattern="[0-9]*" inputmode="numeric">
+        let el = document.querySelector('input.value[inputmode="numeric"], input.value, input[inputmode="numeric"]');
         if (el && el.offsetParent !== null) return el;
 
-        // 2. Quét toàn bộ input trên trang, loại trừ ô chat và tìm kiếm
+        // Dự phòng quét toàn bộ
         const allInputs = Array.from(document.querySelectorAll('input'));
         for (const input of allInputs) {
-            if (input.type === 'hidden' || input.type === 'checkbox' || input.type === 'radio') continue;
+            if (input.type === 'hidden' || input.type === 'checkbox' || input.type === 'radio' || input.type === 'submit') continue;
             const cls = (input.className || '').toLowerCase();
             const placeholder = (input.placeholder || '').toLowerCase();
-            const name = (input.name || '').toLowerCase();
-            const id = (input.id || '').toLowerCase();
-
-            if (cls.includes('chat') || placeholder.includes('chat') || placeholder.includes('message') ||
-                id.includes('chat') || cls.includes('search') || placeholder.includes('search')) {
-                continue;
-            }
-
-            if (input.offsetParent !== null) {
-                return input;
-            }
+            if (cls.includes('chat') || placeholder.includes('chat') || placeholder.includes('message')) continue;
+            if (input.offsetParent !== null) return input;
         }
         return null;
     }
@@ -173,76 +169,117 @@
     }
 
     function findActionButton(type) {
-        const allButtons = Array.from(document.querySelectorAll('button, a.button, div[role="button"]'));
+        // PokerNow dùng thẻ <input type="submit" class="button-1 action-button ..."> và <button>
+        const allButtons = Array.from(document.querySelectorAll(
+            'input[type="submit"].action-button, input[type="submit"], input[type="button"], button, .action-button, a.button, div[role="button"]'
+        ));
         const visibleButtons = allButtons.filter(b => b.offsetParent !== null && !b.disabled);
 
         if (type === 'fold') {
             return visibleButtons.find(b => {
-                const txt = b.textContent.trim().toLowerCase();
-                const cls = b.className.toLowerCase();
+                const txt = getElementLabel(b);
+                const cls = (b.className || '').toLowerCase();
                 return txt === 'fold' || cls.includes('fold') || txt.includes('fold');
             });
         }
 
         if (type === 'check') {
             return visibleButtons.find(b => {
-                const txt = b.textContent.trim().toLowerCase();
-                const cls = b.className.toLowerCase();
+                const txt = getElementLabel(b);
+                const cls = (b.className || '').toLowerCase();
                 return txt === 'check' || cls.includes('check');
             });
         }
 
         if (type === 'call') {
             return visibleButtons.find(b => {
-                const txt = b.textContent.trim().toLowerCase();
-                const cls = b.className.toLowerCase();
+                const txt = getElementLabel(b);
+                const cls = (b.className || '').toLowerCase();
                 return txt.startsWith('call') || cls.includes('call') || txt.includes('call');
             });
         }
 
         if (type === 'all_in') {
             return visibleButtons.find(b => {
-                const txt = b.textContent.trim().toLowerCase();
-                const cls = b.className.toLowerCase();
+                const txt = getElementLabel(b);
+                const cls = (b.className || '').toLowerCase();
                 return txt.includes('all in') || txt.includes('all-in') || cls.includes('all-in') || cls.includes('allin') || txt === 'max';
             });
         }
 
         if (type === 'raise') {
             return visibleButtons.find(b => {
-                const txt = b.textContent.trim().toLowerCase();
-                const cls = b.className.toLowerCase();
-                return txt.includes('raise') || txt.includes('bet') || cls.includes('raise') || cls.includes('bet');
+                const txt = getElementLabel(b);
+                const cls = (b.className || '').toLowerCase();
+                return cls.includes('bet') || cls.includes('raise') || txt.includes('raise') || txt.includes('bet');
             });
         }
 
         return null;
     }
 
-    // Quy trình thực hiện Tố / Cược / All-In theo đúng thao tác bàn cờ PokerNow:
-    // 1. Nhấn 'r' (hoặc click nút Raise) để mở thanh cược
-    // 2. Điền số vào ô input
-    // 3. Bấm phím Enter TRỰC TIẾP tại ô input (và bổ trợ click nút xác nhận)
+    function findRaiseSubmitButton() {
+        // Nút submit xanh của PokerNow: <input type="submit" class="button-1 action-button green highlighted bet" value="Raise">
+        let btn = document.querySelector('input[type="submit"].action-button.bet, input.action-button.green.bet, input.action-button.bet, input[type="submit"].bet');
+        if (btn && btn.offsetParent !== null && !btn.disabled) return btn;
+
+        const allButtons = Array.from(document.querySelectorAll(
+            'input[type="submit"].action-button, input[type="submit"], button, .action-button'
+        ));
+        return allButtons.find(b => {
+            if (b.offsetParent === null || b.disabled) return false;
+            const cls = (b.className || '').toLowerCase();
+            const txt = getElementLabel(b);
+            if (cls.includes('fold') || cls.includes('check') || txt.startsWith('call') || txt === 'fold' || txt === 'check') return false;
+            return cls.includes('bet') || cls.includes('raise') || txt === 'raise' || txt === 'bet' || txt.startsWith('raise') || txt.startsWith('bet');
+        });
+    }
+
+    function submitBet(input) {
+        // 1. Click chính xác nút submit xanh của PokerNow
+        const submitBtn = findRaiseSubmitButton() || findActionButton('raise');
+        if (submitBtn) {
+            console.log(`🔥 [SILENT BOT] Bấm nút submit cược: "${submitBtn.value || submitBtn.textContent}"`);
+            clickElement(submitBtn);
+        }
+
+        // 2. Kích hoạt Enter trên input và submit form
+        if (input) {
+            pressEnterOn(input);
+            if (input.form) {
+                try {
+                    input.form.requestSubmit(submitBtn || undefined);
+                } catch (e) {
+                    try { input.form.submit(); } catch(e2) {}
+                }
+            }
+        }
+    }
+
+    // Quy trình thực hiện Tố / Cược / All-In theo đúng PokerNow:
+    // 1. Kiểm tra / mở thanh cược (bấm 'r' hoặc click nút Raise)
+    // 2. Điền số vào thẻ <input type="text" class="value" ...>
+    // 3. Click nút submit <input type="submit" class="... bet" value="Raise"> và bấm Enter
     function performRaiseOrBet(amount, isAllIn = false) {
         console.log(`🎯 [SILENT BOT] Bắt đầu thao tác ${isAllIn ? 'ALL-IN' : 'RAISE'}: ${amount} chip`);
 
-        // Bước 1: Mở thanh cược
-        pressKeyInPage('r');
-
-        const raiseToggleBtn = findActionButton('raise');
         let input = findBetInput();
-        if (!input && raiseToggleBtn) {
-            clickElement(raiseToggleBtn);
+
+        // Bước 1: Mở thanh cược nếu chưa mở
+        if (!input) {
+            pressKeyInPage('r');
+            const raiseToggleBtn = findActionButton('raise');
+            if (raiseToggleBtn) clickElement(raiseToggleBtn);
         }
 
-        // Bước 2: Đợi thanh cược mở (60ms) rồi điền số và Enter
+        // Bước 2: Đợi thanh cược mở (50ms) rồi điền số và click submit
         setTimeout(() => {
             input = findBetInput();
 
             // Với All-In: Nếu có nút shortcut MAX / ALL IN thì click luôn
             if (isAllIn) {
-                const maxBtn = Array.from(document.querySelectorAll('button, a.button, div[role="button"]')).find(b => {
-                    const txt = b.textContent.trim().toLowerCase();
+                const maxBtn = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], a.button, div[role="button"]')).find(b => {
+                    const txt = getElementLabel(b);
                     return b.offsetParent !== null && !b.disabled && (txt === 'max' || txt === 'all in' || txt === 'all-in');
                 });
                 if (maxBtn) {
@@ -252,48 +289,20 @@
             }
 
             if (input) {
-                // Focus và điền con số
                 input.focus();
                 setReactInputValue(input, amount);
                 console.log(`✍️ [SILENT BOT] Đã nhập ${amount} vào ô cược`);
 
-                // Bước 3: Bấm Enter TRỰC TIẾP tại ô input
+                // Bước 3: Click nút Submit cược và Enter sau 40ms
                 setTimeout(() => {
-                    input.focus();
-                    pressEnterOn(input);
-                    console.log("⚡ [SILENT BOT] Đã bấm Enter tại ô cược!");
-
-                    // Dự phòng bước 4: Nếu có nút xác nhận cược chính ("Raise to...", "Bet...", "All-In") thì click hỗ trợ
-                    setTimeout(() => {
-                        const submitBtn = Array.from(document.querySelectorAll('button, a.button, div[role="button"]')).find(b => {
-                            if (b.offsetParent === null || b.disabled) return false;
-                            const txt = b.textContent.trim().toLowerCase();
-                            if (txt.includes('fold') || txt.includes('check') || txt.startsWith('call')) return false;
-                            if (txt === 'min' || txt === 'pot' || txt === 'max' || txt === '1/2' || txt === 'half') return false;
-                            return txt.startsWith('raise') || txt.startsWith('bet') || txt.includes('all-in') || txt.includes('all in');
-                        });
-                        if (submitBtn) {
-                            console.log(`🎯 [SILENT BOT] Bổ trợ click nút cược: "${submitBtn.textContent.trim()}"`);
-                            clickElement(submitBtn);
-                        }
-                    }, 50);
-                }, 50);
+                    submitBet(input);
+                    console.log("⚡ [SILENT BOT] Đã gửi lệnh cược thành công!");
+                }, 40);
             } else {
-                console.warn("⚠️ [SILENT BOT] Đang tìm lại ô cược...");
-                setTimeout(() => {
-                    const retryInput = findBetInput();
-                    if (retryInput) {
-                        retryInput.focus();
-                        setReactInputValue(retryInput, amount);
-                        pressEnterOn(retryInput);
-                    } else {
-                        pressEnterOn(null);
-                        const submitBtn = findActionButton('raise');
-                        if (submitBtn) clickElement(submitBtn);
-                    }
-                }, 80);
+                console.warn("⚠️ [SILENT BOT] Không thấy ô input, kích hoạt submit trực tiếp...");
+                submitBet(null);
             }
-        }, 60);
+        }, 50);
     }
 
     function executeSilentAction(cmd, attempt = 0) {
@@ -328,9 +337,8 @@
                 console.log("✅ [SILENT BOT] Đã click nút CALL!");
             }
         } else if (act === 'all_in') {
-            // Kiểm tra nút All-In trực tiếp trước (nếu đối thủ đã bet hết stack mình)
             const directAllIn = findActionButton('all_in');
-            if (directAllIn && (directAllIn.textContent.trim().toLowerCase().includes('all') || directAllIn.textContent.trim().toLowerCase() === 'max')) {
+            if (directAllIn && (getElementLabel(directAllIn).includes('all') || getElementLabel(directAllIn) === 'max')) {
                 clickElement(directAllIn);
                 console.log("✅ [SILENT BOT] Đã click nút ALL-IN trực tiếp!");
             }
