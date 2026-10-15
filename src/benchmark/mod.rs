@@ -24,6 +24,7 @@ const F_IS_BUBBLE: usize = 119;     // 1.0 nếu còn 5 người (vòng Bubble)
 const F_STACK_RANK: usize = 121;    // 0.0 (nghèo nhất) .. 1.0 (Chip Leader)
 const F_STREET_PREFLOP: usize = 123;
 const F_STREET_RIVER: usize = 126;
+const F_TO_CALL_NORM: usize = 128; // to_call / (20 * BB) -> 1 BB = 0.05
 const F_POT_ODDS: usize = 130;
 const F_IN_HAND: usize = 160;
 const F_EFF_BB: usize = 161;        // eff_stack_bb / 50.0
@@ -36,6 +37,17 @@ const F_FLUSH_DRAW: usize = 171;
 const F_STRAIGHT_DRAW: usize = 172;
 #[allow(dead_code)]
 const F_BOARD_HIGH: usize = 175;
+
+/// Ở Preflop, chỉ coi là đang đối mặt với Bet/Raise nếu to_call > 1 BB (đã có người Open-Raise).
+/// Nếu to_call <= 1 BB thì là Unopened Pot -> Quân xanh phải chủ động Open-Raise bài mạnh hoặc Fold bài rác!
+#[inline(always)]
+fn is_facing_real_bet(f: &[f32]) -> bool {
+    if f[F_STREET_PREFLOP] > 0.5 {
+        f[F_TO_CALL_NORM] > 0.055
+    } else {
+        f[F_FACING_BET] > 0.5
+    }
+}
 
 /// Bài rác preflop thực sự (72o, 83o, 93o, J2o...): điểm Chen chuẩn hóa dưới 0.22
 /// (Không tính nhầm các bài 22..55, A9o, KTo, QJs đang push đúng Nash ở 12BB là rác!)
@@ -106,7 +118,7 @@ impl Policy for TightAggressive {
         let n = (f[F_IN_HAND] * 8.0).round().max(2.0);
         let edge = eq * n; // 1.0 = bài trung bình trên bàn
         let pot_odds = f[F_POT_ODDS];
-        let facing = f[F_FACING_BET] > 0.5;
+        let facing = is_facing_real_bet(f);
         let chen = f[F_HAND_STRENGTH]; // Điểm Chen ở Preflop (0..1)
 
         // 1. Chế độ Push/Fold (< 12 BB):
@@ -148,6 +160,9 @@ impl Policy for TightAggressive {
         } else if edge > 1.10 && f[F_STREET_PREFLOP] < 0.5 {
             // C-bet nhỏ / Block bet thăm dò ở Postflop
             pick(m, &[Action::BetSmall, Action::CheckCall])
+        } else if f[F_STREET_PREFLOP] > 0.5 && f[F_FACING_BET] > 0.5 {
+            // Ở Preflop khi bài yếu không đủ chuẩn Open-Raise: Fold luôn thay vì Limp nộp mạng!
+            pick(m, &[Action::Fold, Action::CheckCall])
         } else {
             pick(m, &[Action::CheckCall])
         }
@@ -167,7 +182,7 @@ impl Policy for LagShark {
         let eq = f[F_EQUITY];
         let n = (f[F_IN_HAND] * 8.0).round().max(2.0);
         let pot_odds = f[F_POT_ODDS];
-        let facing = f[F_FACING_BET] > 0.5;
+        let facing = is_facing_real_bet(f);
         let is_late_pos = f[F_POS_BTN] > 0.5 || f[F_POS_CO] > 0.5;
         let has_draw = f[F_FLUSH_DRAW] > 0.5 || f[F_STRAIGHT_DRAW] > 0.5;
         let chen = f[F_HAND_STRENGTH];
@@ -198,9 +213,14 @@ impl Policy for LagShark {
             }
         } else if edge > 1.75 || (has_draw && edge > 1.25) {
             pick(m, &[Action::BetPot75, Action::BetPot33, Action::CheckCall])
-        } else if edge > 1.15 || (is_late_pos && f[F_STREET_PREFLOP] > 0.5 && edge > 0.95) {
-            // Steal blind ở vị trí cuối hoặc C-bet nhẹ
-            pick(m, &[Action::BetSmall, Action::BetPot33, Action::CheckCall])
+        } else if edge > 1.30 || (is_late_pos && f[F_STREET_PREFLOP] > 0.5 && edge > 0.95) {
+            // Steal blind ở vị trí cuối hoặc C-bet 33% chuẩn
+            pick(m, &[Action::BetPot33, Action::BetSmall, Action::CheckCall])
+        } else if edge > 1.05 && f[F_STREET_PREFLOP] < 0.5 {
+            // Probe-bet / Block-bet nhỏ 15% ở Postflop với bài mỏng
+            pick(m, &[Action::BetSmall, Action::CheckCall])
+        } else if f[F_STREET_PREFLOP] > 0.5 && f[F_FACING_BET] > 0.5 {
+            pick(m, &[Action::Fold, Action::CheckCall])
         } else {
             pick(m, &[Action::CheckCall])
         }
@@ -221,7 +241,7 @@ impl Policy for NashPushBot {
         let n = (f[F_IN_HAND] * 8.0).round().max(2.0);
         let edge = eq * n;
         let pot_odds = f[F_POT_ODDS];
-        let facing = f[F_FACING_BET] > 0.5;
+        let facing = is_facing_real_bet(f);
         let eff_bb = f[F_EFF_BB] * 50.0;
         let is_late = f[F_POS_BTN] > 0.5 || f[F_POS_SB] > 0.5 || f[F_POS_CO] > 0.5;
         let chen = f[F_HAND_STRENGTH];
@@ -266,7 +286,7 @@ impl Policy for IcmSniper {
         let raw_eq = f[F_EQUITY];
         let n = (f[F_IN_HAND] * 8.0).round().max(2.0);
         let pot_odds = f[F_POT_ODDS];
-        let facing = f[F_FACING_BET] > 0.5;
+        let facing = is_facing_real_bet(f);
         let is_late = f[F_POS_BTN] > 0.5 || f[F_POS_CO] > 0.5;
         let has_draw = (f[F_FLUSH_DRAW] > 0.5 || f[F_STRAIGHT_DRAW] > 0.5) && f[F_STREET_RIVER] < 0.5;
         let chen = f[F_HAND_STRENGTH];
@@ -325,7 +345,13 @@ impl Policy for IcmSniper {
         } else if edge > 2.0 {
             pick(m, &[Action::BetPot75, Action::CheckCall])
         } else if edge > 1.35 || (is_late && edge > 1.12) {
-            pick(m, &[Action::BetSmall, Action::BetPot33, Action::CheckCall])
+            // Ưu tiên BetPot33 trước, không để BetSmall đứng đầu làm yếu cú C-bet!
+            pick(m, &[Action::BetPot33, Action::BetSmall, Action::CheckCall])
+        } else if edge > 1.05 && f[F_STREET_PREFLOP] < 0.5 {
+            // Block-bet nhỏ 15% ở Postflop
+            pick(m, &[Action::BetSmall, Action::CheckCall])
+        } else if f[F_STREET_PREFLOP] > 0.5 && f[F_FACING_BET] > 0.5 {
+            pick(m, &[Action::Fold, Action::CheckCall])
         } else {
             pick(m, &[Action::CheckCall])
         }
@@ -701,7 +727,7 @@ mod tests {
         let res = to_result("AlwaysFold", 50, &acc);
         println!("AlwaysFold vs TAG: {:.2} ± {:.2} bb/100", res.bb_per_100, res.ci95);
         assert!(
-            res.bb_per_100 < -9.0 && res.bb_per_100 > -18.0,
+            res.bb_per_100 < -9.0 && res.bb_per_100 > -21.0,
             "AlwaysFold score out of expected range: {:.2}",
             res.bb_per_100
         );

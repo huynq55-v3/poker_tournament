@@ -39,6 +39,7 @@ struct PlayerTracker {
     seat_num: usize,
     stack: u32,
     current_bet: u32,
+    total_contributed: u32,
     is_folded: bool,
     is_all_in: bool,
 }
@@ -51,6 +52,7 @@ impl Default for PlayerTracker {
             seat_num: 99,
             stack: 1000,
             current_bet: 0,
+            total_contributed: 0,
             is_folded: false,
             is_all_in: false,
         }
@@ -127,6 +129,7 @@ impl HandState {
 
         for p in self.players.values_mut() {
             p.current_bet = 0;
+            p.total_contributed = 0;
             p.is_folded = false;
             p.is_all_in = false;
         }
@@ -683,6 +686,9 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
         }
     }
 
+    // 🟢 Lưu lại mức cược cao nhất trước khi đọc "cHB" từ gói JSON mới
+    let mut prev_highest = state.highest_bet;
+
     if let Some(chb) = payload.get("cHB").and_then(|v| v.as_u64()) { state.highest_bet = chb as u32; }
     
     if let Some(mr) = payload.get("mR").and_then(|v| v.as_u64()) {
@@ -704,28 +710,56 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
         state.dealer_id = Some(did.to_string());
     }
 
-    if let Some(tb_obj) = payload.get("tB").and_then(|v| v.as_object()) {
-        for (pid, bval) in tb_obj {
-            let entry = state.players.entry(pid.clone()).or_insert_with(|| PlayerTracker { id: pid.clone(), ..Default::default() });
-            let prev_bet = entry.current_bet;
-            if let Some(amt) = bval.as_u64() {
-                let new_bet = amt as u32;
-                if new_bet > prev_bet && new_bet > state.bb_size && pid != &state.hero_id {
-                    state.has_evaluated_this_decision = false;
-                }
-                entry.current_bet = new_bet;
-            } else if bval.as_str() == Some("<D>") {
-                entry.current_bet = 0;
-            }
-        }
-    }
-
+    // 🟢 Đọc gói "pGS" (fold / allIn) TRƯỚC "tB" để biết chính xác entry.is_all_in!
     if let Some(pgs_obj) = payload.get("pGS").and_then(|v| v.as_object()) {
         for (pid, sval) in pgs_obj {
             let entry = state.players.entry(pid.clone()).or_insert_with(|| PlayerTracker { id: pid.clone(), ..Default::default() });
             if let Some(st) = sval.as_str() {
                 if st == "fold" { entry.is_folded = true; } 
                 else if st == "allIn" { entry.is_all_in = true; }
+            }
+        }
+    }
+
+    if let Some(tb_obj) = payload.get("tB").and_then(|v| v.as_object()) {
+        for (pid, bval) in tb_obj {
+            let entry = state.players.entry(pid.clone()).or_insert_with(|| PlayerTracker { id: pid.clone(), ..Default::default() });
+            let prev_bet = entry.current_bet;
+            if let Some(amt) = bval.as_u64() {
+                let new_bet = amt as u32;
+                if new_bet > prev_bet {
+                    let delta = new_bet - prev_bet;
+                    entry.total_contributed += delta;
+
+                    // Nếu người chơi này cược vượt mức highest_bet trước đó -> Họ vừa Bet / Raise!
+                    if new_bet > prev_highest && (state.street != Street::Preflop || new_bet > state.bb_size) {
+                        if pid != &state.hero_id {
+                            state.has_evaluated_this_decision = false;
+                        }
+                        let act_type = if entry.is_all_in {
+                            Action::AllIn
+                        } else if delta <= state.bb_size * 2 && state.street != Street::Preflop {
+                            Action::BetSmall
+                        } else if (delta as f32) < (state.pn_total_pot.max(state.bb_size * 2) as f32 * 0.50) {
+                            Action::BetPot33
+                        } else {
+                            Action::BetPot75
+                        };
+                        state.action_history.push(ActionRecord {
+                            player_idx: entry.seat_num,
+                            street: state.street,
+                            action: act_type,
+                            amount: delta,
+                        });
+                        prev_highest = new_bet;
+                    }
+                }
+                entry.current_bet = new_bet;
+                if new_bet > state.highest_bet {
+                    state.highest_bet = new_bet;
+                }
+            } else if bval.as_str() == Some("<D>") {
+                entry.current_bet = 0;
             }
         }
     }
@@ -845,6 +879,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
 
         let mut ps = PlayerState::new(seat_idx, true_stack_behind, seat_idx != hero_seat);
         ps.current_bet = p_track.current_bet;
+        ps.total_contributed = p_track.total_contributed.max(p_track.current_bet);
         ps.is_folded = p_track.is_folded;
         ps.is_all_in = p_track.is_all_in;
         if seat_idx == hero_seat { ps.hole_cards = [Some(hole[0]), Some(hole[1])]; }
@@ -871,6 +906,17 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     env.state.current_player_idx = hero_seat;
     env.state.button_idx = button_idx;
     env.state.players = env_players;
+    env.state.action_history = state.action_history.iter().filter_map(|rec| {
+        let idx = active_seats.iter().position(|id| {
+            state.players.get(id).map(|p| p.seat_num) == Some(rec.player_idx)
+        })?;
+        Some(ActionRecord {
+            player_idx: idx,
+            street: rec.street,
+            action: rec.action,
+            amount: rec.amount,
+        })
+    }).collect();
 
     let hero_bet = state.players.get(&state.hero_id).map(|p| p.current_bet).unwrap_or(0);
     let hero_stack_behind = env.state.players[hero_seat].stack; 
@@ -896,16 +942,17 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     }
 
     // 🛡️ BẢO VỆ CHỐNG MIN-BET (ANTI-MINBET / POT-ODDS SHIELD):
-    // Nếu đối thủ cược quá nhỏ (<= 2 BB hoặc Pot Odds < 12%), CẤM BOT BỊ HOẢNG LOẠN FOLD!
+    // CHỈ áp dụng ở Postflop (Flop/Turn/River) khi Pot đã to mà đối thủ bet thăm dò 1-2 BB (pot_odds < 12%)!
+    // Tuyệt đối KHÔNG áp dụng ở Preflop vì ở Preflop to_call <= 2 BB là bình thường và bot phải được quyền Fold bài rác (như Q7, 72)!
     let pot_odds = if true_table_pot + to_call > 0 {
         to_call as f32 / (true_table_pot + to_call) as f32
     } else {
         0.0
     };
 
-    if to_call > 0 && (to_call <= state.bb_size * 2 || pot_odds < 0.12) {
-        println!("🛡️ [POT-ODDS SHIELD] Đối thủ Min-bet {} chip (Pot Odds: {:.1}%) -> Khóa FOLD, ép Call/Raise!", 
-            to_call, pot_odds * 100.0);
+    if state.street != Street::Preflop && to_call > 0 && (to_call <= state.bb_size * 2 || pot_odds < 0.12) {
+        println!("🛡️ [POT-ODDS SHIELD] Đối thủ Min-bet {} chip ở {:?} (Pot Odds: {:.1}%) -> Khóa FOLD, ép Call/Raise!", 
+            to_call, state.street, pot_odds * 100.0);
         mask.0 &= !(1 << Action::Fold.to_index());
     }
 

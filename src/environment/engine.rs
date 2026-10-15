@@ -201,6 +201,11 @@ impl Environment {
             let mut last_target = 0u32;
             for &(act, frac) in RAISE_ACTIONS.iter() {
                 let target = self.raise_target(p_idx, frac);
+                // Nếu là BetSmall (15%) mà bị trùng đúng bằng mức tiền của BetPot33 (33%),
+                // nhường slot đó cho BetPot33 để giữ đúng bản chất tỷ lệ Pot và không làm liệt bot TAG!
+                if act == Action::BetSmall && target == self.raise_target(p_idx, 0.33) {
+                    continue;
+                }
                 let needed = target.saturating_sub(player.current_bet);
                 if needed < player.stack && target >= min_raise_total && target > last_target {
                     mask.enable(act);

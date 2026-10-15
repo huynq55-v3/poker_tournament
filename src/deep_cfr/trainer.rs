@@ -186,11 +186,12 @@ fn traverse<R: Rng>(env: &mut Environment, ctx: &mut Ctx, pay: &Payoff, rng: &mu
         });
         expected
     } else {
-        // 🟢 TRƯỜNG HỢP 1: Ghế đối thủ đóng vai Quân Xanh (chỉ áp dụng cho ghế lẻ trong ván sparring)
+        // 🟢 TRƯỜNG HỢP 1: Ghế đối thủ đóng vai Quân Xanh (áp dụng đều cho mọi vị trí tương đối)
         // Cho traverser cọ xát đa dạng với cả 4 trường phái (TAG, LagShark, NashPushBot, IcmSniper)
         // mà không cần tốn forward() của MLP!
-        if ctx.sparring_tag && (curr % 2 == 1) {
-            let a = match curr {
+        if ctx.sparring_tag && ((curr + pay.traverser) % 2 == 1) {
+            let rel_idx = (curr + pay.traverser) % 8;
+            let a = match rel_idx {
                 1 => TightAggressive.select_action(&features, &mask),
                 3 => LagShark.select_action(&features, &mask),
                 5 => NashPushBot.select_action(&features, &mask),
@@ -381,8 +382,10 @@ impl DeepCFRTrainer {
             }
         }
 
-        let effective_steps = if self.adv_memory.len() < 50_000 {
-            (self.adv_memory.len() / batch_size * 2).clamp(15, train_steps_per_iter)
+        let effective_steps = if train_steps_per_iter == 0 {
+            0
+        } else if self.adv_memory.len() < 50_000 {
+            (self.adv_memory.len() / batch_size * 2).clamp(15.min(train_steps_per_iter), train_steps_per_iter)
         } else {
             train_steps_per_iter
         };
