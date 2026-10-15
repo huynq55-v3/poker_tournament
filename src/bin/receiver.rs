@@ -1,6 +1,6 @@
 use poker_tournament::deep_cfr::DeepCFRPolicy;
 use poker_tournament::environment::state::ActionRecord;
-use poker_tournament::environment::{Action, Environment, PlayerState, Street};
+use poker_tournament::environment::{Action, Environment, NUM_ACTIONS, PlayerState, Street};
 use poker_tournament::neural_network::MLP;
 use poker_tournament::poker_core::{Card, Rank, Suit};
 use poker_tournament::Policy;
@@ -419,7 +419,7 @@ fn execute_bot_action(action: Action, to_call: u32, target_total: u32, max_total
             println!("🤖 [BOT] Thao tác: ALL-IN {} chip (Bấm R, xóa số cũ, nhập số, Enter)", max_total_bet);
             type_bet_amount(&mut enigo, max_total_bet);
         }
-        Action::BetPot33 | Action::BetPot66 | Action::BetPot100 => {
+        Action::BetSmall | Action::BetPot33 | Action::BetPot75 => {
             let final_bet = target_total.min(max_total_bet);
             if final_bet >= max_total_bet {
                 println!("🤖 [BOT] Đạt mức trần chip, đổi thành ALL-IN {} chip", max_total_bet);
@@ -821,10 +821,23 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
 
     // 🛡️ Nếu không thể tố (đối thủ đã All-In hoặc không còn ai có chip), khóa sạch các action tố/All-In
     if !can_raise {
-        mask.0 &= !((1 << Action::BetPot33.to_index())
-            | (1 << Action::BetPot66.to_index())
-            | (1 << Action::BetPot100.to_index())
+        mask.0 &= !((1 << Action::BetSmall.to_index())
+            | (1 << Action::BetPot33.to_index())
+            | (1 << Action::BetPot75.to_index())
             | (1 << Action::AllIn.to_index()));
+    }
+
+    // 🛡️ BẢO VỆ CHỐNG MIN-BET (ANTI-MINBET / POT-ODDS SHIELD):
+    let pot_odds = if true_table_pot + to_call > 0 {
+        to_call as f32 / (true_table_pot + to_call) as f32
+    } else {
+        0.0
+    };
+
+    if to_call > 0 && (to_call <= state.bb_size * 2 || pot_odds < 0.12) {
+        println!("🛡️ [POT-ODDS SHIELD] Đối thủ Min-bet {} chip (Pot Odds: {:.1}%) -> Khóa FOLD, ép Call/Raise!", 
+            to_call, pot_odds * 100.0);
+        mask.0 &= !(1 << Action::Fold.to_index());
     }
 
     let features = env.state.encode_features(hero_seat);
@@ -866,9 +879,9 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     println!("------------------------------------------------------------");
 
     // LỌC VÀ CHUẨN HÓA XÁC SUẤT THEO GTO MIXED STRATEGY
-    let mut clean_probs = [0.0f32; 6];
+    let mut clean_probs = [0.0f32; NUM_ACTIONS];
     let mut sum_clean = 0.0f32;
-    for (i, &p) in probs.iter().enumerate().take(6) {
+    for (i, &p) in probs.iter().enumerate().take(NUM_ACTIONS) {
         if mask.is_index_valid(i) {
             let val = if p > 0.02 { p } else { 0.0 };
             clean_probs[i] = val;
@@ -876,7 +889,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
         }
     }
     if sum_clean <= 1e-4 {
-        for (i, &p) in probs.iter().enumerate().take(6) {
+        for (i, &p) in probs.iter().enumerate().take(NUM_ACTIONS) {
             if mask.is_index_valid(i) {
                 clean_probs[i] = p.max(0.01);
                 sum_clean += clean_probs[i];
@@ -895,7 +908,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
             // 1. PURE MAX-EV GREEDY (Argmax)
             let mut b_idx = 0;
             let mut b_ev = f32::NEG_INFINITY;
-            for (i, &adv) in raw_adv.iter().enumerate().take(6) {
+            for (i, &adv) in raw_adv.iter().enumerate().take(NUM_ACTIONS) {
                 if mask.is_index_valid(i)
                     && (adv > b_ev + 1e-4 || ((adv - b_ev).abs() <= 1e-4 && clean_probs[i] > clean_probs[b_idx]))
                 {
@@ -934,7 +947,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
             // Tìm EV cao nhất trong các action hợp lệ
             let mut ev_max = f32::NEG_INFINITY;
             let mut best_ev_idx = 0;
-            for (i, &ev) in raw_adv.iter().enumerate().take(6) {
+            for (i, &ev) in raw_adv.iter().enumerate().take(NUM_ACTIONS) {
                 if mask.is_index_valid(i) && ev > ev_max {
                     ev_max = ev;
                     best_ev_idx = i;
@@ -948,7 +961,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
             let mut blocked_suicidal = Vec::new();
             let mut second_best_ev = f32::NEG_INFINITY;
 
-            for (i, &ev) in raw_adv.iter().enumerate().take(6) {
+            for (i, &ev) in raw_adv.iter().enumerate().take(NUM_ACTIONS) {
                 if !mask.is_index_valid(i) { continue; }
                 let act = Action::from_index(i).unwrap();
                 let allowed_delta = if act == Action::AllIn { delta_allin } else { delta_general };
@@ -970,7 +983,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
                 (best_ev_idx, note)
             } else {
                 // B. Trường hợp các nước đi tương đương EV: Tung xúc xắc bảo vệ range!
-                let mut guarded_probs = [0.0f32; 6];
+                let mut guarded_probs = [0.0f32; NUM_ACTIONS];
                 let mut sum_guarded = 0.0f32;
                 for &idx in &safe_candidates {
                     let w = clean_probs[idx];
@@ -1017,11 +1030,12 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
                 else { format!("Call {}", to_call) }
             },
             Action::AllIn => format!("All-In ({})", max_total_bet),
-            Action::BetPot33 | Action::BetPot66 | Action::BetPot100 => {
+            Action::BetSmall | Action::BetPot33 | Action::BetPot75 => {
                 let frac = match act { 
+                    Action::BetSmall => 0.15,
                     Action::BetPot33 => 0.33, 
-                    Action::BetPot66 => 0.66, 
-                    _ => 1.0 
+                    Action::BetPot75 => 0.75, 
+                    _ => unreachable!(),
                 };
                 let pot_after_call = true_table_pot + to_call;
                 let raise_by = ((pot_after_call as f32) * frac).round() as u32;
@@ -1053,7 +1067,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
                 " (Khóa do đối thủ All-In / không thể tố)"
             } else if hero_stack_bb < 12.0 && act != Action::Fold && act != Action::CheckCall && act != Action::AllIn {
                 " (Khóa do Stack < 12BB - Push/Fold Mode)"
-            } else if act == Action::BetPot66 || act == Action::BetPot100 {
+            } else if act == Action::BetSmall || act == Action::BetPot75 {
                 " (Khóa do trùng size/hết chip)"
             } else {
                 " (Bị khóa)"
@@ -1076,11 +1090,12 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     if let Some(best_action) = Action::from_index(chosen_idx) {
         let mut target_total = actual_highest_bet;
         match best_action {
-            Action::BetPot33 | Action::BetPot66 | Action::BetPot100 => {
+            Action::BetSmall | Action::BetPot33 | Action::BetPot75 => {
                 let frac = match best_action {
+                    Action::BetSmall => 0.15,
                     Action::BetPot33 => 0.33,
-                    Action::BetPot66 => 0.66,
-                    _ => 1.0,
+                    Action::BetPot75 => 0.75,
+                    _ => unreachable!(),
                 };
                 let pot_after_call = true_table_pot + to_call;
                 let raise_by = ((pot_after_call as f32) * frac).round() as u32;
@@ -1129,7 +1144,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
                 amount: max_total_bet,
                 to_call,
             },
-            Action::BetPot33 | Action::BetPot66 | Action::BetPot100 => {
+            Action::BetSmall | Action::BetPot33 | Action::BetPot75 => {
                 let final_bet = target_total.min(max_total_bet);
                 if final_bet >= max_total_bet {
                     InPageAction {

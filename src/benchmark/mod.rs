@@ -126,7 +126,7 @@ impl Policy for TightAggressive {
             // Hễ đã cầm bài tốt ở Preflop là KHÔNG BAO GIỜ FOLD trước cú All-in cướp pot!
             if f[F_STREET_PREFLOP] > 0.5 && (chen >= 0.42 || edge > 1.50) {
                 if chen >= 0.60 || edge > 2.0 {
-                    return pick(m, &[Action::BetPot66, Action::BetPot100, Action::AllIn, Action::CheckCall]);
+                    return pick(m, &[Action::BetPot75, Action::AllIn, Action::CheckCall]);
                 } else {
                     return pick(m, &[Action::CheckCall]);
                 }
@@ -135,16 +135,19 @@ impl Policy for TightAggressive {
             // 🟢 2. BẮT CHẾT KẺ SHOVE LÁO Ở POSTFLOP (Flop/Turn/River):
             // Nếu có bài khá mạnh ở Postflop (edge > 1.55, ví dụ Top Pair+), luôn Call dù bị đối thủ Shove!
             if edge > 2.1 {
-                pick(m, &[Action::BetPot66, Action::BetPot33, Action::CheckCall])
+                pick(m, &[Action::BetPot75, Action::BetPot33, Action::CheckCall])
             } else if eq > pot_odds + 0.03 || edge > 1.55 {
                 pick(m, &[Action::CheckCall])
             } else {
                 pick(m, &[Action::Fold, Action::CheckCall])
             }
         } else if edge > 1.85 {
-            pick(m, &[Action::BetPot66, Action::BetPot33, Action::CheckCall])
+            pick(m, &[Action::BetPot75, Action::BetPot33, Action::CheckCall])
         } else if edge > 1.35 {
             pick(m, &[Action::BetPot33, Action::CheckCall])
+        } else if edge > 1.10 && f[F_STREET_PREFLOP] < 0.5 {
+            // C-bet nhỏ / Block bet thăm dò ở Postflop
+            pick(m, &[Action::BetSmall, Action::CheckCall])
         } else {
             pick(m, &[Action::CheckCall])
         }
@@ -156,7 +159,7 @@ impl Policy for TightAggressive {
 
 /// 1. LAG Shark (Loose-Aggressive):
 /// - Tận dụng vị trí cuối (BTN, CO) để mở rộng range tấn công.
-/// - Biết Semi-bluff (BetPot66/33) khi có Flush Draw hoặc Straight Draw ở Flop/Turn.
+/// - Biết Semi-bluff (BetPot75/33) khi có Flush Draw hoặc Straight Draw ở Flop/Turn.
 #[derive(Clone)]
 pub struct LagShark;
 impl Policy for LagShark {
@@ -182,22 +185,22 @@ impl Policy for LagShark {
         if facing {
             // Snap-call/raise với bài tốt ở Preflop (chen >= 0.42 || edge > 1.50) để chống trash shove
             if f[F_STREET_PREFLOP] > 0.5 && (chen >= 0.42 || edge > 1.50) {
-                return pick(m, &[Action::BetPot66, Action::AllIn, Action::CheckCall]);
+                return pick(m, &[Action::BetPot75, Action::AllIn, Action::CheckCall]);
             }
 
             if edge > 2.1 || (has_draw && eq > pot_odds) {
                 // Semi-bluff raise hoặc Value raise
-                pick(m, &[Action::BetPot66, Action::BetPot33, Action::CheckCall])
+                pick(m, &[Action::BetPot75, Action::BetPot33, Action::CheckCall])
             } else if eff_eq > pot_odds + 0.02 || edge > 1.55 {
                 pick(m, &[Action::CheckCall])
             } else {
                 pick(m, &[Action::Fold, Action::CheckCall])
             }
         } else if edge > 1.75 || (has_draw && edge > 1.25) {
-            pick(m, &[Action::BetPot66, Action::BetPot33, Action::CheckCall])
+            pick(m, &[Action::BetPot75, Action::BetPot33, Action::CheckCall])
         } else if edge > 1.15 || (is_late_pos && f[F_STREET_PREFLOP] > 0.5 && edge > 0.95) {
             // Steal blind ở vị trí cuối hoặc C-bet nhẹ
-            pick(m, &[Action::BetPot33, Action::CheckCall])
+            pick(m, &[Action::BetSmall, Action::BetPot33, Action::CheckCall])
         } else {
             pick(m, &[Action::CheckCall])
         }
@@ -229,7 +232,7 @@ impl Policy for NashPushBot {
                 // Open-Shove ngưỡng linh hoạt theo độ sâu stack và vị trí
                 let push_thresh = if is_late { 1.15 + (eff_bb / 45.0) } else { 1.45 + (eff_bb / 35.0) };
                 if edge >= push_thresh {
-                    return pick(m, &[Action::AllIn, Action::BetPot100, Action::CheckCall]);
+                    return pick(m, &[Action::AllIn, Action::BetPot75, Action::CheckCall]);
                 } else {
                     return pick(m, &[Action::Fold, Action::CheckCall]);
                 }
@@ -303,7 +306,7 @@ impl Policy for IcmSniper {
             // Hạ ngưỡng xuống 0.42 (88+, ATs+, KTs+, AJo+, KQo - Top 11% bài)
             if f[F_STREET_PREFLOP] > 0.5 && (chen >= 0.42 || edge > 1.50) {
                 if chen >= 0.60 || edge > 2.0 {
-                    return pick(m, &[Action::BetPot100, Action::BetPot66, Action::AllIn, Action::CheckCall]);
+                    return pick(m, &[Action::BetPot75, Action::AllIn, Action::CheckCall]);
                 } else {
                     return pick(m, &[Action::CheckCall]);
                 }
@@ -311,18 +314,18 @@ impl Policy for IcmSniper {
 
             if edge > 2.35 {
                 // Bài cực mạnh (Set, Two Pair lớn, Nut Flush) -> Raise lấy max value
-                pick(m, &[Action::BetPot100, Action::BetPot66, Action::AllIn, Action::CheckCall])
+                pick(m, &[Action::BetPot75, Action::AllIn, Action::CheckCall])
             } else if edge > 1.95 {
-                pick(m, &[Action::BetPot66, Action::BetPot33, Action::CheckCall])
+                pick(m, &[Action::BetPot75, Action::BetPot33, Action::CheckCall])
             } else if real_eq > pot_odds + 0.04 + icm_tax || edge > 1.60 {
                 pick(m, &[Action::CheckCall])
             } else {
                 pick(m, &[Action::Fold, Action::CheckCall])
             }
         } else if edge > 2.0 {
-            pick(m, &[Action::BetPot66, Action::BetPot100, Action::CheckCall])
+            pick(m, &[Action::BetPot75, Action::CheckCall])
         } else if edge > 1.35 || (is_late && edge > 1.12) {
-            pick(m, &[Action::BetPot33, Action::CheckCall])
+            pick(m, &[Action::BetSmall, Action::BetPot33, Action::CheckCall])
         } else {
             pick(m, &[Action::CheckCall])
         }

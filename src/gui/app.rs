@@ -507,8 +507,8 @@ impl eframe::App for PokerGuiApp {
                     println!("\n🔍 [DEBUG HERO]:");
                     println!("   🃏 Bài tẩy : {:?}", self.env.state.players[curr_actor].hole_cards);
                     println!("   🎭 Action Mask : {:?}", mask.to_bool_array());
-                    println!("   🧠 Raw Regrets : {:?}", &raw[..6]);
-                    println!("   📊 Probs xuất ra: {:?}", &probs[..6]);
+                    println!("   🧠 Raw Regrets : {:?}", &raw[..NUM_ACTIONS]);
+                    println!("   📊 Probs xuất ra: {:?}", &probs[..NUM_ACTIONS]);
                 }
 
                 for a_idx in 0..NUM_ACTIONS {
@@ -759,16 +759,16 @@ let pos_name = Position::for_seat_alive(i, engine_button, &alive_seats);
                         self.execute_action(Action::CheckCall);
                     }
 
+                    if ui.add_enabled(mask.is_valid(Action::BetSmall), egui::Button::new(RichText::new("🌱 Bet 15%").size(15.0))).clicked() {
+                        self.execute_action(Action::BetSmall);
+                    }
+
                     if ui.add_enabled(mask.is_valid(Action::BetPot33), egui::Button::new(RichText::new("🎯 Bet 33%").size(15.0))).clicked() {
                         self.execute_action(Action::BetPot33);
                     }
 
-                    if ui.add_enabled(mask.is_valid(Action::BetPot66), egui::Button::new(RichText::new("💥 Bet 66%").size(15.0))).clicked() {
-                        self.execute_action(Action::BetPot66);
-                    }
-
-                    if ui.add_enabled(mask.is_valid(Action::BetPot100), egui::Button::new(RichText::new("💣 Bet 100%").size(15.0))).clicked() {
-                        self.execute_action(Action::BetPot100);
+                    if ui.add_enabled(mask.is_valid(Action::BetPot75), egui::Button::new(RichText::new("💥 Bet 75%").size(15.0))).clicked() {
+                        self.execute_action(Action::BetPot75);
                     }
 
                     if ui.add_enabled(mask.is_valid(Action::AllIn), egui::Button::new(RichText::new("🚀 All-In").size(15.0).color(Color32::RED).strong())).clicked() {

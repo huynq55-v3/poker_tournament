@@ -185,7 +185,7 @@ impl GameState {
             .find(|r| {
                 matches!(
                     r.action,
-                    Action::BetPot33 | Action::BetPot66 | Action::BetPot100 | Action::AllIn
+                    Action::BetSmall | Action::BetPot33 | Action::BetPot75 | Action::AllIn
                 )
             })
             .map(|r| r.player_idx);
@@ -197,7 +197,7 @@ impl GameState {
                     if r.player_idx == agg_idx
                         && matches!(
                             r.action,
-                            Action::BetPot33 | Action::BetPot66 | Action::BetPot100 | Action::AllIn
+                            Action::BetSmall | Action::BetPot33 | Action::BetPot75 | Action::AllIn
                         )
                     {
                         streets_mask |= 1 << (r.street as u8);
@@ -336,7 +336,7 @@ impl GameState {
         for r in &self.action_history {
             if r.player_idx < MAX_PLAYERS {
                 match r.action {
-                    Action::BetPot33 | Action::BetPot66 | Action::BetPot100 => {
+                    Action::BetSmall | Action::BetPot33 | Action::BetPot75 => {
                         seat_sized_bets[r.player_idx] = seat_sized_bets[r.player_idx].saturating_add(1);
                         seat_streets_aggr_mask[r.player_idx] |= 1 << (r.street as u8);
                     }
@@ -369,7 +369,7 @@ impl GameState {
                 };
                 f.push(active_aggr);
                 // [3]: Cờ All-In (1.0) HOẶC Kích cỡ bet hiện tại so với Pot (0.0 .. 0.9)
-                //      Giúp phân biệt rõ Maniac Shove (1.0) vs TAG Bet 33%/66% (0.25..0.50)
+                //      Giúp phân biệt rõ Maniac Shove (1.0) vs TAG Bet 33%/75% (0.25..0.50)
                 let bet_profile = if o.is_all_in {
                     1.0
                 } else if o.current_bet > 0 && self.pot > 0 {
@@ -389,7 +389,7 @@ impl GameState {
         }
 
         // 7. Tóm tắt lịch sử (2) -> index 159..160
-        // Chiều 159: Tổng số cú Bet/Raise theo size chuẩn (33%/66%/100%) của các đối thủ trong cả ván
+        // Chiều 159: Tổng số cú Bet/Raise theo size chuẩn (15%/33%/75%/100%) của các đối thủ trong cả ván
         let total_opp_sized_bets: u8 = (0..self.num_players)
             .filter(|&i| i != player_idx)
             .map(|i| seat_sized_bets[i])
@@ -401,7 +401,7 @@ impl GameState {
                 r.street == self.street
                     && matches!(
                         r.action,
-                        Action::BetPot33 | Action::BetPot66 | Action::BetPot100 | Action::AllIn
+                        Action::BetSmall | Action::BetPot33 | Action::BetPot75 | Action::AllIn
                     )
             })
             .count();

@@ -210,13 +210,15 @@ fn traverse<R: Rng>(env: &mut Environment, ctx: &mut Ctx, pay: &Payoff, rng: &mu
             iteration_weight: ctx.weight,
         });
 
-        // 8% Smart Exploration: Chỉ thử nghiệm các nhánh BetPot33 / BetPot66 để mở khóa cây Postflop,
+        // 8% Smart Exploration: Thử nghiệm các nhánh BetSmall / BetPot33 / BetPot75 để mở khóa cây Postflop,
         // tuyệt đối KHÔNG chọn bừa All-In hay Fold làm nhiễu TrashShove!
         let a = if rng.gen_bool(0.08) {
-            if mask.is_valid(Action::BetPot33) && rng.gen_bool(0.6) {
+            if mask.is_valid(Action::BetSmall) && rng.gen_bool(0.35) {
+                Action::BetSmall
+            } else if mask.is_valid(Action::BetPot33) && rng.gen_bool(0.55) {
                 Action::BetPot33
-            } else if mask.is_valid(Action::BetPot66) {
-                Action::BetPot66
+            } else if mask.is_valid(Action::BetPot75) {
+                Action::BetPot75
             } else {
                 sample_action(&strat, &mask, rng)
             }

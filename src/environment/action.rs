@@ -7,9 +7,9 @@ pub const NUM_ACTIONS: usize = 6;
 pub enum Action {
     Fold = 0,
     CheckCall = 1,
-    BetPot33 = 2,
-    BetPot66 = 3,
-    BetPot100 = 4,
+    BetSmall = 2,
+    BetPot33 = 3,
+    BetPot75 = 4,
     AllIn = 5,
 }
 
@@ -17,9 +17,9 @@ impl Action {
     pub const ALL: [Action; NUM_ACTIONS] = [
         Action::Fold,
         Action::CheckCall,
+        Action::BetSmall,
         Action::BetPot33,
-        Action::BetPot66,
-        Action::BetPot100,
+        Action::BetPot75,
         Action::AllIn,
     ];
 
@@ -28,9 +28,9 @@ impl Action {
         match idx {
             0 => Some(Action::Fold),
             1 => Some(Action::CheckCall),
-            2 => Some(Action::BetPot33),
-            3 => Some(Action::BetPot66),
-            4 => Some(Action::BetPot100),
+            2 => Some(Action::BetSmall),
+            3 => Some(Action::BetPot33),
+            4 => Some(Action::BetPot75),
             5 => Some(Action::AllIn),
             _ => None,
         }
@@ -45,16 +45,16 @@ impl Action {
         match self {
             Action::Fold => "Fold",
             Action::CheckCall => "Check/Call",
+            Action::BetSmall => "Bet Small (15%)",
             Action::BetPot33 => "Bet 33% Pot",
-            Action::BetPot66 => "Bet 66% Pot",
-            Action::BetPot100 => "Bet 100% Pot",
+            Action::BetPot75 => "Bet 75% Pot",
             Action::AllIn => "All-In",
         }
     }
 }
 
 /// A compact bitmask representing valid actions
-/// Bit 0: Fold, Bit 1: CheckCall, Bit 2: Bet33, Bit 3: Bet66, Bit 4: Bet100, Bit 5: AllIn
+/// Bit 0: Fold, Bit 1: CheckCall, Bit 2: BetSmall, Bit 3: Bet33, Bit 4: Bet75, Bit 5: AllIn
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionMask(pub u8);
 

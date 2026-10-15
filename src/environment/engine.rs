@@ -6,9 +6,9 @@ use rand::Rng;
 
 /// Các action đặt cược theo % pot (pot SAU KHI call, đúng luật pot-sized raise)
 const RAISE_ACTIONS: [(Action, f32); 3] = [
+    (Action::BetSmall, 0.15),
     (Action::BetPot33, 0.33),
-    (Action::BetPot66, 0.66),
-    (Action::BetPot100, 1.0),
+    (Action::BetPot75, 0.75),
 ];
 
 #[derive(Debug, Clone)]
@@ -266,11 +266,12 @@ impl Environment {
                     self.state.players[p_idx].is_all_in = true;
                 }
             }
-            Action::BetPot33 | Action::BetPot66 | Action::BetPot100 => {
+            Action::BetSmall | Action::BetPot33 | Action::BetPot75 => {
                 let frac = match action {
+                    Action::BetSmall => 0.15f32,
                     Action::BetPot33 => 0.33f32,
-                    Action::BetPot66 => 0.66f32,
-                    _ => 1.0f32,
+                    Action::BetPot75 => 0.75f32,
+                    _ => unreachable!(),
                 };
                 let target_total = self.raise_target(p_idx, frac);
                 let needed = target_total.saturating_sub(self.state.players[p_idx].current_bet);
@@ -538,9 +539,9 @@ mod tests {
         env.reset_hand(&mut rng, 0);
 
         let mask = env.get_action_mask();
+        assert!(!mask.is_valid(Action::BetSmall));
         assert!(!mask.is_valid(Action::BetPot33));
-        assert!(!mask.is_valid(Action::BetPot66));
-        assert!(!mask.is_valid(Action::BetPot100));
+        assert!(!mask.is_valid(Action::BetPot75));
         assert!(mask.is_valid(Action::AllIn));
     }
 
