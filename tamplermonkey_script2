@@ -33,32 +33,33 @@
             'k': { key: 'k', code: 'KeyK', keyCode: 75 },
             'c': { key: 'c', code: 'KeyC', keyCode: 67 },
             'r': { key: 'r', code: 'KeyR', keyCode: 82 },
+            'm': { key: 'm', code: 'KeyM', keyCode: 77 },
+            'M': { key: 'M', code: 'KeyM', keyCode: 77 },
             'Enter': { key: 'Enter', code: 'Enter', keyCode: 13 }
         };
         const info = codeMap[keyChar];
         if (!info) return;
 
         const target = document.activeElement || document.body || window;
-        const down = new KeyboardEvent('keydown', {
+        const eventInit = {
             key: info.key,
             code: info.code,
             keyCode: info.keyCode,
             which: info.keyCode,
+            charCode: info.keyCode,
             bubbles: true,
             cancelable: true
-        });
-        const up = new KeyboardEvent('keyup', {
-            key: info.key,
-            code: info.code,
-            keyCode: info.keyCode,
-            which: info.keyCode,
-            bubbles: true,
-            cancelable: true
-        });
+        };
+        const down = new KeyboardEvent('keydown', eventInit);
+        const press = new KeyboardEvent('keypress', eventInit);
+        const up = new KeyboardEvent('keyup', eventInit);
 
         window.dispatchEvent(down);
         document.dispatchEvent(down);
         target.dispatchEvent(down);
+        window.dispatchEvent(press);
+        document.dispatchEvent(press);
+        target.dispatchEvent(press);
         window.dispatchEvent(up);
         document.dispatchEvent(up);
         target.dispatchEvent(up);
@@ -116,21 +117,141 @@
         return ((el.value || el.textContent || el.innerText || '') + '').trim().toLowerCase();
     }
 
-    function findBetInput() {
-        // Selector chính xác 100% của PokerNow: <input type="text" class="value" pattern="[0-9]*" inputmode="numeric">
-        let el = document.querySelector('input.value[inputmode="numeric"], input.value, input[inputmode="numeric"]');
-        if (el && el.offsetParent !== null) return el;
+    function isElementVisible(el) {
+        if (!el) return false;
+        if (el.disabled) return false;
+        if (el.getAttribute('aria-hidden') === 'true') return false;
 
-        // Dự phòng quét toàn bộ
+        // 1. checkVisibility API nếu trình duyệt hỗ trợ
+        if (typeof el.checkVisibility === 'function') {
+            return el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
+        }
+
+        // 2. getBoundingClientRect (width và height > 0)
+        // Đây là cách nhận diện chuẩn nhất, KHÔNG BỊ LỖI KHI CÓ position: fixed như offsetParent!
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) return true;
+
+        // 3. Fallback offsetParent (cho trường hợp thông thường)
+        if (el.offsetParent !== null) return true;
+
+        // 4. Fallback computedStyle
+        try {
+            const style = window.getComputedStyle(el);
+            return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+        } catch (e) {
+            return true;
+        }
+    }
+
+    function findBetInput() {
+        // Selector chính xác 100% của PokerNow:
+        // <input type="text" class="value" pattern="[0-9]*" inputmode="numeric" value="40">
+        const selectors = [
+            'input.value[inputmode="numeric"]',
+            'input.value[pattern="[0-9]*"]',
+            'input.value',
+            'input[inputmode="numeric"]:not([placeholder*="chat" i])',
+            '.action-signal input.value',
+            '.action-buttons input.value',
+            '.bet-box input',
+            '.form-group input.value',
+            'input[type="text"].value'
+        ];
+
+        for (const sel of selectors) {
+            const els = Array.from(document.querySelectorAll(sel));
+            for (const el of els) {
+                if (isElementVisible(el)) return el;
+            }
+            // Nếu có trong DOM và đã kết nối
+            if (els.length > 0 && els[0].isConnected) {
+                return els[0];
+            }
+        }
+
+        // Dự phòng quét toàn bộ inputs không phải chat/hidden/button
         const allInputs = Array.from(document.querySelectorAll('input'));
         for (const input of allInputs) {
-            if (input.type === 'hidden' || input.type === 'checkbox' || input.type === 'radio' || input.type === 'submit') continue;
+            if (input.type === 'hidden' || input.type === 'checkbox' || input.type === 'radio' || input.type === 'submit' || input.type === 'button') continue;
             const cls = (input.className || '').toLowerCase();
             const placeholder = (input.placeholder || '').toLowerCase();
             if (cls.includes('chat') || placeholder.includes('chat') || placeholder.includes('message')) continue;
-            if (input.offsetParent !== null) return input;
+            if (isElementVisible(input)) return input;
         }
         return null;
+    }
+
+    // =========================================================================
+    // 💬 HỆ THỐNG GỬI TIN NHẮN CHAT TỰ ĐỘNG (BẤM 'M' -> FOCUS -> NHẬP -> ENTER)
+    // =========================================================================
+    const BOT_RESEARCH_NOTICE = "Notice: You are playing against an AI bot for research purposes only.";
+    let hasAnnouncedChat = false;
+
+    function findChatInput() {
+        // Selector chính xác theo thuộc tính của PokerNow:
+        // <input maxlength="100" type="text" required="" placeholder="Your Message (press Enter to submit)" value="">
+        const selectors = [
+            'input[placeholder="Your Message (press Enter to submit)"]',
+            'input[placeholder*="Your Message"]',
+            'input[placeholder*="press Enter to submit"]',
+            'input[maxlength="100"][type="text"]',
+            '.chat-box input',
+            '.chat input',
+            'form.chat-form input'
+        ];
+
+        for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (el && isElementVisible(el)) return el;
+            if (el) return el;
+        }
+        return null;
+    }
+
+    function sendInPageChat(message, attempt = 0) {
+        if (!message) return;
+        console.log(`💬 [SILENT BOT] Chuẩn bị gửi tin nhắn chat (lần thử ${attempt + 1}): "${message}"`);
+
+        // 1. Nhấn phím 'm' trên trang để kích hoạt mở/focus khung chat PokerNow
+        pressKeyInPage('m');
+
+        setTimeout(() => {
+            let input = findChatInput();
+
+            // Nếu chưa tìm thấy sau phím m, thử lại sau 300ms (tối đa 5 lần thử khi bàn mới load)
+            if (!input && attempt < 5) {
+                setTimeout(() => sendInPageChat(message, attempt + 1), 300);
+                return;
+            }
+
+            if (input) {
+                input.focus();
+                setReactInputValue(input, message);
+                console.log("✍️ [SILENT BOT] Đã nhập nội dung thông báo vào ô chat:", input);
+
+                setTimeout(() => {
+                    pressEnterOn(input);
+                    pressKeyInPage('Enter');
+                    if (input.form) {
+                        try {
+                            input.form.requestSubmit();
+                        } catch (e) {
+                            try { input.form.submit(); } catch (e2) {}
+                        }
+                    }
+                    console.log("🚀 [SILENT BOT] Đã bấm Enter gửi tin nhắn chat thành công!");
+
+                    // Thoát focus khỏi ô chat để không làm kẹt phím tắt đánh poker ('f', 'k', 'c', 'r')
+                    setTimeout(() => {
+                        try { input.blur(); } catch(e) {}
+                        if (document.body) { try { document.body.focus(); } catch(e) {} }
+                    }, 50);
+                }, 80);
+            } else {
+                console.warn("⚠️ [SILENT BOT] Không tìm thấy ô chat sau nhiều lần thử!");
+            }
+        }, 100);
     }
 
     // Gán giá trị cược tương thích 100% với React.js (bypass React Synthetic Event wrapper)
@@ -153,6 +274,9 @@
                 input._valueTracker.setValue("");
             }
             input.dispatchEvent(new Event('input', { bubbles: true }));
+            try {
+                input.dispatchEvent(new InputEvent('input', { bubbles: true, data: strVal }));
+            } catch (e3) {}
             input.dispatchEvent(new Event('change', { bubbles: true }));
             return true;
         } catch (e) {
@@ -173,7 +297,7 @@
         const allButtons = Array.from(document.querySelectorAll(
             'input[type="submit"].action-button, input[type="submit"], input[type="button"], button, .action-button, a.button, div[role="button"]'
         ));
-        const visibleButtons = allButtons.filter(b => b.offsetParent !== null && !b.disabled);
+        const visibleButtons = allButtons.filter(b => isElementVisible(b));
 
         if (type === 'fold') {
             return visibleButtons.find(b => {
@@ -220,14 +344,14 @@
 
     function findRaiseSubmitButton() {
         // Nút submit xanh của PokerNow: <input type="submit" class="button-1 action-button green highlighted bet" value="Raise">
-        let btn = document.querySelector('input[type="submit"].action-button.bet, input.action-button.green.bet, input.action-button.bet, input[type="submit"].bet');
-        if (btn && btn.offsetParent !== null && !btn.disabled) return btn;
+        let btn = document.querySelector('input[type="submit"].action-button.bet, input.action-button.green.bet, input.action-button.bet, input[type="submit"].bet, button.bet');
+        if (btn && isElementVisible(btn)) return btn;
 
         const allButtons = Array.from(document.querySelectorAll(
-            'input[type="submit"].action-button, input[type="submit"], button, .action-button'
+            'input[type="submit"].action-button, input[type="submit"], button, .action-button, input[type="button"]'
         ));
         return allButtons.find(b => {
-            if (b.offsetParent === null || b.disabled) return false;
+            if (!isElementVisible(b)) return false;
             const cls = (b.className || '').toLowerCase();
             const txt = getElementLabel(b);
             if (cls.includes('fold') || cls.includes('check') || txt.startsWith('call') || txt === 'fold' || txt === 'check') return false;
@@ -257,60 +381,90 @@
     }
 
     // Quy trình thực hiện Tố / Cược / All-In theo đúng PokerNow:
-    // 1. Kiểm tra / mở thanh cược (bấm 'r' hoặc click nút Raise)
-    // 2. Điền số vào thẻ <input type="text" class="value" ...>
-    // 3. Click nút submit <input type="submit" class="... bet" value="Raise"> và bấm Enter
-    function performRaiseOrBet(amount, isAllIn = false) {
+    // Quy trình thực hiện Tố / Cược / All-In theo đúng PokerNow:
+    // 1. Luôn kích hoạt mở ô cược (bấm 'r' + click nút Raise)
+    // 2. Chờ ô input xuất hiện (retry tối đa 15 lần x 60ms = ~900ms)
+    // 3. Điền số vào thẻ <input type="text" class="value" ...>
+    // 4. Click nút submit cược và gửi phím Enter
+    function performRaiseOrBet(amount, isAllIn = false, onComplete = null) {
         console.log(`🎯 [SILENT BOT] Bắt đầu thao tác ${isAllIn ? 'ALL-IN' : 'RAISE'}: ${amount} chip`);
 
-        let input = findBetInput();
-
-        // Bước 1: Mở thanh cược nếu chưa mở
-        if (!input) {
-            pressKeyInPage('r');
-            const raiseToggleBtn = findActionButton('raise');
-            if (raiseToggleBtn) clickElement(raiseToggleBtn);
+        // Với All-In: Nếu có nút shortcut MAX / ALL IN trực tiếp thì click luôn
+        if (isAllIn) {
+            const maxBtn = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], a.button, div[role="button"]')).find(b => {
+                const txt = getElementLabel(b);
+                return isElementVisible(b) && (txt === 'max' || txt === 'all in' || txt === 'all-in');
+            });
+            if (maxBtn) {
+                console.log("🚀 [SILENT BOT] Click nút MAX / ALL-IN trực tiếp!");
+                clickElement(maxBtn);
+                setTimeout(() => {
+                    const submitBtn = findRaiseSubmitButton() || findActionButton('raise');
+                    if (submitBtn) clickElement(submitBtn);
+                    pressKeyInPage('Enter');
+                    if (typeof onComplete === 'function') onComplete(true);
+                }, 60);
+                return;
+            }
         }
 
-        // Bước 2: Đợi thanh cược mở (50ms) rồi điền số và click submit
-        setTimeout(() => {
-            input = findBetInput();
+        // Bước 1: Luôn bấm 'r' trước và bấm nút Raise để mở thanh cược
+        pressKeyInPage('r');
+        const raiseToggleBtn = findActionButton('raise');
+        if (raiseToggleBtn) clickElement(raiseToggleBtn);
 
-            // Với All-In: Nếu có nút shortcut MAX / ALL IN thì click luôn
-            if (isAllIn) {
-                const maxBtn = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], a.button, div[role="button"]')).find(b => {
-                    const txt = getElementLabel(b);
-                    return b.offsetParent !== null && !b.disabled && (txt === 'max' || txt === 'all in' || txt === 'all-in');
-                });
-                if (maxBtn) {
-                    console.log("🚀 [SILENT BOT] Click nút MAX / ALL-IN!");
-                    clickElement(maxBtn);
-                }
+        // Bước 2: Polling chờ ô input xuất hiện (tối đa 15 lần x 60ms = ~900ms)
+        let attempts = 0;
+        const maxAttempts = 15;
+
+        function pollAndFill() {
+            attempts++;
+            let input = findBetInput();
+
+            // Nếu sau vài lần thử vẫn chưa thấy (do bàn đang chạy animation lật bài/chia chip), bấm lại 'r'
+            if (!input && (attempts === 3 || attempts === 6 || attempts === 9)) {
+                pressKeyInPage('r');
+                const btn = findActionButton('raise');
+                if (btn) clickElement(btn);
             }
 
             if (input) {
                 input.focus();
                 setReactInputValue(input, amount);
-                console.log(`✍️ [SILENT BOT] Đã nhập ${amount} vào ô cược`);
+                console.log(`✍️ [SILENT BOT] Đã nhập ${amount} vào ô cược (lần thử ${attempts}):`, input);
 
-                // Bước 3: Click nút Submit cược và Enter sau 40ms
+                // Bước 3: Click nút Submit cược và bấm Enter
                 setTimeout(() => {
                     submitBet(input);
+                    pressKeyInPage('Enter');
                     console.log("⚡ [SILENT BOT] Đã gửi lệnh cược thành công!");
-                }, 40);
+                    if (typeof onComplete === 'function') onComplete(true);
+                }, 50);
+            } else if (attempts < maxAttempts) {
+                setTimeout(pollAndFill, 60);
             } else {
-                console.warn("⚠️ [SILENT BOT] Không thấy ô input, kích hoạt submit trực tiếp...");
+                console.warn("⚠️ [SILENT BOT] Chưa thấy ô input sau 15 lần thử, kích hoạt submit trực tiếp...");
                 submitBet(null);
+                pressKeyInPage('Enter');
+                if (typeof onComplete === 'function') onComplete(false);
             }
-        }, 50);
+        }
+
+        setTimeout(pollAndFill, 40);
     }
 
     function executeSilentAction(cmd, attempt = 0) {
         if (!cmd || !cmd.action) return;
         const act = cmd.action.toLowerCase();
-        console.log(`🥷 [SILENT BOT] Thực thi hành động ngầm: ${act.toUpperCase()} (Chip: ${cmd.amount || 0})`);
+        console.log(`🥷 [SILENT BOT] Thực thi hành động ngầm: ${act.toUpperCase()} (Chip: ${cmd.amount || 0}, Thử lần: ${attempt + 1})`);
 
         let done = false;
+
+        if (act === 'chat') {
+            const msg = cmd.text || cmd.message || BOT_RESEARCH_NOTICE;
+            sendInPageChat(msg);
+            return;
+        }
 
         if (act === 'fold') {
             pressKeyInPage('f');
@@ -342,16 +496,24 @@
                 clickElement(directAllIn);
                 console.log("✅ [SILENT BOT] Đã click nút ALL-IN trực tiếp!");
             }
-            performRaiseOrBet(cmd.amount, true);
+            performRaiseOrBet(cmd.amount, true, (success) => {
+                if (!success && attempt < 4) {
+                    setTimeout(() => executeSilentAction(cmd, attempt + 1), 150);
+                }
+            });
             done = true;
         } else if (act === 'raise') {
-            performRaiseOrBet(cmd.amount, false);
+            performRaiseOrBet(cmd.amount, false, (success) => {
+                if (!success && attempt < 4) {
+                    setTimeout(() => executeSilentAction(cmd, attempt + 1), 150);
+                }
+            });
             done = true;
         }
 
-        // Nếu bàn chơi đang trong hoạt ảnh chưa kịp hiện nút, thử lại sau 120ms (tối đa 4 lần)
+        // Nếu bàn chơi đang trong hoạt ảnh chưa kịp hiện nút fold/check/call, thử lại sau 150ms (tối đa 4 lần)
         if (!done && attempt < 4) {
-            setTimeout(() => executeSilentAction(cmd, attempt + 1), 120);
+            setTimeout(() => executeSilentAction(cmd, attempt + 1), 150);
         }
     }
 
@@ -369,6 +531,11 @@
             onload: function(response) {
                 try {
                     const data = JSON.parse(response.responseText);
+                    if (data && data.chat_message && !hasAnnouncedChat) {
+                        hasAnnouncedChat = true;
+                        console.log("💬 [SILENT BOT] Nhận yêu cầu gửi tin nhắn chat từ Rust:", data.chat_message);
+                        sendInPageChat(data.chat_message);
+                    }
                     if (data && data.bot_action) {
                         console.log("📥 [SILENT BOT] Nhận lệnh từ Rust:", data.bot_action);
                         executeSilentAction(data.bot_action);
@@ -383,6 +550,15 @@
             ontimeout: function() {}
         });
     }
+
+    // Tự động kiểm tra và gửi thông báo nếu sau 4 giây vào bàn chưa gửi
+    setTimeout(() => {
+        if (!hasAnnouncedChat && window.location.href.includes('/games/')) {
+            console.log("📢 [SILENT BOT] Tự động gửi thông báo bot nghiên cứu vào bàn chơi...");
+            hasAnnouncedChat = true;
+            sendInPageChat(BOT_RESEARCH_NOTICE);
+        }
+    }, 4000);
 
     // Kiểm tra và gửi lại gói registered đã lưu trong sessionStorage nếu có (phòng khi Rust restart)
     try {

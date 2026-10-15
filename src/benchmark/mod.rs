@@ -9,19 +9,37 @@ use rayon::prelude::*;
 use std::io::Write;
 
 pub mod arena;
-pub use arena::{evaluate_against_champion, ArenaMatchResult};
+pub use arena::{
+    evaluate_against_champion, evaluate_against_heuristic_team, evaluate_arena_suite,
+    print_arena_results, ArenaMatchResult,
+};
 
 // ---- Vị trí các đặc trưng trong encode_features (đổi layout thì phải cập nhật; có test kiểm tra) ----
+const F_POS_BTN: usize = 109;
+const F_POS_SB: usize = 110;
+#[allow(dead_code)]
+const F_POS_BB: usize = 111;
+const F_POS_CO: usize = 116;
+const F_IS_BUBBLE: usize = 119;     // 1.0 nếu còn 5 người (vòng Bubble)
+const F_STACK_RANK: usize = 121;    // 0.0 (nghèo nhất) .. 1.0 (Chip Leader)
 const F_STREET_PREFLOP: usize = 123;
+const F_STREET_RIVER: usize = 126;
 const F_POT_ODDS: usize = 130;
 const F_IN_HAND: usize = 160;
+const F_EFF_BB: usize = 161;        // eff_stack_bb / 50.0
 const F_PUSHFOLD: usize = 162;
 const F_FACING_BET: usize = 163;
 const F_HAND_STRENGTH: usize = 167; // preflop: điểm Chen 0..1
 const F_EQUITY: usize = 168;
+const F_AGG_BARRELS: usize = 170;   // Số vòng đối thủ đã barrel / 4.0
+const F_FLUSH_DRAW: usize = 171;
+const F_STRAIGHT_DRAW: usize = 172;
+#[allow(dead_code)]
+const F_BOARD_HIGH: usize = 175;
 
-/// Bài rác preflop: điểm Chen chuẩn hóa dưới ngưỡng này
-const TRASH_CHEN: f32 = 0.30;
+/// Bài rác preflop thực sự (72o, 83o, 93o, J2o...): điểm Chen chuẩn hóa dưới 0.22
+/// (Không tính nhầm các bài 22..55, A9o, KTo, QJs đang push đúng Nash ở 12BB là rác!)
+const TRASH_CHEN: f32 = 0.22;
 const TABLE_SIZE: usize = 8;
 
 // ===================================================================== Baselines
@@ -79,31 +97,231 @@ impl Policy for Maniac {
     }
 }
 
-/// Chặt-hung hăng dựa trên equity so với bài ngẫu nhiên và pot odds
+/// Chặt-hung hăng dựa trên equity, vị trí và khả năng bắt bluff All-in chuẩn xác
 #[derive(Clone)]
 pub struct TightAggressive;
 impl Policy for TightAggressive {
     fn select_action(&self, f: &[f32], m: &ActionMask) -> Action {
         let eq = f[F_EQUITY];
         let n = (f[F_IN_HAND] * 8.0).round().max(2.0);
-        let edge = eq * n; // 1.0 = phần chia công bằng
+        let edge = eq * n; // 1.0 = bài trung bình trên bàn
         let pot_odds = f[F_POT_ODDS];
         let facing = f[F_FACING_BET] > 0.5;
+        let chen = f[F_HAND_STRENGTH]; // Điểm Chen ở Preflop (0..1)
 
-        if edge > 2.6 && f[F_PUSHFOLD] > 0.5 {
-            return pick(m, &[Action::AllIn, Action::CheckCall]);
+        // 1. Chế độ Push/Fold (< 12 BB):
+        if f[F_PUSHFOLD] > 0.5 {
+            // Không đẩy bài rác, chỉ đẩy/call khi bài thuộc top (edge > 1.65 hoặc Chen >= 0.45)
+            if edge > 1.75 || (f[F_STREET_PREFLOP] > 0.5 && chen >= 0.48) {
+                return pick(m, &[Action::AllIn, Action::CheckCall]);
+            } else if facing {
+                return pick(m, &[Action::Fold, Action::CheckCall]);
+            }
         }
+
+        // 2. Khi đối mặt với Bet / Raise / All-In của đối thủ:
         if facing {
-            if edge > 2.2 {
+            // 🟢 1. BẮT CHẾT KẺ RE-SHOVE LÁO Ở PREFLOP:
+            // Hạ ngưỡng từ 0.52 xuống 0.42 (bao gồm 88+, ATs+, KTs+, AJo+, KQo - Top 11% bài):
+            // Hễ đã cầm bài tốt ở Preflop là KHÔNG BAO GIỜ FOLD trước cú All-in cướp pot!
+            if f[F_STREET_PREFLOP] > 0.5 && (chen >= 0.42 || edge > 1.50) {
+                if chen >= 0.60 || edge > 2.0 {
+                    return pick(m, &[Action::BetPot66, Action::BetPot100, Action::AllIn, Action::CheckCall]);
+                } else {
+                    return pick(m, &[Action::CheckCall]);
+                }
+            }
+
+            // 🟢 2. BẮT CHẾT KẺ SHOVE LÁO Ở POSTFLOP (Flop/Turn/River):
+            // Nếu có bài khá mạnh ở Postflop (edge > 1.55, ví dụ Top Pair+), luôn Call dù bị đối thủ Shove!
+            if edge > 2.1 {
                 pick(m, &[Action::BetPot66, Action::BetPot33, Action::CheckCall])
-            } else if eq > pot_odds + 0.04 {
+            } else if eq > pot_odds + 0.03 || edge > 1.55 {
                 pick(m, &[Action::CheckCall])
             } else {
                 pick(m, &[Action::Fold, Action::CheckCall])
             }
-        } else if edge > 1.9 {
+        } else if edge > 1.85 {
             pick(m, &[Action::BetPot66, Action::BetPot33, Action::CheckCall])
         } else if edge > 1.35 {
+            pick(m, &[Action::BetPot33, Action::CheckCall])
+        } else {
+            pick(m, &[Action::CheckCall])
+        }
+    }
+    fn get_action_probs(&self, f: &[f32], m: &ActionMask) -> [f32; NUM_ACTIONS] {
+        one_hot(self.select_action(f, m))
+    }
+}
+
+/// 1. LAG Shark (Loose-Aggressive):
+/// - Tận dụng vị trí cuối (BTN, CO) để mở rộng range tấn công.
+/// - Biết Semi-bluff (BetPot66/33) khi có Flush Draw hoặc Straight Draw ở Flop/Turn.
+#[derive(Clone)]
+pub struct LagShark;
+impl Policy for LagShark {
+    fn select_action(&self, f: &[f32], m: &ActionMask) -> Action {
+        let eq = f[F_EQUITY];
+        let n = (f[F_IN_HAND] * 8.0).round().max(2.0);
+        let pot_odds = f[F_POT_ODDS];
+        let facing = f[F_FACING_BET] > 0.5;
+        let is_late_pos = f[F_POS_BTN] > 0.5 || f[F_POS_CO] > 0.5;
+        let has_draw = f[F_FLUSH_DRAW] > 0.5 || f[F_STRAIGHT_DRAW] > 0.5;
+        let chen = f[F_HAND_STRENGTH];
+
+        // Cộng thêm Equity kỳ vọng khi có thùng/sảnh chờ hoặc lợi thế vị trí
+        let draw_bonus = if has_draw && f[F_STREET_RIVER] < 0.5 { 0.12 } else { 0.0 };
+        let pos_bonus = if is_late_pos && !facing { 0.08 } else { 0.0 };
+        let eff_eq = (eq + draw_bonus + pos_bonus).min(0.98);
+        let edge = eff_eq * n;
+
+        if f[F_PUSHFOLD] > 0.5 && edge > 2.1 {
+            return pick(m, &[Action::AllIn, Action::CheckCall]);
+        }
+
+        if facing {
+            // Snap-call/raise với bài tốt ở Preflop (chen >= 0.42 || edge > 1.50) để chống trash shove
+            if f[F_STREET_PREFLOP] > 0.5 && (chen >= 0.42 || edge > 1.50) {
+                return pick(m, &[Action::BetPot66, Action::AllIn, Action::CheckCall]);
+            }
+
+            if edge > 2.1 || (has_draw && eq > pot_odds) {
+                // Semi-bluff raise hoặc Value raise
+                pick(m, &[Action::BetPot66, Action::BetPot33, Action::CheckCall])
+            } else if eff_eq > pot_odds + 0.02 || edge > 1.55 {
+                pick(m, &[Action::CheckCall])
+            } else {
+                pick(m, &[Action::Fold, Action::CheckCall])
+            }
+        } else if edge > 1.75 || (has_draw && edge > 1.25) {
+            pick(m, &[Action::BetPot66, Action::BetPot33, Action::CheckCall])
+        } else if edge > 1.15 || (is_late_pos && f[F_STREET_PREFLOP] > 0.5 && edge > 0.95) {
+            // Steal blind ở vị trí cuối hoặc C-bet nhẹ
+            pick(m, &[Action::BetPot33, Action::CheckCall])
+        } else {
+            pick(m, &[Action::CheckCall])
+        }
+    }
+    fn get_action_probs(&self, f: &[f32], m: &ActionMask) -> [f32; NUM_ACTIONS] {
+        one_hot(self.select_action(f, m))
+    }
+}
+
+/// 2. NashPushBot (Chuyên gia Short-Stack & Push/Fold):
+/// - Khi stack <= 15 BB: Đánh chuẩn lý thuyết Nash Push/Fold theo số đối thủ còn lại và vị trí.
+/// - Khi stack > 15 BB: Đánh kỷ luật chặt chẽ.
+#[derive(Clone)]
+pub struct NashPushBot;
+impl Policy for NashPushBot {
+    fn select_action(&self, f: &[f32], m: &ActionMask) -> Action {
+        let eq = f[F_EQUITY];
+        let n = (f[F_IN_HAND] * 8.0).round().max(2.0);
+        let edge = eq * n;
+        let pot_odds = f[F_POT_ODDS];
+        let facing = f[F_FACING_BET] > 0.5;
+        let eff_bb = f[F_EFF_BB] * 50.0;
+        let is_late = f[F_POS_BTN] > 0.5 || f[F_POS_SB] > 0.5 || f[F_POS_CO] > 0.5;
+        let chen = f[F_HAND_STRENGTH];
+
+        // Chế độ Short-stack Nash Push/Fold (<= 15 BB)
+        if eff_bb <= 15.0 && f[F_STREET_PREFLOP] > 0.5 {
+            if !facing {
+                // Open-Shove ngưỡng linh hoạt theo độ sâu stack và vị trí
+                let push_thresh = if is_late { 1.15 + (eff_bb / 45.0) } else { 1.45 + (eff_bb / 35.0) };
+                if edge >= push_thresh {
+                    return pick(m, &[Action::AllIn, Action::BetPot100, Action::CheckCall]);
+                } else {
+                    return pick(m, &[Action::Fold, Action::CheckCall]);
+                }
+            } else {
+                // Call All-in cần ngưỡng chặt hơn Open-Shove (Gap Concept của Sklansky)
+                // nhưng bắt chết với bài tốt (chen >= 0.42) tránh bị multiway eq làm mù quáng
+                if (eq >= pot_odds + 0.06 || chen >= 0.42) && edge >= 1.45 {
+                    return pick(m, &[Action::CheckCall, Action::AllIn]);
+                } else {
+                    return pick(m, &[Action::Fold, Action::CheckCall]);
+                }
+            }
+        }
+
+        // Stack sâu (> 15 BB): Chơi TAG chuẩn mực
+        TightAggressive.select_action(f, m)
+    }
+    fn get_action_probs(&self, f: &[f32], m: &ActionMask) -> [f32; NUM_ACTIONS] {
+        one_hot(self.select_action(f, m))
+    }
+}
+
+/// 3. IcmSniper (TRÙM CUỐI HEURISTIC - Apex SNG Bot):
+/// - Khấu trừ Equity khi đối thủ barrel nhiều vòng (không bao giờ làm CallStation nộp mạng).
+/// - Áp dụng Bubble Factor (ép bàn khi làm Chip Leader, thu mình khi stack trung bình ở Bubble).
+/// - Kết hợp cả Semi-bluff lẫn Nash Push/Fold.
+#[derive(Clone)]
+pub struct IcmSniper;
+impl Policy for IcmSniper {
+    fn select_action(&self, f: &[f32], m: &ActionMask) -> Action {
+        let raw_eq = f[F_EQUITY];
+        let n = (f[F_IN_HAND] * 8.0).round().max(2.0);
+        let pot_odds = f[F_POT_ODDS];
+        let facing = f[F_FACING_BET] > 0.5;
+        let is_late = f[F_POS_BTN] > 0.5 || f[F_POS_CO] > 0.5;
+        let has_draw = (f[F_FLUSH_DRAW] > 0.5 || f[F_STRAIGHT_DRAW] > 0.5) && f[F_STREET_RIVER] < 0.5;
+        let chen = f[F_HAND_STRENGTH];
+
+        // 1. Đọc lịch sử barrel của đối thủ: Nếu đối thủ bet liên tục qua nhiều vòng,
+        // IcmSniper tự hiểu đối thủ đang cầm top range và khấu trừ equity ảo!
+        let opp_barrels = f[F_AGG_BARRELS] * 4.0; // 0..4 vòng
+        let range_discount = if facing { (opp_barrels * 0.065).min(0.22) } else { 0.0 };
+
+        // 2. Tính áp lực ICM / Bubble Factor:
+        let is_bubble = f[F_IS_BUBBLE] > 0.5;
+        let stack_rank = f[F_STACK_RANK]; // 1.0 = giàu nhất bàn
+        let icm_tax = if is_bubble && facing && stack_rank < 0.85 {
+            0.05 // Đang ở Bubble mà bị bet vào mặt -> đòi thêm 5% equity mới dám Call
+        } else if stack_rank > 0.80 && !facing {
+            -0.04 // Là Chip Leader và chưa ai bet -> giảm ngưỡng để gây áp lực lên bàn
+        } else {
+            0.0
+        };
+
+        let draw_bonus = if has_draw { 0.09 } else { 0.0 };
+        let real_eq = (raw_eq + draw_bonus - range_discount).clamp(0.0, 1.0);
+        let edge = real_eq * n;
+
+        // Chế độ Push/Fold (< 12 BB) có điều chỉnh ICM
+        if f[F_PUSHFOLD] > 0.5 {
+            let push_req = if facing { 1.85 + icm_tax * 4.0 } else if is_late { 1.30 } else { 1.60 };
+            if edge >= push_req && (!facing || real_eq >= pot_odds + 0.05 + icm_tax || chen >= 0.42) {
+                return pick(m, &[Action::AllIn, Action::CheckCall]);
+            } else {
+                return pick(m, &[Action::Fold, Action::CheckCall]);
+            }
+        }
+
+        if facing {
+            // 🟢 BẮT CHẾT KẺ RE-SHOVE LÁO Ở PREFLOP:
+            // Hạ ngưỡng xuống 0.42 (88+, ATs+, KTs+, AJo+, KQo - Top 11% bài)
+            if f[F_STREET_PREFLOP] > 0.5 && (chen >= 0.42 || edge > 1.50) {
+                if chen >= 0.60 || edge > 2.0 {
+                    return pick(m, &[Action::BetPot100, Action::BetPot66, Action::AllIn, Action::CheckCall]);
+                } else {
+                    return pick(m, &[Action::CheckCall]);
+                }
+            }
+
+            if edge > 2.35 {
+                // Bài cực mạnh (Set, Two Pair lớn, Nut Flush) -> Raise lấy max value
+                pick(m, &[Action::BetPot100, Action::BetPot66, Action::AllIn, Action::CheckCall])
+            } else if edge > 1.95 {
+                pick(m, &[Action::BetPot66, Action::BetPot33, Action::CheckCall])
+            } else if real_eq > pot_odds + 0.04 + icm_tax || edge > 1.60 {
+                pick(m, &[Action::CheckCall])
+            } else {
+                pick(m, &[Action::Fold, Action::CheckCall])
+            }
+        } else if edge > 2.0 {
+            pick(m, &[Action::BetPot66, Action::BetPot100, Action::CheckCall])
+        } else if edge > 1.35 || (is_late && edge > 1.12) {
             pick(m, &[Action::BetPot33, Action::CheckCall])
         } else {
             pick(m, &[Action::CheckCall])
@@ -121,6 +339,9 @@ pub fn baseline_opponents() -> Vec<(&'static str, Box<dyn Policy>)> {
         ("CallStation", Box::new(CallStation)),
         ("Maniac", Box::new(Maniac)),
         ("TAG", Box::new(TightAggressive)),
+        ("LagShark", Box::new(LagShark)),
+        ("NashPush", Box::new(NashPushBot)),
+        ("IcmSniper", Box::new(IcmSniper)),
     ]
 }
 
@@ -214,7 +435,7 @@ fn run_match(hero: &dyn Policy, opp: &dyn Policy, hands: usize, stack_bb: u32) -
 }
 
 /// Chạy 1 ván trên bàn HỖN HỢP: Hero thi đấu cùng các đối thủ đa dạng:
-/// 1 TAG, 1 Maniac, 2 CallStation, 1 Random (Mô phỏng chân thực bàn thi đấu tournament)
+/// 1 IcmSniper, 1 TAG, 1 LagShark, 1 NashPushBot, 1 CallStation, 1 Maniac, 1 Random (Mô phỏng chân thực bàn thi đấu tournament)
 fn play_mixed_hand<R: Rng>(
     hero: &dyn Policy,
     stack_bb: u32,
@@ -232,13 +453,13 @@ fn play_mixed_hand<R: Rng>(
     env.reset_hand(rng, button);
 
     let opponents: [Box<dyn Policy>; 7] = [
-        Box::new(TightAggressive),
-        Box::new(CallStation),
-        Box::new(Maniac),
-        Box::new(CallStation),
-        Box::new(UniformRandomPolicy),
-        Box::new(TightAggressive),
-        Box::new(UniformRandomPolicy),
+        Box::new(IcmSniper),           // 1 Cao thủ SNG thực thụ
+        Box::new(TightAggressive),     // 1 Người chơi chặt (TAG)
+        Box::new(LagShark),            // 1 Cá mập đánh biến ảo (LAG)
+        Box::new(NashPushBot),         // 1 Chuyên gia Push/Fold
+        Box::new(CallStation),         // 1 Gà thích theo cược
+        Box::new(Maniac),              // 1 Kẻ điên thích All-in
+        Box::new(UniformRandomPolicy), // 1 Người chơi ngẫu nhiên
     ];
 
     let mut guard = 0;
@@ -363,6 +584,16 @@ pub fn score(results: &[BenchResult]) -> f64 {
                 // TAG là thước đo độ hở sườn (Exploitability)
                 tag_score += r.bb_per_100.clamp(-300.0, 100.0);
             }
+            "IcmSniper" => {
+                // Trùm cuối Heuristic: thước đo tiệm cận GTO cao cấp nhất
+                total_score += r.bb_per_100.clamp(-200.0, 150.0) * 1.5;
+            }
+            "LagShark" => {
+                total_score += r.bb_per_100.clamp(-200.0, 150.0) * 1.2;
+            }
+            "NashPush" => {
+                total_score += r.bb_per_100.clamp(-200.0, 150.0) * 1.0;
+            }
             "CallStation" => {
                 // Farm gà chỉ lấy tối đa 150 điểm để không làm méo mó thước đo
                 total_score += r.bb_per_100.clamp(-100.0, 150.0) * 0.5;
@@ -471,5 +702,35 @@ mod tests {
             "AlwaysFold score out of expected range: {:.2}",
             res.bb_per_100
         );
+    }
+
+    #[test]
+    fn test_new_heuristic_bots_smoke() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut env = Environment::new(8, &[2000; 8], 100, 50, 0);
+        env.reset_hand(&mut rng, 0);
+        let cur = env.state.current_player_idx;
+        let mask = env.get_action_mask();
+        let feats = env.state.encode_features(cur);
+
+        let lag_action = LagShark.select_action(&feats, &mask);
+        assert!(mask.is_valid(lag_action));
+        let nash_action = NashPushBot.select_action(&feats, &mask);
+        assert!(mask.is_valid(nash_action));
+        let icm_action = IcmSniper.select_action(&feats, &mask);
+        assert!(mask.is_valid(icm_action));
+
+        let lag_probs = LagShark.get_action_probs(&feats, &mask);
+        assert_eq!(lag_probs[lag_action.to_index()], 1.0);
+        let nash_probs = NashPushBot.get_action_probs(&feats, &mask);
+        assert_eq!(nash_probs[nash_action.to_index()], 1.0);
+        let icm_probs = IcmSniper.get_action_probs(&feats, &mask);
+        assert_eq!(icm_probs[icm_action.to_index()], 1.0);
+    }
+
+    #[test]
+    fn test_arena_heuristic_team_smoke() {
+        let res = evaluate_against_heuristic_team(&TightAggressive, 100, 35);
+        assert_eq!(res.hands, 100);
     }
 }

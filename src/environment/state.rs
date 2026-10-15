@@ -176,15 +176,50 @@ impl GameState {
             0.0
         };
 
+        // Tìm người chơi vừa thực hiện hành động Bet/Raise cuối cùng (Last Aggressor)
+        // và đếm xem người đó đã chủ động bet/raise bao nhiêu vòng (Streets) trong ván này.
+        let last_aggressor = self
+            .action_history
+            .iter()
+            .rev()
+            .find(|r| {
+                matches!(
+                    r.action,
+                    Action::BetPot33 | Action::BetPot66 | Action::BetPot100 | Action::AllIn
+                )
+            })
+            .map(|r| r.player_idx);
+
+        let aggressor_street_barrels = if let Some(agg_idx) = last_aggressor {
+            if agg_idx != player_idx {
+                let mut streets_mask = 0u8;
+                for r in &self.action_history {
+                    if r.player_idx == agg_idx
+                        && matches!(
+                            r.action,
+                            Action::BetPot33 | Action::BetPot66 | Action::BetPot100 | Action::AllIn
+                        )
+                    {
+                        streets_mask |= 1 << (r.street as u8);
+                    }
+                }
+                (streets_mask.count_ones() as f32 / 4.0).min(1.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
         [
-            eq,
-            (eq - pot_odds).clamp(-1.0, 1.0),
-            (eq * in_hand as f32 / 4.0).min(1.0),
-            d[0],
-            d[1],
-            d[2],
-            d[3],
-            d[4],
+            eq,                                 // f[168]: Equity thô khách quan (0..1)
+            (eq - pot_odds).clamp(-1.0, 1.0),   // f[169]: Chênh lệch Equity so với Pot Odds
+            aggressor_street_barrels,           // f[170]: Số vòng cược mà Last Aggressor đã barrel (0.25 = 1 vòng, 0.5 = 2 vòng, 0.75 = 3 vòng, 1.0 = 4 vòng)
+            d[0],                               // f[171]: Flush draw
+            d[1],                               // f[172]: Straight draw
+            d[2],                               // f[173]: Paired board
+            d[3],                               // f[174]: Max suit on board / 5
+            d[4],                               // f[175]: Board high card / 12
         ]
     }
 
@@ -289,11 +324,29 @@ impl GameState {
 
         // 5. Pot, to_call, stack của mình, pot odds (4)
         let to_call = self.current_highest_bet.saturating_sub(me.current_bet);
-        f.push(self.pot as f32 / (bb * 100.0));
-        f.push(to_call as f32 / (bb * 20.0));
-        f.push(me.stack as f32 / (bb * 100.0));
+        f.push((self.pot as f32 / (bb * 50.0)).min(2.0));
+        f.push((to_call as f32 / (bb * 20.0)).min(2.0));
+        f.push((me.stack as f32 / (bb * 50.0)).min(2.0));
         let denom = (self.pot + to_call) as f32;
         f.push(if denom > 0.0 { to_call as f32 / denom } else { 0.0 });
+
+        // Tiền xử lý nhanh lịch sử hành động của từng ghế trong ván bài (O(N) trên action_history)
+        let mut seat_sized_bets = [0u8; MAX_PLAYERS];
+        let mut seat_streets_aggr_mask = [0u8; MAX_PLAYERS];
+        for r in &self.action_history {
+            if r.player_idx < MAX_PLAYERS {
+                match r.action {
+                    Action::BetPot33 | Action::BetPot66 | Action::BetPot100 => {
+                        seat_sized_bets[r.player_idx] = seat_sized_bets[r.player_idx].saturating_add(1);
+                        seat_streets_aggr_mask[r.player_idx] |= 1 << (r.street as u8);
+                    }
+                    Action::AllIn => {
+                        seat_streets_aggr_mask[r.player_idx] |= 1 << (r.street as u8);
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         // 6. 7 đối thủ theo thứ tự xoay tròn (7 * 4 = 28) -> index 131..158
         let mut opp_count = 0;
@@ -302,11 +355,29 @@ impl GameState {
             let seat = (player_idx + step) % self.num_players;
             let o = &self.players[seat];
             if o.stack > 0 || o.is_all_in {
-                f.push((o.stack as f32 / (bb * 100.0)).min(2.0));
-                let opp_pressure = o.current_bet.max(o.total_contributed / 2) as f32 / (bb * 20.0);
-                f.push(opp_pressure.min(2.0));
-                f.push(if o.is_in_hand() { 1.0 } else { 0.0 });
-                f.push(if o.is_all_in { 1.0 } else { 0.0 });
+                // [0]: Stack còn lại
+                f.push((o.stack as f32 / (bb * 50.0)).min(2.0));
+                // [1]: Tổng chip đối thủ đã bỏ vào pot từ đầu ván (không bị reset về 0 khi sang vòng mới)
+                f.push((o.total_contributed as f32 / (bb * 25.0)).min(2.0));
+                // [2]: Trạng thái trong ván + Số vòng cược đã chủ động tấn công:
+                //      0.0 = đã Fold; 0.2 = chỉ Check/Call (CallStation); 0.4..1.0 = Chủ động Bet/Raise qua 1..4 vòng (TAG/Aggressor)
+                let active_aggr = if o.is_in_hand() {
+                    let streets_aggr = seat_streets_aggr_mask[seat].count_ones() as f32;
+                    (0.2 + 0.2 * streets_aggr).min(1.0)
+                } else {
+                    0.0
+                };
+                f.push(active_aggr);
+                // [3]: Cờ All-In (1.0) HOẶC Kích cỡ bet hiện tại so với Pot (0.0 .. 0.9)
+                //      Giúp phân biệt rõ Maniac Shove (1.0) vs TAG Bet 33%/66% (0.25..0.50)
+                let bet_profile = if o.is_all_in {
+                    1.0
+                } else if o.current_bet > 0 && self.pot > 0 {
+                    (o.current_bet as f32 / self.pot as f32).min(0.90)
+                } else {
+                    0.0
+                };
+                f.push(bet_profile);
                 opp_count += 1;
             }
             step += 1;
@@ -318,16 +389,11 @@ impl GameState {
         }
 
         // 7. Tóm tắt lịch sử (2) -> index 159..160
-        let total_raises = self
-            .action_history
-            .iter()
-            .filter(|r| {
-                matches!(
-                    r.action,
-                    Action::BetPot33 | Action::BetPot66 | Action::BetPot100 | Action::AllIn
-                )
-            })
-            .count();
+        // Chiều 159: Tổng số cú Bet/Raise theo size chuẩn (33%/66%/100%) của các đối thủ trong cả ván
+        let total_opp_sized_bets: u8 = (0..self.num_players)
+            .filter(|&i| i != player_idx)
+            .map(|i| seat_sized_bets[i])
+            .sum();
         let street_raises = self
             .action_history
             .iter()
@@ -339,25 +405,27 @@ impl GameState {
                     )
             })
             .count();
-        let agg_score = (street_raises as f32 * 0.35 + total_raises as f32 * 0.15).min(1.0);
-        f.push(agg_score);
+        // Kết hợp cả số lần raise ở vòng hiện tại và tổng số lần sized-bet cả ván
+        f.push(((street_raises as f32 * 0.20) + (total_opp_sized_bets as f32 * 0.20)).min(1.0));
+
         let in_hand = self.players.iter().filter(|p| p.is_in_hand()).count();
         f.push(in_hand as f32 / MAX_PLAYERS as f32); // index 160: F_IN_HAND
 
-        // 8. Ngữ cảnh push/fold & sức mạnh bài (7)
+        // 8. Ngữ cảnh push/fold & sức mạnh bài (7) -> index 161..167
         let eff_bb = self.effective_stack_bb(player_idx);
-        f.push((eff_bb / 100.0).min(1.0));
-        f.push(if eff_bb < 12.0 { 1.0 } else { 0.0 });
-        f.push(if to_call > 0 { 1.0 } else { 0.0 });
+        f.push((eff_bb / 50.0).min(1.5)); // index 161
+        f.push(if eff_bb < 12.0 { 1.0 } else { 0.0 }); // index 162: F_PUSHFOLD
+        f.push(if to_call > 0 { 1.0 } else { 0.0 }); // index 163: F_FACING_BET
         let my_stack = me.stack as f32;
-        f.push(if my_stack > 0.0 { (to_call as f32 / my_stack).min(1.0) } else { 1.0 });
-        let pot_after = (self.pot + to_call) as f32;
-        f.push(if pot_after > 0.0 { (my_stack / pot_after / 20.0).min(1.0) } else { 0.0 });
+        f.push(if my_stack > 0.0 { (to_call as f32 / my_stack).min(1.0) } else { 1.0 }); // index 164
+        // index 165: Tỷ lệ Pot-Commitment của bản thân (đã bỏ bao nhiêu % tổng tài sản vào pot này)
+        let my_total_wealth = (me.stack + me.total_contributed).max(1) as f32;
+        f.push((me.total_contributed as f32 / my_total_wealth).clamp(0.0, 1.0));
         let (cat, strength) = self.hand_strength(player_idx);
-        f.push(cat);
-        f.push(strength);
+        f.push(cat);      // index 166
+        f.push(strength); // index 167: F_HAND_STRENGTH
 
-        // 9. Equity & draw & board texture (8)
+        // 9. Equity & draw & board texture (8) -> index 168..175
         f.extend_from_slice(&self.equity_features(player_idx, to_call));
 
         debug_assert_eq!(f.len(), FEATURE_DIM, "encode_features length mismatch");

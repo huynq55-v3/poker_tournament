@@ -14,7 +14,7 @@ pub const MAX_OPP: usize = 7;
 pub const PREFLOP_TABLE_PATH: &str = "preflop_equity.json";
 const PREFLOP_BUILD_SAMPLES: usize = 8_000;
 /// Số mẫu Monte Carlo postflop. 64 ~ sai số ±6%; tăng lên 128+ nếu muốn chính xác hơn (chậm hơn).
-pub const POSTFLOP_SAMPLES: usize = 64;
+pub const POSTFLOP_SAMPLES: usize = 32;
 
 // ---------------------------------------------------------------- RNG nhỏ, không phụ thuộc crate
 

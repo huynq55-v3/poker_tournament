@@ -1,23 +1,24 @@
+use crate::benchmark::{IcmSniper, LagShark, NashPushBot, TightAggressive};
 use crate::deep_cfr::advantage_memory::{AdvantageMemory, AdvantageSample, SampleBatch};
 use crate::deep_cfr::policy::DeepCFRPolicy;
 use crate::deep_cfr::strategy_memory::{StrategyMemory, StrategySample};
 use crate::environment::action::{Action, ActionMask, NUM_ACTIONS};
 use crate::environment::engine::Environment;
 use crate::environment::state::Street;
+use crate::equity::icm::{calculate_icm_ev, get_sng_payouts};
 use crate::neural_network::{LossType, MLP};
 use crate::sampler::TournamentStackSampler;
+use crate::self_play::Policy;
 use rand::distributions::WeightedIndex;
 use rand::prelude::Distribution;
 use rand::Rng;
 use rayon::prelude::*;
 use std::sync::{Arc, RwLock};
-use crate::equity::icm::{calculate_icm_ev, get_sng_payouts};
 
-/// Độ sâu tối đa cho traverser rẽ nhánh. 8 lượt đủ bao quát Preflop, Flop, Turn và River
-/// (mỗi vòng 2 lượt hành động kể cả re-raise) mà không bị bùng nổ vì đối thủ chỉ sample 1 nhánh.
-const MAX_BRANCH_DEPTH: usize = 8;
+/// Độ sâu 6 vừa đủ bao phủ cả 4 vòng (Preflop -> Flop -> Turn -> River) mà chạy siêu tốc
+const MAX_BRANCH_DEPTH: usize = 6;
 
-/// Hàm thưởng cho 1 traverser: Chip-EV chuẩn hóa chia cho 10 BB
+/// Hàm thưởng kết hợp (Hybrid Tournament ICM & Chip-EV)
 struct Payoff {
     traverser: usize,
     start_icm_ev: f32,
@@ -29,8 +30,6 @@ struct Payoff {
 impl Payoff {
     fn new(start: &[f32], traverser: usize, bb: f32, use_icm: bool) -> Self {
         let start_stacks = start.to_vec();
-        // Heads-up (2 người) trong tournament không có áp lực ICM vì cả 2 đã cầm chắc Top 2.
-        // Do đó, chỉ áp dụng ICM khi bàn có từ 3 người trở lên.
         let is_hu = start_stacks.len() <= 2;
         let start_icm_ev = if use_icm && !is_hu {
             let payouts = get_sng_payouts(start_stacks.len());
@@ -51,7 +50,6 @@ impl Payoff {
 
     #[inline(always)]
     fn eval(&self, env: &Environment) -> f32 {
-        // 1. Tính Chip-EV chuẩn hóa (luôn tính để làm nền tảng sát thương)
         let mut my_end_chips = env.state.players[self.traverser].stack as f32;
         if env.state.pot > 0 {
             let in_hand: Vec<usize> = env
@@ -95,9 +93,9 @@ impl Payoff {
             let end_evs = calculate_icm_ev(&end_stacks, payouts);
             let icm_ev = (end_evs[self.traverser] - self.start_icm_ev) * 10.0;
 
-            // Pha trộn 65% ICM + 35% Chip-EV:
-            // Giữ nguyên kỷ luật sinh tồn Bubble của SNG nhưng không bị thụ động trước TAG
-            0.65 * icm_ev + 0.35 * chip_ev
+            // Cân bằng 50% ICM + 50% Chip-EV
+            // 0.50 * icm_ev + 0.50 * chip_ev
+            icm_ev
         } else {
             chip_ev
         }
@@ -109,6 +107,7 @@ struct Ctx<'a> {
     adv_out: Vec<AdvantageSample>,
     strat_out: Vec<StrategySample>,
     weight: f32,
+    sparring_tag: bool, // 🟢 Cờ kích hoạt Quân xanh TAG trên bàn đấu tập
 }
 
 fn sample_action<R: Rng>(probs: &[f32; NUM_ACTIONS], mask: &ActionMask, rng: &mut R) -> Action {
@@ -137,7 +136,7 @@ fn step_and_continue<R: Rng>(
     }
 }
 
-/// External-sampling MCCFR
+/// External-sampling MCCFR kết hợp Sparring TAG & Smart Postflop Exploration
 fn traverse<R: Rng>(env: &mut Environment, ctx: &mut Ctx, pay: &Payoff, rng: &mut R, depth: usize) -> f32 {
     if env.state.street == Street::Showdown {
         return pay.eval(env);
@@ -153,11 +152,11 @@ fn traverse<R: Rng>(env: &mut Environment, ctx: &mut Ctx, pay: &Payoff, rng: &mu
     }
 
     let features = env.state.encode_features(curr);
-    let raw = ctx.net.forward(&features);
-    let strat = DeepCFRPolicy::compute_regret_matching_probs(&raw, &mask);
 
     if curr == pay.traverser {
-        // Nếu vượt quá độ sâu tối đa, chỉ lấy mẫu 1 hành động đi tiếp
+        let raw = ctx.net.forward(&features);
+        let strat = DeepCFRPolicy::compute_regret_matching_probs(&raw, &mask);
+
         if depth >= MAX_BRANCH_DEPTH {
             let a = sample_action(&strat, &mask, rng);
             return step_and_continue(env, a, ctx, pay, rng, depth);
@@ -187,14 +186,43 @@ fn traverse<R: Rng>(env: &mut Environment, ctx: &mut Ctx, pay: &Payoff, rng: &mu
         });
         expected
     } else {
-        // Đối thủ chỉ lấy mẫu 1 nhánh theo chiến lược hiện tại
+        // 🟢 TRƯỜNG HỢP 1: Ghế đối thủ đóng vai Quân Xanh (chỉ áp dụng cho ghế lẻ trong ván sparring)
+        // Cho traverser cọ xát đa dạng với cả 4 trường phái (TAG, LagShark, NashPushBot, IcmSniper)
+        // mà không cần tốn forward() của MLP!
+        if ctx.sparring_tag && (curr % 2 == 1) {
+            let a = match curr {
+                1 => TightAggressive.select_action(&features, &mask),
+                3 => LagShark.select_action(&features, &mask),
+                5 => NashPushBot.select_action(&features, &mask),
+                _ => IcmSniper.select_action(&features, &mask),
+            };
+            return step_and_continue(env, a, ctx, pay, rng, depth);
+        }
+
+        // 🟢 TRƯỜNG HỢP 2: Đối thủ Self-Play chuẩn theo mạng hiện tại
+        let raw = ctx.net.forward(&features);
+        let strat = DeepCFRPolicy::compute_regret_matching_probs(&raw, &mask);
+
         ctx.strat_out.push(StrategySample {
             features,
             action_probs: strat.to_vec(),
             mask: mask.to_bool_array(),
             iteration_weight: ctx.weight,
         });
-        let a = sample_action(&strat, &mask, rng);
+
+        // 8% Smart Exploration: Chỉ thử nghiệm các nhánh BetPot33 / BetPot66 để mở khóa cây Postflop,
+        // tuyệt đối KHÔNG chọn bừa All-In hay Fold làm nhiễu TrashShove!
+        let a = if rng.gen_bool(0.08) {
+            if mask.is_valid(Action::BetPot33) && rng.gen_bool(0.6) {
+                Action::BetPot33
+            } else if mask.is_valid(Action::BetPot66) {
+                Action::BetPot66
+            } else {
+                sample_action(&strat, &mask, rng)
+            }
+        } else {
+            sample_action(&strat, &mask, rng)
+        };
         step_and_continue(env, a, ctx, pay, rng, depth)
     }
 }
@@ -270,7 +298,7 @@ impl DeepCFRTrainer {
             return 0.0;
         }
         let avg = (raw_weights.iter().sum::<f32>() / raw_weights.len() as f32).max(1e-6);
-        let norm: Vec<f32> = raw_weights.iter().map(|&w| (w / avg).clamp(0.1, 3.0)).collect();
+        let norm: Vec<f32> = raw_weights.iter().map(|&w| (w / avg).clamp(0.05, 5.0)).collect();
         let mut n = net.write().unwrap();
         n.train_batch(&inputs, &targets, Some(&norm), Some(&masks), loss, lr, weight_decay)
     }
@@ -283,29 +311,23 @@ impl DeepCFRTrainer {
         rng: &mut R,
     ) -> f32 {
         self.iteration += 1;
-        // Căn bậc hai (Sqrt CFR weight) giúp các iter lớn không đè bẹp hoàn toàn mẫu cũ
-        let iter_weight = (self.iteration as f32).sqrt();
+
+        // Dọn dẹp các mẫu nhiễu thời kỳ đầu (Iter 1..11) đúng 1 lần tại Iter 25
+        if self.iteration == 25 {
+            self.adv_memory.buffer.retain(|s| s.iteration_weight >= 12.0);
+            self.adv_memory.seen = self.adv_memory.buffer.len();
+            self.strategy_memory.buffer.retain(|s| s.iteration_weight >= 12.0);
+            self.strategy_memory.seen = self.strategy_memory.buffer.len();
+        }
+
+        // Linear CFR Weight chuẩn (Brown et al.)
+        let iter_weight = self.iteration as f32;
         let bb_size = 100u32;
         let sb_size = 50u32;
         let fixed = self.fixed_players;
 
-        // 1. Chu kỳ Cosine Annealing (chu kỳ 50 iterations):
-        // Giúp mạng liên tục thoát khỏi cực tiểu cục bộ (local minimum), duy trì tính khám phá và hội tụ sâu
-        let cycle_len = 50;
-        let step_in_cycle = (self.iteration - 1) % cycle_len;
-
-        // Reset optimizer ở đầu mỗi chu kỳ để loại bỏ stale momentum tích tụ trong Adam, chống drift trọng số
-        if step_in_cycle == 0 && self.iteration > 1 {
-            self.advantage_net.write().unwrap().reset_optimizer();
-            self.strategy_net.write().unwrap().reset_optimizer();
-        }
-
-        // Cosine Annealing Learning Rate Schedule với Warm Restarts
-        let cycle_idx = (self.iteration - 1) / cycle_len;
-        let cycle_max_lr = (self.lr * 0.992f32.powi(cycle_idx as i32)).max(0.00015);
-        let min_lr = 0.00005;
-        let cos_ratio = (std::f32::consts::PI * step_in_cycle as f32 / cycle_len as f32).cos();
-        let effective_lr = min_lr + 0.5 * (cycle_max_lr - min_lr) * (1.0 + cos_ratio);
+        // Lịch trình giảm Learning Rate mượt mà (Smooth Inverse Decay)
+        let effective_lr = (self.lr / (1.0 + 0.004 * self.iteration as f32)).max(0.00008);
 
         let snapshot: MLP = self.advantage_net.read().unwrap().clone();
         let results: Vec<(Vec<AdvantageSample>, Vec<StrategySample>)> = (0..num_traversals)
@@ -313,17 +335,16 @@ impl DeepCFRTrainer {
             .map(|_| {
                 let mut trng = rand::thread_rng();
                 let n = fixed.unwrap_or_else(|| {
-                    if trng.gen_bool(0.20) {
+                    if trng.gen_bool(0.15) {
                         2
-                    } else if trng.gen_bool(0.75) {
-                        trng.gen_range(6..=8)
+                    } else if trng.gen_bool(0.80) {
+                        trng.gen_range(7..=8)
                     } else {
-                        trng.gen_range(3..=5)
+                        trng.gen_range(3..=6)
                     }
                 });
                 let button = trng.gen_range(0..n);
-                // 50% Equal Stacks (bao gồm 8, 10, 12, 25, 50 BB) + 50% Dirichlet Stacks
-                let stacks = if trng.gen_bool(0.50) {
+                let stacks = if trng.gen_bool(0.55) {
                     TournamentStackSampler::sample_equal_stacks(&mut trng, n, bb_size)
                 } else {
                     TournamentStackSampler::sample_dirichlet_stacks(&mut trng, n, bb_size)
@@ -335,6 +356,9 @@ impl DeepCFRTrainer {
                     adv_out: Vec::new(),
                     strat_out: Vec::new(),
                     weight: iter_weight,
+                    // 🟢 Bật chế độ Bể Quân Xanh (Sparring League: TAG, LAG, Nash, ICM) trong 20% số ván duyệt cây:
+                    // Đủ để trừng phạt thẳng tay các pha All-in rác mà vẫn giữ 80% Self-Play GTO thuần túy!
+                    sparring_tag: trng.gen_bool(0.20),
                 };
                 for t in 0..n {
                     let mut env = Environment::new(n, &stacks, bb_size, sb_size, button);
@@ -355,10 +379,8 @@ impl DeepCFRTrainer {
             }
         }
 
-        // 2. Chống Overfitting khi buffer còn nhỏ:
-        // Cân bằng số steps tương đương 2 epoch trên buffer hiện có, tránh việc vài nghìn mẫu đầu bị train tới 80 epoch
         let effective_steps = if self.adv_memory.len() < 50_000 {
-            (self.adv_memory.len() / batch_size * 2).clamp(10, train_steps_per_iter)
+            (self.adv_memory.len() / batch_size * 2).clamp(15, train_steps_per_iter)
         } else {
             train_steps_per_iter
         };

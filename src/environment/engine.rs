@@ -202,7 +202,6 @@ impl Environment {
             for &(act, frac) in RAISE_ACTIONS.iter() {
                 let target = self.raise_target(p_idx, frac);
                 let needed = target.saturating_sub(player.current_bet);
-                // ✅ FIX: bỏ action trùng mức bet (33%/66%/100% trùng nhau khi pot nhỏ)
                 if needed < player.stack && target >= min_raise_total && target > last_target {
                     mask.enable(act);
                     last_target = target;

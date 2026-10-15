@@ -1,3 +1,4 @@
+use crate::benchmark::{IcmSniper, LagShark, NashPushBot, TightAggressive};
 use crate::environment::action::Action;
 use crate::environment::engine::Environment;
 use crate::environment::state::Street;
@@ -7,7 +8,8 @@ use rayon::prelude::*;
 
 const F_STREET_PREFLOP: usize = 123;
 const F_HAND_STRENGTH: usize = 167;
-const TRASH_CHEN: f32 = 0.30;
+/// Bài rác preflop thực sự (72o, 83o, 93o, J2o...): điểm Chen chuẩn hóa dưới 0.22
+const TRASH_CHEN: f32 = 0.22;
 const ARENA_PLAYERS: usize = 8;
 
 #[derive(Default, Clone)]
@@ -43,9 +45,9 @@ pub struct ArenaMatchResult {
     pub is_winner: bool,
 }
 
-fn play_arena_hand<R: Rng>(
+fn play_arena_team_hand<R: Rng>(
     challenger: &dyn Policy,
-    champion: &dyn Policy,
+    opponents: &[&dyn Policy],
     stack_bb: u32,
     acc: &mut ArenaAcc,
     rng: &mut R,
@@ -85,7 +87,8 @@ fn play_arena_hand<R: Rng>(
             }
             a
         } else {
-            champion.select_action(&feats, &mask)
+            let opp_idx = (cur / 2) % opponents.len();
+            opponents[opp_idx].select_action(&feats, &mask)
         };
 
         match env.step(action) {
@@ -107,23 +110,7 @@ fn play_arena_hand<R: Rng>(
     acc.sum_sq_diff += diff_bb * diff_bb;
 }
 
-pub fn evaluate_against_champion(
-    challenger: &dyn Policy,
-    champion: &dyn Policy,
-    total_hands: usize,
-    stack_bb: u32,
-) -> ArenaMatchResult {
-    let acc = (0..total_hands)
-        .into_par_iter()
-        .fold(ArenaAcc::default, |mut acc, _| {
-            let mut rng = thread_rng();
-            // Đánh xen kẽ cả mức stack_bb (35BB) và Push/Fold (12BB) trong Arena để kiểm duyệt toàn diện
-            let actual_depth = if rng.gen_bool(0.25) { 12 } else { stack_bb };
-            play_arena_hand(challenger, champion, actual_depth, &mut acc, &mut rng);
-            acc
-        })
-        .reduce(ArenaAcc::default, |a, b| a.merge(&b));
-
+fn acc_to_result(acc: &ArenaAcc) -> ArenaMatchResult {
     let n = acc.hands.max(1) as f64;
     let mean = acc.sum_diff / n;
     let var = (acc.sum_sq_diff / n - mean * mean).max(0.0);
@@ -149,4 +136,80 @@ pub fn evaluate_against_champion(
         challenger_trash_shove_pct: trash_shove_pct,
         is_winner,
     }
+}
+
+/// Đấu trường 8-max: Challenger (ghế 0, 2, 4, 6) đối đầu Champion (ghế 1, 3, 5, 7)
+pub fn evaluate_against_champion(
+    challenger: &dyn Policy,
+    champion: &dyn Policy,
+    total_hands: usize,
+    stack_bb: u32,
+) -> ArenaMatchResult {
+    let opps = [champion];
+    let acc = (0..total_hands)
+        .into_par_iter()
+        .fold(ArenaAcc::default, |mut acc, _| {
+            let mut rng = thread_rng();
+            // Đánh xen kẽ cả mức stack_bb (35BB) và Push/Fold (12BB) trong Arena để kiểm duyệt toàn diện
+            let actual_depth = if rng.gen_bool(0.25) { 12 } else { stack_bb };
+            play_arena_team_hand(challenger, &opps, actual_depth, &mut acc, &mut rng);
+            acc
+        })
+        .reduce(ArenaAcc::default, |a, b| a.merge(&b));
+
+    acc_to_result(&acc)
+}
+
+/// Đấu trường 8-max đối đầu Biệt đội Heuristic All-Star:
+/// Ghế 0, 2, 4, 6: Challenger
+/// Ghế 1: TightAggressive | Ghế 3: LagShark | Ghế 5: NashPushBot | Ghế 7: IcmSniper
+pub fn evaluate_against_heuristic_team(
+    challenger: &dyn Policy,
+    total_hands: usize,
+    stack_bb: u32,
+) -> ArenaMatchResult {
+    let tag = TightAggressive;
+    let lag = LagShark;
+    let nash = NashPushBot;
+    let icm = IcmSniper;
+    let opps: [&dyn Policy; 4] = [&tag, &lag, &nash, &icm];
+
+    let acc = (0..total_hands)
+        .into_par_iter()
+        .fold(ArenaAcc::default, |mut acc, _| {
+            let mut rng = thread_rng();
+            let actual_depth = if rng.gen_bool(0.25) { 12 } else { stack_bb };
+            play_arena_team_hand(challenger, &opps, actual_depth, &mut acc, &mut rng);
+            acc
+        })
+        .reduce(ArenaAcc::default, |a, b| a.merge(&b));
+
+    acc_to_result(&acc)
+}
+
+/// Đánh giá toàn diện trên Đấu trường Arena 8-max với từng bot Heuristic và Biệt đội hỗn hợp
+pub fn evaluate_arena_suite(
+    challenger: &dyn Policy,
+    hands_per_match: usize,
+    stack_bb: u32,
+) -> Vec<(&'static str, ArenaMatchResult)> {
+    vec![
+        ("Arena_TAG", evaluate_against_champion(challenger, &TightAggressive, hands_per_match, stack_bb)),
+        ("Arena_LagShark", evaluate_against_champion(challenger, &LagShark, hands_per_match, stack_bb)),
+        ("Arena_NashPush", evaluate_against_champion(challenger, &NashPushBot, hands_per_match, stack_bb)),
+        ("Arena_IcmSniper", evaluate_against_champion(challenger, &IcmSniper, hands_per_match, stack_bb)),
+        ("Arena_HeuristicTeam", evaluate_against_heuristic_team(challenger, hands_per_match, stack_bb)),
+    ]
+}
+
+pub fn print_arena_results(label: &str, results: &[(&str, ArenaMatchResult)]) {
+    println!("   ┌─ Arena Benchmark: {}", label);
+    println!("   │ {:<20} {:>8} {:>10} {:>8} {:>12} {:>8}",
+        "Opponent", "Hands", "bb/100", "±95%", "TrashShove%", "Status");
+    for (name, r) in results {
+        let status = if r.is_winner { "WIN 👑" } else { "DEF 🛡️" };
+        println!("   │ {:<20} {:>8} {:>+10.1} {:>8.1} {:>11.1}% {:>8}",
+            name, r.hands, r.challenger_bb_per_100, r.ci95, r.challenger_trash_shove_pct, status);
+    }
+    println!("   └─");
 }
