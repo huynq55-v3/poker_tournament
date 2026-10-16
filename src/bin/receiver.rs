@@ -32,6 +32,15 @@ pub struct InPageAction {
 }
 
 #[derive(Clone, Debug)]
+struct HandActionRecord {
+    pub player_id: String,
+    pub seat_num: usize,
+    pub street: Street,
+    pub action: Action,
+    pub amount: u32,
+}
+
+#[derive(Clone, Debug)]
 struct PlayerTracker {
     id: String,
     name: String,
@@ -72,7 +81,7 @@ struct HandState {
     sb_size: u32,
     dealer_id: Option<String>,
     dealer_seat: Option<usize>,
-    action_history: Vec<ActionRecord>,
+    action_history: Vec<HandActionRecord>,
     players: HashMap<String, PlayerTracker>,
     seats_order: Vec<String>,
     has_evaluated_this_decision: bool,
@@ -599,12 +608,53 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
     }
 
     if let Some(arr) = payload.get("seats").and_then(|v| v.as_array()) {
-        let mut v: Vec<(u64, String)> = arr.iter().filter_map(|s| {
-            let a = s.as_array()?;
-            Some((a.first()?.as_u64()?, a.get(1)?.as_str()?.to_string()))
-        }).collect();
-        v.sort();
-        state.seats_order = v.into_iter().map(|(_, id)| id).collect();
+        let mut v: Vec<(usize, String)> = Vec::new();
+        for s in arr {
+            let (seat_num, pid_opt) = if let Some(a) = s.as_array() {
+                let seat = a.first().and_then(|v| v.as_u64()).map(|n| n as usize);
+                let pid = a.get(1).and_then(|v| v.as_str())
+                    .or_else(|| a.get(1).and_then(|v| v.get("id")).and_then(|v| v.as_str()))
+                    .map(|s| s.to_string());
+                (seat, pid)
+            } else if let Some(obj) = s.as_object() {
+                let seat = obj.get("seat").or_else(|| obj.get("seatNum")).and_then(|v| v.as_u64()).map(|n| n as usize);
+                let pid = obj.get("id").or_else(|| obj.get("player_id")).or_else(|| obj.get("playerId")).and_then(|v| v.as_str()).map(|s| s.to_string());
+                (seat, pid)
+            } else {
+                (None, None)
+            };
+
+            if let (Some(seat), Some(pid)) = (seat_num, pid_opt) {
+                let entry = state.players.entry(pid.clone()).or_insert_with(|| PlayerTracker {
+                    id: pid.clone(),
+                    ..Default::default()
+                });
+                entry.seat_num = seat;
+                v.push((seat, pid));
+            }
+        }
+        if !v.is_empty() {
+            v.sort_by_key(|(s, _)| *s);
+            state.seats_order = v.into_iter().map(|(_, id)| id).collect();
+        }
+    } else if let Some(obj) = payload.get("seats").and_then(|v| v.as_object()) {
+        let mut v: Vec<(usize, String)> = Vec::new();
+        for (k, val) in obj {
+            if let Ok(seat) = k.parse::<usize>() {
+                if let Some(pid) = val.as_str().or_else(|| val.get("id").and_then(|v| v.as_str())) {
+                    let entry = state.players.entry(pid.to_string()).or_insert_with(|| PlayerTracker {
+                        id: pid.to_string(),
+                        ..Default::default()
+                    });
+                    entry.seat_num = seat;
+                    v.push((seat, pid.to_string()));
+                }
+            }
+        }
+        if !v.is_empty() {
+            v.sort_by_key(|(s, _)| *s);
+            state.seats_order = v.into_iter().map(|(_, id)| id).collect();
+        }
     }
 
     if let Some(bb) = payload.get("bigBlind").and_then(|v| v.as_u64()) { state.bb_size = bb as u32; }
@@ -634,12 +684,32 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
             });
             if let Some(s) = pval.get("stack").and_then(|v| v.as_u64()) { entry.stack = s as u32; }
             if let Some(n) = pval.get("name").and_then(|v| v.as_str()) { entry.name = n.to_string(); }
-            if let Some(seat) = pval.get("seat").and_then(|v| v.as_u64()) { entry.seat_num = seat as usize; }
+            if let Some(seat) = pval.get("seat").or_else(|| pval.get("seatNum")).and_then(|v| v.as_u64()) {
+                entry.seat_num = seat as usize;
+            }
+        }
+    }
+
+    // Đảm bảo seat_num được đồng bộ từ seats_order nếu entry.seat_num vẫn là 99
+    for (idx, pid) in state.seats_order.iter().enumerate() {
+        if let Some(p) = state.players.get_mut(pid) {
+            if p.seat_num == 99 {
+                p.seat_num = idx + 1;
+            }
         }
     }
 
     if let Some(did) = payload.get("dealerID").and_then(|v| v.as_str()) {
         state.dealer_id = Some(did.to_string());
+    }
+    if let Some(ds) = payload.get("dealerSeat").or_else(|| payload.get("dealer")).and_then(|v| v.as_u64()) {
+        state.dealer_seat = Some(ds as usize);
+    } else if let Some(ref did) = state.dealer_id {
+        if let Some(p) = state.players.get(did) {
+            if p.seat_num != 99 {
+                state.dealer_seat = Some(p.seat_num);
+            }
+        }
     }
 
     // 🟢 Đọc gói "pGS" (fold / allIn) TRƯỚC "tB" để biết chính xác entry.is_all_in!
@@ -677,8 +747,9 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
                         } else {
                             Action::BetPot75
                         };
-                        state.action_history.push(ActionRecord {
-                            player_idx: entry.seat_num,
+                        state.action_history.push(HandActionRecord {
+                            player_id: pid.clone(),
+                            seat_num: entry.seat_num,
                             street: state.street,
                             action: act_type,
                             amount: delta,
@@ -839,9 +910,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     env.state.button_idx = button_idx;
     env.state.players = env_players;
     env.state.action_history = state.action_history.iter().filter_map(|rec| {
-        let idx = active_seats.iter().position(|id| {
-            state.players.get(id).map(|p| p.seat_num) == Some(rec.player_idx)
-        })?;
+        let idx = active_seats.iter().position(|id| id == &rec.player_id)?;
         Some(ActionRecord {
             player_idx: idx,
             street: rec.street,
@@ -855,7 +924,6 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     let to_call = actual_highest_bet.saturating_sub(hero_bet);
     let max_total_bet = state.hero_mavtb.unwrap_or(hero_stack_behind + hero_bet);
 
-    // 🛡️ Kiểm tra xem trên bàn còn đối thủ nào có chip để tố hay không
     let has_opp_with_chips = state.players.iter().any(|(pid, p)| {
         pid != &state.hero_id && !p.is_folded && !p.is_all_in && p.stack > 0
     });
@@ -865,27 +933,12 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
 
     let mut mask = env.get_action_mask();
 
-    // 🛡️ Nếu không thể tố (đối thủ đã All-In hoặc không còn ai có chip), khóa sạch các action tố/All-In
+    // Chỉ hạn chế tố nếu trên bàn đối thủ đã All-In hết hoặc PokerNow UI giới hạn (mAVTB)
     if !can_raise {
         mask.0 &= !((1 << Action::BetSmall.to_index())
             | (1 << Action::BetPot33.to_index())
             | (1 << Action::BetPot75.to_index())
             | (1 << Action::AllIn.to_index()));
-    }
-
-    // 🛡️ BẢO VỆ CHỐNG MIN-BET (ANTI-MINBET / POT-ODDS SHIELD):
-    // CHỈ áp dụng ở Postflop (Flop/Turn/River) khi Pot đã to mà đối thủ bet thăm dò 1-2 BB (pot_odds < 12%)!
-    // Tuyệt đối KHÔNG áp dụng ở Preflop vì ở Preflop to_call <= 2 BB là bình thường và bot phải được quyền Fold bài rác (như Q7, 72)!
-    let pot_odds = if true_table_pot + to_call > 0 {
-        to_call as f32 / (true_table_pot + to_call) as f32
-    } else {
-        0.0
-    };
-
-    if state.street != Street::Preflop && to_call > 0 && (to_call <= state.bb_size * 2 || pot_odds < 0.12) {
-        println!("🛡️ [POT-ODDS SHIELD] Đối thủ Min-bet {} chip ở {:?} (Pot Odds: {:.1}%) -> Khóa FOLD, ép Call/Raise!", 
-            to_call, state.street, pot_odds * 100.0);
-        mask.0 &= !(1 << Action::Fold.to_index());
     }
 
     let features = env.state.encode_features(hero_seat);
@@ -924,6 +977,55 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     
     let call_status = if to_call == 0 { "(Đang check)" } else { "" };
     println!("💰 Tổng Pot thực tế: {} chip | Cần Call: {} chip {}", true_table_pot, to_call, call_status);
+    
+    // 📜 IN THÔNG TIN LỊCH SỬ HÀNH ĐỘNG (ACTION HISTORY) - CHỈ IN KHI ĐẾN LƯỢT HERO
+    if state.action_history.is_empty() {
+        println!("📜 [LỊCH SỬ CƯỢC]: Chưa có cú Bet/Raise nào (Chỉ có Post Blind hoặc Check)");
+    } else {
+        println!("📜 [LỊCH SỬ CƯỢC - ACTION HISTORY] ({} hành động):", state.action_history.len());
+        for (idx, rec) in state.action_history.iter().enumerate() {
+            let p_name = state.players.get(&rec.player_id)
+                .map(|p| p.name.as_str())
+                .unwrap_or("Unknown");
+            let is_hero = rec.player_id == state.hero_id;
+            let who = if is_hero { format!("{} (Hero)", p_name) } else { p_name.to_string() };
+            let seat = state.players.get(&rec.player_id).map(|p| p.seat_num).unwrap_or(rec.seat_num);
+            let act_desc = match rec.action {
+                Action::AllIn => format!("All-In (+{} chip)", rec.amount),
+                Action::Fold => "Fold".to_string(),
+                Action::CheckCall => {
+                    if rec.amount == 0 { "Check".to_string() } else { format!("Call (+{} chip)", rec.amount) }
+                }
+                _ => format!("Tố (+{} chip)", rec.amount),
+            };
+            println!("   {}. [{:?}] {:<12} (Ghế #{:<2}): {}", 
+                idx + 1, rec.street, who, seat, act_desc);
+        }
+    }
+
+    // In tổng chip đã đóng góp vào Pot của từng người chơi theo thứ tự ghế ngồi
+    let mut active_p_list: Vec<&PlayerTracker> = state.players.values().collect();
+    active_p_list.sort_by_key(|p| p.seat_num);
+    let mut contrib_str = Vec::new();
+    for p in active_p_list {
+        let total = p.total_contributed.max(p.current_bet);
+        if total > 0 {
+            let display_name = if !p.name.is_empty() && p.name != "Player" {
+                p.name.clone()
+            } else {
+                format!("Ghế #{}", p.seat_num)
+            };
+            let label = if p.id == state.hero_id {
+                format!("{} (Hero)", display_name)
+            } else {
+                display_name
+            };
+            contrib_str.push(format!("{}: {} chip", label, total));
+        }
+    }
+    if !contrib_str.is_empty() {
+        println!("💵 [TỔNG CHIP ĐÓNG GÓP]: {}", contrib_str.join(" | "));
+    }
     println!("------------------------------------------------------------");
 
     // LỌC VÀ CHUẨN HÓA XÁC SUẤT THEO GTO MIXED STRATEGY
@@ -1110,15 +1212,15 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
         let status = if is_valid { 
             "" 
         } else { 
-            let hero_stack_bb = hero_stack_behind as f32 / state.bb_size as f32;
-            if !can_raise && act != Action::Fold && act != Action::CheckCall {
-                " (Khóa do đối thủ All-In / không thể tố)"
-            } else if hero_stack_bb < 12.0 && act != Action::Fold && act != Action::CheckCall && act != Action::AllIn {
-                " (Khóa do Stack < 12BB - Push/Fold Mode)"
-            } else if act == Action::BetSmall || act == Action::BetPot75 {
-                " (Khóa do trùng size/hết chip)"
+            let eff_stack_bb = env.state.effective_stack_bb(hero_seat);
+            if act == Action::Fold && to_call == 0 {
+                " (Khóa: Check miễn phí)"
+            } else if eff_stack_bb < 12.0 && act != Action::Fold && act != Action::CheckCall && act != Action::AllIn {
+                " (Khóa do Effective Stack < 12BB - Push/Fold Mode)"
+            } else if act == Action::BetSmall {
+                " (Khóa: Trùng size với Bet 33%)"
             } else {
-                " (Bị khóa)"
+                " (Bị khóa do luật cược / không đủ chip)"
             }
         };
 
