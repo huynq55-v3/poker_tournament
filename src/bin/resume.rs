@@ -176,6 +176,10 @@ fn main() {
                 );
                 current_champion_net = trainer.advantage_net.read().unwrap().clone();
                 let _ = trainer.save_models(&best_path, &best_strat_path);
+                if out == "deep_cfr" {
+                    let _ = trainer.save_models("deep_cfr_model.json", "deep_cfr_strategy.json");
+                    println!("   🌟 Đã cập nhật trực tiếp vào deep_cfr_model.json & deep_cfr_strategy.json cho Receiver!");
+                }
             } else {
                 println!("   🛡️  Champion giữ vững ngôi vương. Challenger chưa đủ vượt trội (hoặc TrashShove cao).");
             }

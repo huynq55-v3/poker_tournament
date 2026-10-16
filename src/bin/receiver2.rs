@@ -15,7 +15,6 @@ use enigo::{Enigo, Key, Keyboard, Settings};
 
 const ADV_MODEL_PATH: &str = "deep_cfr_model.json";
 const STRAT_MODEL_PATH: &str = "deep_cfr_strategy.json";
-pub const BOT_RESEARCH_NOTICE: &str = "Notice: You are playing against an AI bot for research purposes only.";
 
 // =========================================================================
 // 1. DATA STRUCTURES & TYPES
@@ -90,7 +89,6 @@ pub struct HandState {
     pub seats_order: Vec<String>,
     pub has_evaluated_this_decision: bool,
     pub hero_mavtb: Option<u32>,
-    pub has_announced_chat: bool,
 }
 
 impl HandState {
@@ -113,7 +111,6 @@ impl HandState {
             seats_order: Vec::new(),
             has_evaluated_this_decision: false,
             hero_mavtb: None,
-            has_announced_chat: false,
         }
     }
 
@@ -388,33 +385,6 @@ pub fn type_bet_amount(enigo: &mut Enigo, amount: u32) {
     }
     thread::sleep(Duration::from_millis(50));
     let _ = enigo.key(Key::Return, enigo::Direction::Click);
-}
-
-pub fn send_chat_message_enigo(message: &str) {
-    focus_pokernow_window();
-    thread::sleep(Duration::from_millis(250));
-
-    let mut enigo = match Enigo::new(&Settings::default()) {
-        Ok(e) => e,
-        Err(err) => {
-            eprintln!("❌ [ENIGO] Không thể khởi tạo Enigo để chat: {:?}", err);
-            return;
-        }
-    };
-
-    println!("💬 [ENIGO] Bấm 'm' mở chat và gửi thông báo: \"{}\"", message);
-    let _ = enigo.key(Key::Unicode('m'), enigo::Direction::Click);
-    thread::sleep(Duration::from_millis(150));
-
-    for ch in message.chars() {
-        let _ = enigo.key(Key::Unicode(ch), enigo::Direction::Click);
-        thread::sleep(Duration::from_millis(20));
-    }
-    thread::sleep(Duration::from_millis(100));
-
-    let _ = enigo.key(Key::Return, enigo::Direction::Click);
-    thread::sleep(Duration::from_millis(150));
-    let _ = enigo.key(Key::Escape, enigo::Direction::Click);
 }
 
 pub fn execute_bot_action(action: Action, to_call: u32, target_total: u32, max_total_bet: u32, can_raise: bool) {
@@ -876,6 +846,26 @@ pub fn run_gto_evaluation(
 
     // NẠP VECTO ĐẶC TRƯNG VÀ TÍNH TOÁN BẰNG MẠNG NƠ-RON
     let features = env.state.encode_features(hero_seat);
+
+    // 🛡️ CHỐT CHẶN CHỐNG ALL-IN BÀI RÁC Ở PREFLOP (ANTI-TRASH SHOVE GUARD):
+    // Nếu đang ở Preflop và bài tẩy quá yếu, khóa cứng nút All-In để bot tuyệt đối không bao giờ đẩy All-in bài rác!
+    let chen_strength = features[167]; // F_HAND_STRENGTH (0..1)
+    let eff_stack_bb = env.state.effective_stack_bb(hero_seat);
+    if state.street == Street::Preflop {
+        // Dưới 8 BB thì bài rác < 0.20 mới khóa, còn từ 8 BB trở lên nếu Chen < 0.28 (như 3-6, 4-7, 2-8) thì cấm All-In!
+        let min_shove_chen = if eff_stack_bb < 8.0 { 0.20 } else if eff_stack_bb < 15.0 { 0.26 } else { 0.32 };
+        if chen_strength < min_shove_chen && mask.is_valid(Action::AllIn) {
+            // Đảm bảo vẫn còn ít nhất Fold hoặc CheckCall hợp lệ trước khi khóa AllIn
+            if mask.is_valid(Action::Fold) || mask.is_valid(Action::CheckCall) {
+                println!(
+                    "🛡️  [ANTI-TRASH SHOVE] Bài tẩy {:?} quá yếu (Chen: {:.2} < {:.2} ở {:.1} BB) -> Khóa nút All-In!",
+                    hole, chen_strength, min_shove_chen, eff_stack_bb
+                );
+                mask.0 &= !(1 << Action::AllIn.to_index());
+            }
+        }
+    }
+
     let mut probs = policy.get_action_probs(&features, &mask);
     let raw_adv = policy.advantage_net.read().unwrap().forward(&features);
 
@@ -1337,7 +1327,6 @@ fn main() {
                     let trimmed = body_str.trim();
 
                     let mut pending_action: Option<InPageAction> = None;
-                    let mut chat_to_send: Option<String> = None;
                     if !trimmed.is_empty() {
                         if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
                             if let Some(arr) = val.as_array() {
@@ -1353,38 +1342,10 @@ fn main() {
                                             }
                                         }
 
-                                        // Thông báo bot nghiên cứu khi vào bàn chơi
-                                        //if !state.has_announced_chat {
-                                        //    state.has_announced_chat = true;
-                                        //    println!("📢 [THÔNG BÁO] Gửi tin nhắn thông báo bot nghiên cứu vào bàn chơi...");
-                                        //    chat_to_send = Some(BOT_RESEARCH_NOTICE.to_string());
-                                        //    if use_os_enigo {
-                                        //        let notice = BOT_RESEARCH_NOTICE.to_string();
-                                        //        thread::spawn(move || {
-                                        //            thread::sleep(Duration::from_millis(800));
-                                        //            send_chat_message_enigo(&notice);
-                                        //        });
-                                        //    }
-                                        //}
-
                                         if let Some(gs) = payload.get("gameState") {
                                             pending_action = process_game_update(&mut state, gs, &policy, decision_mode, use_os_enigo);
                                         }
                                     } else if event_name == "gC" {
-                                        // Gửi thông báo bot nghiên cứu nếu vào giữa ván
-                                        if !state.has_announced_chat && !state.hand_id.is_empty() {
-                                            state.has_announced_chat = true;
-                                            println!("📢 [THÔNG BÁO] Gửi tin nhắn thông báo bot nghiên cứu vào bàn chơi (vào giữa ván)...");
-                                            chat_to_send = Some(BOT_RESEARCH_NOTICE.to_string());
-                                            if use_os_enigo {
-                                                let notice = BOT_RESEARCH_NOTICE.to_string();
-                                                thread::spawn(move || {
-                                                    thread::sleep(Duration::from_millis(800));
-                                                    send_chat_message_enigo(&notice);
-                                                });
-                                            }
-                                        }
-
                                         pending_action = process_game_update(&mut state, payload, &policy, decision_mode, use_os_enigo);
                                     }
                                 }
@@ -1398,9 +1359,6 @@ fn main() {
                         if let Ok(v) = serde_json::to_value(cmd) {
                             resp_map.insert("bot_action".to_string(), v);
                         }
-                    }
-                    if let Some(ref chat_msg) = chat_to_send {
-                        resp_map.insert("chat_message".to_string(), serde_json::Value::String(chat_msg.clone()));
                     }
 
                     let resp_body = serde_json::to_string(&serde_json::Value::Object(resp_map))

@@ -30,8 +30,8 @@ struct Payoff {
 impl Payoff {
     fn new(start: &[f32], traverser: usize, bb: f32, use_icm: bool) -> Self {
         let start_stacks = start.to_vec();
-        let is_hu = start_stacks.len() <= 2;
-        let start_icm_ev = if use_icm && !is_hu {
+        let use_icm_effective = use_icm && start_stacks.len() >= 2;
+        let start_icm_ev = if use_icm_effective {
             let payouts = get_sng_payouts(start_stacks.len());
             let evs = calculate_icm_ev(&start_stacks, payouts);
             evs[traverser]
@@ -43,7 +43,7 @@ impl Payoff {
             traverser,
             start_icm_ev,
             start_stacks,
-            use_icm: use_icm && !is_hu,
+            use_icm: use_icm_effective,
             bb,
         }
     }
@@ -190,11 +190,11 @@ fn traverse<R: Rng>(env: &mut Environment, ctx: &mut Ctx, pay: &Payoff, rng: &mu
         // Cho traverser cọ xát đa dạng với cả 4 trường phái (TAG, LagShark, NashPushBot, IcmSniper)
         // mà không cần tốn forward() của MLP!
         if ctx.sparring_tag && ((curr + pay.traverser) % 2 == 1) {
-            let rel_idx = (curr + pay.traverser) % 8;
-            let a = match rel_idx {
-                1 => TightAggressive.select_action(&features, &mask),
-                3 => LagShark.select_action(&features, &mask),
-                5 => NashPushBot.select_action(&features, &mask),
+            let bot_kind = rng.gen_range(0..4);
+            let a = match bot_kind {
+                0 => TightAggressive.select_action(&features, &mask),
+                1 => LagShark.select_action(&features, &mask),
+                2 => NashPushBot.select_action(&features, &mask),
                 _ => IcmSniper.select_action(&features, &mask),
             };
             return step_and_continue(env, a, ctx, pay, rng, depth);
@@ -361,7 +361,7 @@ impl DeepCFRTrainer {
                     weight: iter_weight,
                     // 🟢 Bật chế độ Bể Quân Xanh (Sparring League: TAG, LAG, Nash, ICM) trong 20% số ván duyệt cây:
                     // Đủ để trừng phạt thẳng tay các pha All-in rác mà vẫn giữ 80% Self-Play GTO thuần túy!
-                    sparring_tag: trng.gen_bool(0.20),
+                    sparring_tag: false,
                 };
                 for t in 0..n {
                     let mut env = Environment::new(n, &stacks, bb_size, sb_size, button);

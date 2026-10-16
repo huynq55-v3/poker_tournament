@@ -942,6 +942,26 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     }
 
     let features = env.state.encode_features(hero_seat);
+
+    // 🛡️ CHỐT CHẶN CHỐNG ALL-IN BÀI RÁC Ở PREFLOP (ANTI-TRASH SHOVE GUARD):
+    // Nếu đang ở Preflop và bài tẩy quá yếu, khóa cứng nút All-In để bot tuyệt đối không bao giờ đẩy All-in bài rác!
+    let chen_strength = features[167]; // F_HAND_STRENGTH (0..1)
+    let eff_stack_bb = env.state.effective_stack_bb(hero_seat);
+    if state.street == Street::Preflop {
+        // Dưới 8 BB thì bài rác < 0.20 mới khóa, còn từ 8 BB trở lên nếu Chen < 0.28 (như 3-6, 4-7, 2-8) thì cấm All-In!
+        let min_shove_chen = if eff_stack_bb < 8.0 { 0.20 } else if eff_stack_bb < 15.0 { 0.26 } else { 0.32 };
+        if chen_strength < min_shove_chen && mask.is_valid(Action::AllIn) {
+            // Đảm bảo vẫn còn ít nhất Fold hoặc CheckCall hợp lệ trước khi khóa AllIn
+            if mask.is_valid(Action::Fold) || mask.is_valid(Action::CheckCall) {
+                println!(
+                    "🛡️  [ANTI-TRASH SHOVE] Bài tẩy {:?} quá yếu (Chen: {:.2} < {:.2} ở {:.1} BB) -> Khóa nút All-In!",
+                    hole, chen_strength, min_shove_chen, eff_stack_bb
+                );
+                mask.0 &= !(1 << Action::AllIn.to_index());
+            }
+        }
+    }
+
     let mut probs = policy.get_action_probs(&features, &mask);
     let raw_adv = policy.advantage_net.read().unwrap().forward(&features);
 

@@ -49,6 +49,36 @@ fn is_facing_real_bet(f: &[f32]) -> bool {
     }
 }
 
+/// Quy đổi Equity sang thang đo Edge đồng nhất cho mọi quy mô bàn (từ Heads-Up 2 người đến 8-Max):
+/// Khắc phục triệt để lỗi `eq * 2.0 <= 2.0` làm tê liệt các ngưỡng > 1.75..2.35 khi còn 2-3 người!
+#[inline(always)]
+fn normalized_edge(eq: f32, n: f32) -> f32 {
+    if n <= 2.5 {
+        // Bàn 2 người (Heads-Up): eq = 0.50 -> edge = 1.00; eq = 0.65 (AQo) -> 1.72; eq = 0.85 (AA) -> 2.68; eq = 1.0 -> 3.40
+        1.0 + (eq - 0.50) * 4.8
+    } else if n <= 3.5 {
+        // Bàn 3 người (3-Max): eq = 0.333 -> edge = 1.00; eq = 0.73 (AA) -> 2.59
+        1.0 + (eq - 0.333) * 4.0
+    } else {
+        eq * n
+    }
+}
+
+/// Ngưỡng Chen tối thiểu để bắt chết cú All-in / Re-shove láo ở Preflop theo số người trong ván:
+/// - Bàn 2 người (Heads-Up): chen >= 0.27 (22+, A2+, K7+, Q9+, J9s - Top 32% bài) là bắt chết kẻ shove 3-6!
+/// - Bàn 3-4 người: chen >= 0.35 (55+, A7+, KTs+, QJs)
+/// - Bàn 5-8 người: chen >= 0.42 (88+, ATs+, AJo+, KQo)
+#[inline(always)]
+fn anti_shove_chen_threshold(n: f32) -> f32 {
+    if n <= 2.5 {
+        0.27
+    } else if n <= 4.5 {
+        0.35
+    } else {
+        0.42
+    }
+}
+
 /// Bài rác preflop thực sự (72o, 83o, 93o, J2o...): điểm Chen chuẩn hóa dưới 0.22
 /// (Không tính nhầm các bài 22..55, A9o, KTo, QJs đang push đúng Nash ở 12BB là rác!)
 const TRASH_CHEN: f32 = 0.22;
@@ -116,17 +146,21 @@ impl Policy for TightAggressive {
     fn select_action(&self, f: &[f32], m: &ActionMask) -> Action {
         let eq = f[F_EQUITY];
         let n = (f[F_IN_HAND] * 8.0).round().max(2.0);
-        let edge = eq * n; // 1.0 = bài trung bình trên bàn
+        let edge = normalized_edge(eq, n); // 1.0 = bài trung bình trên bàn
         let pot_odds = f[F_POT_ODDS];
         let facing = is_facing_real_bet(f);
         let chen = f[F_HAND_STRENGTH]; // Điểm Chen ở Preflop (0..1)
 
         // 1. Chế độ Push/Fold (< 12 BB):
         if f[F_PUSHFOLD] > 0.5 {
-            // Không đẩy bài rác, chỉ đẩy/call khi bài thuộc top (edge > 1.65 hoặc Chen >= 0.45)
-            if edge > 1.75 || (f[F_STREET_PREFLOP] > 0.5 && chen >= 0.48) {
+            let push_chen = if n <= 2.5 { 0.28 } else if n <= 4.5 { 0.38 } else { 0.48 };
+            if edge > 1.75 || (f[F_STREET_PREFLOP] > 0.5 && chen >= push_chen) {
                 return pick(m, &[Action::AllIn, Action::CheckCall]);
             } else if facing {
+                let call_chen = anti_shove_chen_threshold(n);
+                if f[F_STREET_PREFLOP] > 0.5 && (chen >= call_chen || edge > 1.45) {
+                    return pick(m, &[Action::CheckCall, Action::AllIn]);
+                }
                 return pick(m, &[Action::Fold, Action::CheckCall]);
             }
         }
@@ -134,10 +168,9 @@ impl Policy for TightAggressive {
         // 2. Khi đối mặt với Bet / Raise / All-In của đối thủ:
         if facing {
             // 🟢 1. BẮT CHẾT KẺ RE-SHOVE LÁO Ở PREFLOP:
-            // Hạ ngưỡng từ 0.52 xuống 0.42 (bao gồm 88+, ATs+, KTs+, AJo+, KQo - Top 11% bài):
-            // Hễ đã cầm bài tốt ở Preflop là KHÔNG BAO GIỜ FOLD trước cú All-in cướp pot!
-            if f[F_STREET_PREFLOP] > 0.5 && (chen >= 0.42 || edge > 1.50) {
-                if chen >= 0.60 || edge > 2.0 {
+            let min_chen = anti_shove_chen_threshold(n);
+            if f[F_STREET_PREFLOP] > 0.5 && (chen >= min_chen || edge > 1.45) {
+                if chen >= (min_chen + 0.18).min(0.60) || edge > 2.0 {
                     return pick(m, &[Action::BetPot75, Action::AllIn, Action::CheckCall]);
                 } else {
                     return pick(m, &[Action::CheckCall]);
@@ -191,15 +224,17 @@ impl Policy for LagShark {
         let draw_bonus = if has_draw && f[F_STREET_RIVER] < 0.5 { 0.12 } else { 0.0 };
         let pos_bonus = if is_late_pos && !facing { 0.08 } else { 0.0 };
         let eff_eq = (eq + draw_bonus + pos_bonus).min(0.98);
-        let edge = eff_eq * n;
+        let edge = normalized_edge(eff_eq, n);
 
-        if f[F_PUSHFOLD] > 0.5 && edge > 2.1 {
+        let min_chen = anti_shove_chen_threshold(n);
+        let push_edge = if n <= 2.5 { 1.65 } else { 2.1 };
+        if f[F_PUSHFOLD] > 0.5 && (edge > push_edge || (f[F_STREET_PREFLOP] > 0.5 && chen >= min_chen)) {
             return pick(m, &[Action::AllIn, Action::CheckCall]);
         }
 
         if facing {
-            // Snap-call/raise với bài tốt ở Preflop (chen >= 0.42 || edge > 1.50) để chống trash shove
-            if f[F_STREET_PREFLOP] > 0.5 && (chen >= 0.42 || edge > 1.50) {
+            // Snap-call/raise với bài tốt ở Preflop để chống trash shove
+            if f[F_STREET_PREFLOP] > 0.5 && (chen >= min_chen || edge > 1.45) {
                 return pick(m, &[Action::BetPot75, Action::AllIn, Action::CheckCall]);
             }
 
@@ -239,7 +274,7 @@ impl Policy for NashPushBot {
     fn select_action(&self, f: &[f32], m: &ActionMask) -> Action {
         let eq = f[F_EQUITY];
         let n = (f[F_IN_HAND] * 8.0).round().max(2.0);
-        let edge = eq * n;
+        let edge = normalized_edge(eq, n);
         let pot_odds = f[F_POT_ODDS];
         let facing = is_facing_real_bet(f);
         let eff_bb = f[F_EFF_BB] * 50.0;
@@ -248,6 +283,8 @@ impl Policy for NashPushBot {
 
         // Chế độ Short-stack Nash Push/Fold (<= 15 BB)
         if eff_bb <= 15.0 && f[F_STREET_PREFLOP] > 0.5 {
+            let min_chen = anti_shove_chen_threshold(n);
+            let call_edge = if n <= 2.5 { 1.25 } else { 1.45 };
             if !facing {
                 // Open-Shove ngưỡng linh hoạt theo độ sâu stack và vị trí
                 let push_thresh = if is_late { 1.15 + (eff_bb / 45.0) } else { 1.45 + (eff_bb / 35.0) };
@@ -258,8 +295,8 @@ impl Policy for NashPushBot {
                 }
             } else {
                 // Call All-in cần ngưỡng chặt hơn Open-Shove (Gap Concept của Sklansky)
-                // nhưng bắt chết với bài tốt (chen >= 0.42) tránh bị multiway eq làm mù quáng
-                if (eq >= pot_odds + 0.06 || chen >= 0.42) && edge >= 1.45 {
+                // nhưng bắt chết với bài tốt tránh bị multiway eq làm mù quáng
+                if (eq >= pot_odds + 0.04 || chen >= min_chen) && edge >= call_edge {
                     return pick(m, &[Action::CheckCall, Action::AllIn]);
                 } else {
                     return pick(m, &[Action::Fold, Action::CheckCall]);
@@ -309,12 +346,21 @@ impl Policy for IcmSniper {
 
         let draw_bonus = if has_draw { 0.09 } else { 0.0 };
         let real_eq = (raw_eq + draw_bonus - range_discount).clamp(0.0, 1.0);
-        let edge = real_eq * n;
+        let edge = normalized_edge(real_eq, n);
 
+        let min_chen = anti_shove_chen_threshold(n);
         // Chế độ Push/Fold (< 12 BB) có điều chỉnh ICM
         if f[F_PUSHFOLD] > 0.5 {
-            let push_req = if facing { 1.85 + icm_tax * 4.0 } else if is_late { 1.30 } else { 1.60 };
-            if edge >= push_req && (!facing || real_eq >= pot_odds + 0.05 + icm_tax || chen >= 0.42) {
+            let push_req = if facing {
+                if n <= 2.5 { 1.45 + icm_tax * 3.0 } else { 1.85 + icm_tax * 4.0 }
+            } else if is_late {
+                1.20
+            } else {
+                1.45
+            };
+            if (!facing && edge >= push_req)
+                || (facing && (edge >= push_req || chen >= min_chen) && (real_eq >= pot_odds - 0.02 + icm_tax || chen >= min_chen))
+            {
                 return pick(m, &[Action::AllIn, Action::CheckCall]);
             } else {
                 return pick(m, &[Action::Fold, Action::CheckCall]);
@@ -323,9 +369,8 @@ impl Policy for IcmSniper {
 
         if facing {
             // 🟢 BẮT CHẾT KẺ RE-SHOVE LÁO Ở PREFLOP:
-            // Hạ ngưỡng xuống 0.42 (88+, ATs+, KTs+, AJo+, KQo - Top 11% bài)
-            if f[F_STREET_PREFLOP] > 0.5 && (chen >= 0.42 || edge > 1.50) {
-                if chen >= 0.60 || edge > 2.0 {
+            if f[F_STREET_PREFLOP] > 0.5 && (chen >= min_chen || edge > 1.45) {
+                if chen >= (min_chen + 0.18).min(0.60) || edge > 2.0 {
                     return pick(m, &[Action::BetPot75, Action::AllIn, Action::CheckCall]);
                 } else {
                     return pick(m, &[Action::CheckCall]);
@@ -761,5 +806,38 @@ mod tests {
     fn test_arena_heuristic_team_smoke() {
         let res = evaluate_against_heuristic_team(&TightAggressive, 100, 35);
         assert_eq!(res.hands, 100);
+    }
+
+    #[test]
+    fn test_heads_up_bots_call_shove_with_strong_hands() {
+        // Giả lập ván Heads-Up (2 người) ở mức 10 BB (Push/Fold mode)
+        let mut f = vec![0.0f32; FEATURE_DIM];
+        f[F_STREET_PREFLOP] = 1.0;
+        f[F_IN_HAND] = 2.0 / 8.0; // 2 người trong ván bài -> n = 2.0
+        f[F_FACING_BET] = 1.0;
+        f[F_TO_CALL_NORM] = 0.50; // Đối thủ vừa shove All-In
+        f[F_POT_ODDS] = 0.48;
+        f[F_EFF_BB] = 10.0 / 50.0;
+        f[F_PUSHFOLD] = 1.0; // eff_stack < 12 BB
+        f[F_EQUITY] = 0.85; // Cầm Pocket Aces (AA) ở Heads-Up
+        f[F_HAND_STRENGTH] = 0.58; // Chen score của Pocket Aces (AA)
+
+        let mut mask = ActionMask::EMPTY;
+        mask.enable(Action::Fold);
+        mask.enable(Action::CheckCall);
+        mask.enable(Action::AllIn);
+
+        // Cả 4 bot heuristic phải CALL hoặc ALL-IN, TUYỆT ĐỐI KHÔNG ĐƯỢC FOLD POCKET ACES!
+        let tag_act = TightAggressive.select_action(&f, &mask);
+        assert_ne!(tag_act, Action::Fold, "TAG không được fold Pocket Aces ở Heads-Up!");
+
+        let lag_act = LagShark.select_action(&f, &mask);
+        assert_ne!(lag_act, Action::Fold, "LagShark không được fold Pocket Aces ở Heads-Up!");
+
+        let nash_act = NashPushBot.select_action(&f, &mask);
+        assert_ne!(nash_act, Action::Fold, "NashPushBot không được fold Pocket Aces ở Heads-Up!");
+
+        let icm_act = IcmSniper.select_action(&f, &mask);
+        assert_ne!(icm_act, Action::Fold, "IcmSniper không được fold Pocket Aces ở Heads-Up!");
     }
 }
