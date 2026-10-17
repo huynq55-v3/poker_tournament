@@ -128,6 +128,8 @@ pub struct GameState {
     pub bb_size: u32,
     pub sb_size: u32,
     pub action_history: Vec<ActionRecord>,
+    #[serde(default)]
+    pub is_cash_game: bool,
 }
 
 impl GameState {
@@ -324,9 +326,15 @@ impl GameState {
 
         // 5. Pot, to_call, stack của mình, pot odds (4)
         let to_call = self.current_highest_bet.saturating_sub(me.current_bet);
-        f.push((self.pot as f32 / (bb * 50.0)).min(2.0));
-        f.push((to_call as f32 / (bb * 20.0)).min(2.0));
-        f.push((me.stack as f32 / (bb * 50.0)).min(2.0));
+        if self.is_cash_game {
+            f.push((self.pot as f32 / (bb * 150.0)).min(3.0));
+            f.push((to_call as f32 / (bb * 50.0)).min(2.0));
+            f.push((me.stack as f32 / (bb * 150.0)).min(2.0));
+        } else {
+            f.push((self.pot as f32 / (bb * 50.0)).min(2.0));
+            f.push((to_call as f32 / (bb * 20.0)).min(2.0));
+            f.push((me.stack as f32 / (bb * 50.0)).min(2.0));
+        }
         let denom = (self.pot + to_call) as f32;
         f.push(if denom > 0.0 { to_call as f32 / denom } else { 0.0 });
 
@@ -355,10 +363,14 @@ impl GameState {
             let seat = (player_idx + step) % self.num_players;
             let o = &self.players[seat];
             if o.stack > 0 || o.is_all_in {
-                // [0]: Stack còn lại
-                f.push((o.stack as f32 / (bb * 50.0)).min(2.0));
-                // [1]: Tổng chip đối thủ đã bỏ vào pot từ đầu ván (không bị reset về 0 khi sang vòng mới)
-                f.push((o.total_contributed as f32 / (bb * 25.0)).min(2.0));
+                // [0]: Stack còn lại & [1]: Tổng chip đối thủ đã bỏ vào pot từ đầu ván
+                if self.is_cash_game {
+                    f.push((o.stack as f32 / (bb * 150.0)).min(2.0));
+                    f.push((o.total_contributed as f32 / (bb * 50.0)).min(2.0));
+                } else {
+                    f.push((o.stack as f32 / (bb * 50.0)).min(2.0));
+                    f.push((o.total_contributed as f32 / (bb * 25.0)).min(2.0));
+                }
                 // [2]: Trạng thái trong ván + Số vòng cược đã chủ động tấn công:
                 //      0.0 = đã Fold; 0.2 = chỉ Check/Call (CallStation); 0.4..1.0 = Chủ động Bet/Raise qua 1..4 vòng (TAG/Aggressor)
                 let active_aggr = if o.is_in_hand() {
@@ -413,7 +425,11 @@ impl GameState {
 
         // 8. Ngữ cảnh push/fold & sức mạnh bài (7) -> index 161..167
         let eff_bb = self.effective_stack_bb(player_idx);
-        f.push((eff_bb / 50.0).min(1.5)); // index 161
+        if self.is_cash_game {
+            f.push((eff_bb / 150.0).min(2.0)); // index 161: dải mượt 0..300 BB
+        } else {
+            f.push((eff_bb / 50.0).min(1.5));  // index 161: Tournament cũ
+        }
         f.push(if eff_bb < 12.0 { 1.0 } else { 0.0 }); // index 162: F_PUSHFOLD
         f.push(if to_call > 0 { 1.0 } else { 0.0 }); // index 163: F_FACING_BET
         let my_stack = me.stack as f32;

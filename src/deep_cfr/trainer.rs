@@ -25,10 +25,11 @@ struct Payoff {
     start_stacks: Vec<f32>,
     use_icm: bool,
     bb: f32,
+    is_cash_game: bool,
 }
 
 impl Payoff {
-    fn new(start: &[f32], traverser: usize, bb: f32, use_icm: bool) -> Self {
+    fn new(start: &[f32], traverser: usize, bb: f32, use_icm: bool, is_cash_game: bool) -> Self {
         let start_stacks = start.to_vec();
         let use_icm_effective = use_icm && start_stacks.len() >= 2;
         let start_icm_ev = if use_icm_effective {
@@ -45,6 +46,7 @@ impl Payoff {
             start_stacks,
             use_icm: use_icm_effective,
             bb,
+            is_cash_game,
         }
     }
 
@@ -61,7 +63,14 @@ impl Payoff {
                 .map(|(i, _)| i)
                 .collect();
             if in_hand.contains(&self.traverser) {
-                my_end_chips += env.state.pot as f32 / in_hand.len() as f32;
+                let mut share = env.state.pot as f32 / in_hand.len() as f32;
+                // Trừ Rake nếu là Cash Game và ván bài đi tới Flop/Turn/River
+                // (No Flop No Drop: Ăn pot preflop không mất phế)
+                if self.is_cash_game && env.state.street != Street::Preflop {
+                    let rake = (share * 0.055).min(3.0 * self.bb);
+                    share -= rake;
+                }
+                my_end_chips += share;
             }
         }
         let my_start_chips = self.start_stacks[self.traverser];
@@ -240,7 +249,10 @@ pub struct DeepCFRTrainer {
     pub lr: f32,
     pub weight_decay: f32,
     pub fixed_players: Option<usize>,
+    pub max_players: usize,
     pub use_icm: bool,
+    pub stack_bb: u32,
+    pub is_cash_game: bool,
 }
 
 impl DeepCFRTrainer {
@@ -285,7 +297,10 @@ impl DeepCFRTrainer {
             lr: 0.0005,
             weight_decay: 1e-4,
             fixed_players: None,
+            max_players: 8,
             use_icm,
+            stack_bb: 100,
+            is_cash_game: false,
         }
     }
 
@@ -328,6 +343,10 @@ impl DeepCFRTrainer {
         let bb_size = 100u32;
         let sb_size = 50u32;
         let fixed = self.fixed_players;
+        let max_p = self.max_players;
+        let stack_depth = self.stack_bb;
+        let is_cash = self.is_cash_game;
+        let use_icm = self.use_icm;
 
         // Lịch trình giảm Learning Rate mượt mà (Smooth Inverse Decay)
         let effective_lr = (self.lr / (1.0 + 0.004 * self.iteration as f32)).max(0.00008);
@@ -338,16 +357,30 @@ impl DeepCFRTrainer {
             .map(|_| {
                 let mut trng = rand::thread_rng();
                 let n = fixed.unwrap_or_else(|| {
-                    if trng.gen_bool(0.15) {
-                        2
-                    } else if trng.gen_bool(0.80) {
-                        trng.gen_range(7..=8)
+                    if max_p <= 6 {
+                        if trng.gen_bool(0.15) {
+                            2
+                        } else if trng.gen_bool(0.75) {
+                            6
+                        } else {
+                            trng.gen_range(3..=5)
+                        }
                     } else {
-                        trng.gen_range(3..=6)
+                        if trng.gen_bool(0.15) {
+                            2
+                        } else if trng.gen_bool(0.80) {
+                            trng.gen_range(7..=8)
+                        } else {
+                            trng.gen_range(3..=6)
+                        }
                     }
                 });
                 let button = trng.gen_range(0..n);
-                let stacks = if trng.gen_bool(0.55) {
+                let stacks = if is_cash {
+                    TournamentStackSampler::sample_cash_game_stacks(&mut trng, n, bb_size)
+                } else if stack_depth > 0 {
+                    vec![stack_depth * bb_size; n]
+                } else if trng.gen_bool(0.55) {
                     TournamentStackSampler::sample_equal_stacks(&mut trng, n, bb_size)
                 } else {
                     TournamentStackSampler::sample_dirichlet_stacks(&mut trng, n, bb_size)
@@ -365,8 +398,11 @@ impl DeepCFRTrainer {
                 };
                 for t in 0..n {
                     let mut env = Environment::new(n, &stacks, bb_size, sb_size, button);
+                    if is_cash {
+                        env.state.is_cash_game = true;
+                    }
                     env.reset_hand(&mut trng, button);
-                    let pay = Payoff::new(&start, t, bb_size as f32, self.use_icm);
+                    let pay = Payoff::new(&start, t, bb_size as f32, use_icm, is_cash);
                     traverse(&mut env, &mut ctx, &pay, &mut trng, 0);
                 }
                 (ctx.adv_out, ctx.strat_out)

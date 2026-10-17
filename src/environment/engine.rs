@@ -42,6 +42,7 @@ impl Environment {
             bb_size,
             sb_size,
             action_history: Vec::new(),
+            is_cash_game: false,
         };
 
         Environment {

@@ -10,8 +10,8 @@ use std::io::Write;
 
 pub mod arena;
 pub use arena::{
-    evaluate_against_champion, evaluate_against_heuristic_team, evaluate_arena_suite,
-    print_arena_results, ArenaMatchResult,
+    evaluate_against_champion, evaluate_against_champion_cash, evaluate_against_champion_table,
+    evaluate_against_heuristic_team, evaluate_arena_suite, print_arena_results, ArenaMatchResult,
 };
 
 // ---- Vị trí các đặc trưng trong encode_features (đổi layout thì phải cập nhật; có test kiểm tra) ----

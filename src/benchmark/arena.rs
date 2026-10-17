@@ -51,10 +51,11 @@ fn play_arena_team_hand<R: Rng>(
     stack_bb: u32,
     acc: &mut ArenaAcc,
     rng: &mut R,
+    num_players: usize,
 ) {
     let bb = 100u32;
     let sb = 50u32;
-    let n = ARENA_PLAYERS;
+    let n = num_players.clamp(2, 8);
     let stacks = vec![stack_bb * bb; n];
     let button = rng.gen_range(0..n);
 
@@ -97,13 +98,15 @@ fn play_arena_team_hand<R: Rng>(
         }
     }
 
-    let initial_team_chips = (4 * stack_bb * bb) as f64;
-    let final_team_chips: f64 = [0, 2, 4, 6]
+    let challenger_seats: Vec<usize> = (0..n).filter(|&seat| seat % 2 == 0).collect();
+    let num_challengers = challenger_seats.len().max(1) as f64;
+    let initial_team_chips = num_challengers * (stack_bb * bb) as f64;
+    let final_team_chips: f64 = challenger_seats
         .iter()
         .map(|&seat| env.state.players[seat].stack as f64)
         .sum();
 
-    let diff_bb = (final_team_chips - initial_team_chips) / (bb as f64) / 4.0;
+    let diff_bb = (final_team_chips - initial_team_chips) / (bb as f64) / num_challengers;
 
     acc.hands += 1;
     acc.sum_diff += diff_bb;
@@ -138,26 +141,126 @@ fn acc_to_result(acc: &ArenaAcc) -> ArenaMatchResult {
     }
 }
 
-/// Đấu trường 8-max: Challenger (ghế 0, 2, 4, 6) đối đầu Champion (ghế 1, 3, 5, 7)
+/// Đấu trường mặc định 8-max (tương thích ngược với các caller cũ)
 pub fn evaluate_against_champion(
     challenger: &dyn Policy,
     champion: &dyn Policy,
     total_hands: usize,
     stack_bb: u32,
 ) -> ArenaMatchResult {
+    evaluate_against_champion_table(challenger, champion, total_hands, stack_bb, ARENA_PLAYERS)
+}
+
+/// Đấu trường đối đầu Champion tùy biến số người chơi trên bàn (6-max hoặc 8-max)
+pub fn evaluate_against_champion_table(
+    challenger: &dyn Policy,
+    champion: &dyn Policy,
+    total_hands: usize,
+    stack_bb: u32,
+    num_players: usize,
+) -> ArenaMatchResult {
     let opps = [champion];
     let acc = (0..total_hands)
         .into_par_iter()
         .fold(ArenaAcc::default, |mut acc, _| {
             let mut rng = thread_rng();
-            // Đánh xen kẽ cả mức stack_bb (35BB) và Push/Fold (12BB) trong Arena để kiểm duyệt toàn diện
-            let actual_depth = if rng.gen_bool(0.25) { 12 } else { stack_bb };
-            play_arena_team_hand(challenger, &opps, actual_depth, &mut acc, &mut rng);
+            // Đánh xen kẽ cả mức stack_bb (100BB) và Push/Fold (12BB) trong Arena để kiểm duyệt toàn diện
+            let actual_depth = if rng.gen_bool(0.20) { 12 } else { stack_bb };
+            play_arena_team_hand(challenger, &opps, actual_depth, &mut acc, &mut rng, num_players);
             acc
         })
         .reduce(ArenaAcc::default, |a, b| a.merge(&b));
 
     acc_to_result(&acc)
+}
+
+/// Đấu trường Cash Game thực chiến (mô phỏng bàn 6-max PokerStars có tích lũy chip và Deep Stack)
+pub fn evaluate_against_champion_cash(
+    challenger: &dyn Policy,
+    champion: &dyn Policy,
+    total_hands: usize,
+    num_players: usize,
+) -> ArenaMatchResult {
+    let opps = [champion];
+    let acc = (0..total_hands)
+        .into_par_iter()
+        .fold(ArenaAcc::default, |mut acc, _| {
+            let mut rng = thread_rng();
+            play_arena_cash_hand(challenger, &opps, &mut acc, &mut rng, num_players);
+            acc
+        })
+        .reduce(ArenaAcc::default, |a, b| a.merge(&b));
+
+    acc_to_result(&acc)
+}
+
+fn play_arena_cash_hand<R: Rng>(
+    challenger: &dyn Policy,
+    opponents: &[&dyn Policy],
+    acc: &mut ArenaAcc,
+    rng: &mut R,
+    num_players: usize,
+) {
+    let bb = 100u32;
+    let sb = 50u32;
+    let n = num_players.clamp(2, 8);
+    let stacks = crate::sampler::TournamentStackSampler::sample_cash_game_stacks(rng, n, bb);
+    let button = rng.gen_range(0..n);
+
+    let mut env = Environment::new(n, &stacks, bb, sb, button);
+    env.state.is_cash_game = true;
+    env.reset_hand(rng, button);
+
+    let challenger_seats: Vec<usize> = (0..n).filter(|&seat| seat % 2 == 0).collect();
+    let initial_team_chips: f64 = challenger_seats.iter().map(|&seat| stacks[seat] as f64).sum();
+
+    let mut guard = 0;
+    while env.state.street != Street::Showdown && guard < 400 {
+        guard += 1;
+        let cur = env.state.current_player_idx;
+        let mask = env.get_action_mask();
+        if mask.0 == 0 {
+            break;
+        }
+
+        let feats = env.state.encode_features(cur);
+        let is_challenger = cur.is_multiple_of(2);
+
+        let action = if is_challenger {
+            let a = challenger.select_action(&feats, &mask);
+            acc.total_actions += 1;
+            if a == Action::AllIn {
+                acc.challenger_shoves += 1;
+            }
+            if feats[F_STREET_PREFLOP] > 0.5 && feats[F_HAND_STRENGTH] < TRASH_CHEN {
+                acc.challenger_trash += 1;
+                if a == Action::AllIn {
+                    acc.challenger_trash_shoves += 1;
+                }
+            }
+            a
+        } else {
+            let opp_idx = (cur / 2) % opponents.len();
+            opponents[opp_idx].select_action(&feats, &mask)
+        };
+
+        match env.step(action) {
+            Ok(true) | Err(_) => break,
+            Ok(false) => {}
+        }
+    }
+
+    let final_team_chips: f64 = challenger_seats
+        .iter()
+        .map(|&seat| env.state.players[seat].stack as f64)
+        .sum();
+
+    let num_challengers = challenger_seats.len().max(1) as f64;
+    let diff_bb = (final_team_chips - initial_team_chips) / (bb as f64) / num_challengers;
+
+    acc.hands += 1;
+    acc.sum_diff += diff_bb;
+    acc.sum_sq_diff += diff_bb * diff_bb;
 }
 
 /// Đấu trường 8-max đối đầu Biệt đội Heuristic All-Star:
@@ -178,8 +281,8 @@ pub fn evaluate_against_heuristic_team(
         .into_par_iter()
         .fold(ArenaAcc::default, |mut acc, _| {
             let mut rng = thread_rng();
-            let actual_depth = if rng.gen_bool(0.25) { 12 } else { stack_bb };
-            play_arena_team_hand(challenger, &opps, actual_depth, &mut acc, &mut rng);
+            let actual_depth = if rng.gen_bool(0.20) { 12 } else { stack_bb };
+            play_arena_team_hand(challenger, &opps, actual_depth, &mut acc, &mut rng, ARENA_PLAYERS);
             acc
         })
         .reduce(ArenaAcc::default, |a, b| a.merge(&b));

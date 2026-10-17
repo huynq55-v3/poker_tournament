@@ -11,16 +11,20 @@ use std::net::TcpListener;
 use std::sync::{Arc, RwLock};
 use std::{thread, time::Duration};
 
-// Thư viện điều khiển bàn phím tự động
 use enigo::{Enigo, Key, Keyboard, Settings};
+use rand::Rng;
 
-const ADV_MODEL_PATH: &str = "deep_cfr_model.json";
-const STRAT_MODEL_PATH: &str = "deep_cfr_strategy.json";
+const ADV_MODEL_PATH: &str = "deep_cfr_model_tour.json";
+const STRAT_MODEL_PATH: &str = "deep_cfr_strategy_tour.json";
+
+// =========================================================================
+// 1. DATA STRUCTURES & TYPES
+// =========================================================================
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum DecisionMode {
-    GuardedMixing, // Mặc định: Lọc phòng hộ EV + Bảo vệ range GTO
-    PureMaxEv,     // --greedy hoặc --max-ev: 100% Argmax EV
+pub enum DecisionMode {
+    PureMaxEv,     // Mặc định cho receiver2: 100% Argmax EV (Thuần EV Max)
+    GuardedMixing, // --guarded: Lọc phòng hộ EV + Bảo vệ range GTO
     PureGtoRoll,   // --roll: 100% GTO Roll nguyên bản
 }
 
@@ -29,10 +33,12 @@ pub struct InPageAction {
     pub action: String, // "fold", "check", "call", "all_in", "raise"
     pub amount: u32,
     pub to_call: u32,
+    #[serde(default)]
+    pub delay_ms: u64,
 }
 
 #[derive(Clone, Debug)]
-struct HandActionRecord {
+pub struct HandActionRecord {
     pub player_id: String,
     pub seat_num: usize,
     pub street: Street,
@@ -41,15 +47,15 @@ struct HandActionRecord {
 }
 
 #[derive(Clone, Debug)]
-struct PlayerTracker {
-    id: String,
-    name: String,
-    seat_num: usize,
-    stack: u32,
-    current_bet: u32,
-    total_contributed: u32,
-    is_folded: bool,
-    is_all_in: bool,
+pub struct PlayerTracker {
+    pub id: String,
+    pub name: String,
+    pub seat_num: usize,
+    pub stack: u32,
+    pub current_bet: u32,
+    pub total_contributed: u32,
+    pub is_folded: bool,
+    pub is_all_in: bool,
 }
 
 impl Default for PlayerTracker {
@@ -68,28 +74,28 @@ impl Default for PlayerTracker {
 }
 
 #[derive(Debug)]
-struct HandState {
-    hand_id: String,
-    hero_id: String,
-    hero_cards: Option<[Card; 2]>,
-    community_cards: Vec<Card>,
-    street: Street,
-    pn_total_pot: u32,
-    highest_bet: u32,
-    min_raise: u32,
-    bb_size: u32,
-    sb_size: u32,
-    dealer_id: Option<String>,
-    dealer_seat: Option<usize>,
-    action_history: Vec<HandActionRecord>,
-    players: HashMap<String, PlayerTracker>,
-    seats_order: Vec<String>,
-    has_evaluated_this_decision: bool,
-    hero_mavtb: Option<u32>,
+pub struct HandState {
+    pub hand_id: String,
+    pub hero_id: String,
+    pub hero_cards: Option<[Card; 2]>,
+    pub community_cards: Vec<Card>,
+    pub street: Street,
+    pub pn_total_pot: u32,
+    pub highest_bet: u32,
+    pub min_raise: u32,
+    pub bb_size: u32,
+    pub sb_size: u32,
+    pub dealer_id: Option<String>,
+    pub dealer_seat: Option<usize>,
+    pub action_history: Vec<HandActionRecord>,
+    pub players: HashMap<String, PlayerTracker>,
+    pub seats_order: Vec<String>,
+    pub has_evaluated_this_decision: bool,
+    pub hero_mavtb: Option<u32>,
 }
 
 impl HandState {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             hand_id: String::new(),
             hero_id: String::new(),
@@ -111,7 +117,7 @@ impl HandState {
         }
     }
 
-    fn start_new_hand(&mut self, new_h_id: &str) {
+    pub fn start_new_hand(&mut self, new_h_id: &str) {
         println!("\n============================================================");
         println!("🎲 [VÁN MỚI] Hand ID: {}", new_h_id);
         println!("============================================================");
@@ -127,8 +133,7 @@ impl HandState {
         self.action_history.clear();
         self.hero_mavtb = None;
 
-        // 🟢 FIX: Nếu có danh sách ghế ngồi thực tế từ PokerNow (seats_order),
-        // chỉ giữ lại những player ID đang thực sự có mặt ở bàn này!
+        // Giữ lại những player ID đang thực sự có mặt ở bàn này
         if !self.seats_order.is_empty() {
             self.players.retain(|id, _| self.seats_order.contains(id));
         }
@@ -142,7 +147,11 @@ impl HandState {
     }
 }
 
-fn robust_parse_card(s: &str) -> Option<Card> {
+// =========================================================================
+// 2. CARD PARSING UTILITIES
+// =========================================================================
+
+pub fn robust_parse_card(s: &str) -> Option<Card> {
     let s = s.trim();
     if s.len() < 2 || s.len() > 3 { return None; }
     let (r_char, s_char) = if s.len() == 3 && s.starts_with("10") {
@@ -165,34 +174,21 @@ fn robust_parse_card(s: &str) -> Option<Card> {
     Some(Card::new(rank, suit))
 }
 
-fn parse_cards_array(val: &Value) -> Option<[Card; 2]> {
+pub fn parse_cards_array(val: &Value) -> Option<[Card; 2]> {
     let arr = val.as_array()?;
     let mut cards = Vec::new();
     for item in arr {
-        if let Some(s) = item.as_str() { if let Some(card) = robust_parse_card(s) { cards.push(card); } }
-        else if let Some(s) = item.get("value").and_then(|v| v.as_str()) { if let Some(card) = robust_parse_card(s) { cards.push(card); } }
+        if let Some(s) = item.as_str() { 
+            if let Some(card) = robust_parse_card(s) { cards.push(card); } 
+        } else if let Some(s) = item.get("value").and_then(|v| v.as_str()) { 
+            if let Some(card) = robust_parse_card(s) { cards.push(card); } 
+        }
     }
     if cards.len() == 2 { Some([cards[0], cards[1]]) } else { None }
 }
 
-fn type_bet_amount(enigo: &mut Enigo, amount: u32) {
-    let _ = enigo.key(Key::Unicode('r'), enigo::Direction::Click);
-    thread::sleep(Duration::from_millis(100));
-    // Xóa sạch số mặc định cũ trong ô cược của PokerNow (tránh bị nối chuỗi số như 401000)
-    for _ in 0..6 {
-        let _ = enigo.key(Key::Backspace, enigo::Direction::Click);
-        thread::sleep(Duration::from_millis(15));
-    }
-    for ch in amount.to_string().chars() {
-        let _ = enigo.key(Key::Unicode(ch), enigo::Direction::Click);
-        thread::sleep(Duration::from_millis(30));
-    }
-    thread::sleep(Duration::from_millis(50));
-    let _ = enigo.key(Key::Return, enigo::Direction::Click);
-}
-
 // =========================================================================
-// 🪟 WINDOW FOCUS MODULE (KHÔNG CHIẾM CHUỘT / KHÔNG DI CHUỘT)
+// 3. WINDOW FOCUS & OS AUTOMATION (ENIGO / X11 / WIN32)
 // =========================================================================
 
 static TARGET_GAME_ID: RwLock<String> = RwLock::new(String::new());
@@ -266,55 +262,61 @@ mod win_focus {
             return 1;
         }
 
-        let mut buf = [0u16; 512];
-        let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), 512);
+        let mut buffer = [0u16; 512];
+        let len = GetWindowTextW(hwnd, buffer.as_mut_ptr(), 512);
         if len > 0 {
-            let title = String::from_utf16_lossy(&buf[..len as usize]).to_lowercase();
+            let title = String::from_utf16_lossy(&buffer[..len as usize]);
             for kw in &ctx.keywords {
-                if title.contains(&kw.to_lowercase()) {
+                if title.contains(kw) {
                     ctx.target_hwnd = Some(hwnd);
-                    return 0; // Tìm thấy cửa sổ khớp, dừng duyệt
+                    return 0; // Dừng quét ngay khi tìm thấy
                 }
             }
         }
         1
     }
 
-    pub fn focus_window(keywords: &[String]) -> bool {
+    pub fn focus_pokernow_window() -> bool {
         let mut ctx = SearchContext {
-            keywords: keywords.to_vec(),
+            keywords: super::get_target_game_keywords(),
             target_hwnd: None,
         };
 
         unsafe {
             EnumWindows(Some(enum_window_callback), &mut ctx as *mut _ as LPARAM);
+        }
 
-            if let Some(hwnd) = ctx.target_hwnd {
-                let fg_wnd = GetForegroundWindow();
-                let fg_thread = GetWindowThreadProcessId(fg_wnd, std::ptr::null_mut());
-                let cur_thread = GetCurrentThreadId();
-
-                if fg_thread != cur_thread && fg_thread != 0 {
-                    AttachThreadInput(cur_thread, fg_thread, 1);
+        if let Some(target) = ctx.target_hwnd {
+            unsafe {
+                let fg = GetForegroundWindow();
+                if fg == target {
+                    return true;
                 }
 
-                if IsIconic(hwnd) != 0 {
-                    ShowWindow(hwnd, SW_RESTORE);
+                let current_thread = GetCurrentThreadId();
+                let fg_thread = GetWindowThreadProcessId(fg, std::ptr::null_mut());
+
+                if fg_thread != 0 && fg_thread != current_thread {
+                    AttachThreadInput(current_thread, fg_thread, 1);
+                }
+
+                if IsIconic(target) != 0 {
+                    ShowWindow(target, SW_RESTORE);
                 } else {
-                    ShowWindow(hwnd, SW_SHOW);
+                    ShowWindow(target, SW_SHOW);
                 }
 
-                SetForegroundWindow(hwnd);
-                BringWindowToTop(hwnd);
-                SetFocus(hwnd);
+                BringWindowToTop(target);
+                SetForegroundWindow(target);
+                SetFocus(target);
 
-                if fg_thread != cur_thread && fg_thread != 0 {
-                    AttachThreadInput(cur_thread, fg_thread, 0);
+                if fg_thread != 0 && fg_thread != current_thread {
+                    AttachThreadInput(current_thread, fg_thread, 0);
                 }
-                true
-            } else {
-                false
             }
+            true
+        } else {
+            false
         }
     }
 }
@@ -323,25 +325,23 @@ mod win_focus {
 mod linux_focus {
     use std::process::Command;
 
-    pub fn focus_window(keywords: &[String]) -> bool {
-        // 1. Thử dùng wmctrl nếu có (chuẩn X11 / Xwayland)
-        for kw in keywords {
-            if let Ok(status) = Command::new("wmctrl").args(["-a", kw]).status() {
-                if status.success() {
-                    return true;
-                }
-            }
-        }
+    pub fn focus_pokernow_window() -> bool {
+        let keywords = super::get_target_game_keywords();
 
-        // 2. Thử dùng xdotool nếu có
-        for kw in keywords {
-            if let Ok(output) = Command::new("xdotool").args(["search", "--name", kw]).output() {
-                if output.status.success() {
-                    let wids = String::from_utf8_lossy(&output.stdout);
-                    if let Some(first_id) = wids.lines().next() {
-                        let trimmed = first_id.trim();
-                        if !trimmed.is_empty() {
-                            let _ = Command::new("xdotool").args(["windowactivate", trimmed]).status();
+        for kw in &keywords {
+            let output = Command::new("xdotool")
+                .args(["search", "--name", kw])
+                .output();
+
+            if let Ok(out) = output {
+                if out.status.success() {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    if let Some(first_id) = text.lines().next() {
+                        let wid = first_id.trim();
+                        if !wid.is_empty() {
+                            let _ = Command::new("xdotool")
+                                .args(["windowactivate", "--sync", wid])
+                                .output();
                             return true;
                         }
                     }
@@ -349,71 +349,70 @@ mod linux_focus {
             }
         }
 
-        // 3. GNOME Wayland / Desktop Apps (Kích hoạt cửa sổ trình duyệt đang chạy)
-        for app in &["google-chrome", "google-chrome.desktop", "brave-browser", "firefox", "chromium"] {
-            if let Ok(status) = Command::new("gtk-launch").arg(app).status() {
-                if status.success() {
-                    return true;
-                }
-            }
+        for kw in &keywords {
+            let _ = Command::new("wmctrl")
+                .args(["-a", kw])
+                .output();
         }
 
         false
     }
 }
 
-/// Tự động đưa cửa sổ PokerNow lên foreground mà KHÔNG chiếm chuột, KHÔNG di chuyển trỏ chuột
-pub fn focus_pokernow_window() {
-    let keywords = get_target_game_keywords();
-
-    #[cfg(target_os = "windows")]
-    {
-        if win_focus::focus_window(&keywords) {
-            println!("🪟 [FOCUS] Đã tự động focus cửa sổ PokerNow (Windows - không chiếm chuột)!");
-        } else {
-            println!("⚠️ [FOCUS] Chưa tìm thấy cửa sổ PokerNow trên Windows.");
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        if linux_focus::focus_window(&keywords) {
-            println!("🪟 [FOCUS] Đã kích hoạt cửa sổ PokerNow trên Linux (không chiếm chuột)!");
-        } else {
-            println!("⚠️ [FOCUS] Đã gửi lệnh kích hoạt cửa sổ trình duyệt (Linux).");
-        }
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    {
-        println!("ℹ️ Nền tảng chưa hỗ trợ window focus tự động.");
-    }
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+mod dummy_focus {
+    pub fn focus_pokernow_window() -> bool { false }
 }
 
-// Hàm thực hiện tự động gõ phím vào cửa sổ đang focus
-fn execute_bot_action(action: Action, to_call: u32, target_total: u32, max_total_bet: u32, can_raise: bool) {
-    // 🪟 TỰ ĐỘNG FOCUS CỬA SỔ POKERNOW (KHÔNG CHIẾM CHUỘT / KHÔNG DI CHUỘT)
+pub fn focus_pokernow_window() -> bool {
+    #[cfg(target_os = "windows")]
+    { win_focus::focus_pokernow_window() }
+
+    #[cfg(target_os = "linux")]
+    { linux_focus::focus_pokernow_window() }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    { dummy_focus::focus_pokernow_window() }
+}
+
+pub fn type_bet_amount(enigo: &mut Enigo, amount: u32) {
+    let _ = enigo.key(Key::Unicode('r'), enigo::Direction::Click);
+    thread::sleep(Duration::from_millis(100));
+    for _ in 0..6 {
+        let _ = enigo.key(Key::Backspace, enigo::Direction::Click);
+        thread::sleep(Duration::from_millis(15));
+    }
+    for ch in amount.to_string().chars() {
+        let _ = enigo.key(Key::Unicode(ch), enigo::Direction::Click);
+        thread::sleep(Duration::from_millis(30));
+    }
+    thread::sleep(Duration::from_millis(50));
+    let _ = enigo.key(Key::Return, enigo::Direction::Click);
+}
+
+pub fn execute_bot_action(action: Action, to_call: u32, target_total: u32, max_total_bet: u32, can_raise: bool) {
     focus_pokernow_window();
+    thread::sleep(Duration::from_millis(150));
 
-    // Chờ 250ms để cửa sổ nhận focus trọn vẹn và giao diện sẵn sàng nhận phím
-    thread::sleep(Duration::from_millis(250));
-
-    let mut enigo = Enigo::new(&Settings::default()).unwrap();
-
-    // 🛡️ BẢO VỆ TUYỆT ĐỐI: Nếu bàn không thể Tố (đối thủ đã All-In hoặc không còn ai có chip),
-    // tự động chuyển hướng an toàn: nếu to_call == 0 thì CHECK, nếu to_call > 0 thì CALL!
-    let safe_action = if !can_raise && action != Action::Fold && action != Action::CheckCall {
-        if to_call == 0 {
-            println!("⚠️ [BẢO VỆ] Bàn không thể Tố/All-In -> Tự động chuyển thành CHECK!");
-        } else {
-            println!("⚠️ [BẢO VỆ] Bàn không thể Tố/All-In -> Tự động chuyển thành CALL!");
+    let mut enigo = match Enigo::new(&Settings::default()) {
+        Ok(e) => e,
+        Err(err) => {
+            eprintln!("❌ [ENIGO] Không thể tạo Enigo keyboard driver: {:?}", err);
+            return;
         }
-        Action::CheckCall
-    } else {
-        action
     };
 
-    match safe_action {
+    if !can_raise && action != Action::Fold && action != Action::CheckCall {
+        println!("⚠️ [BẢO VỆ] Bàn không thể Tố/All-In -> Tự động chuyển thành CHECK/CALL!");
+        if to_call == 0 {
+            let _ = enigo.key(Key::Unicode('k'), enigo::Direction::Click);
+        } else {
+            let _ = enigo.key(Key::Unicode('c'), enigo::Direction::Click);
+        }
+        return;
+    }
+
+    match action {
         Action::Fold => {
             println!("🤖 [BOT] Thao tác: FOLD (Bấm F)");
             let _ = enigo.key(Key::Unicode('f'), enigo::Direction::Click);
@@ -444,147 +443,23 @@ fn execute_bot_action(action: Action, to_call: u32, target_total: u32, max_total
     }
 }
 
-fn main() {
-    println!("============================================================");
-    println!("⚡ POKERNOW REAL-TIME GTO ASSISTANT & AUTO-BOT (v3)");
-    println!("============================================================");
+// =========================================================================
+// 4. GAME UPDATE PROCESSING & STATE TRACKING
+// =========================================================================
 
-    // Cấu hình URL / ID phòng game để tự động focus
-    let default_game = "https://www.pokernow.com/games/pglq3HyXKRV6Klg6v5XNQA0_i";
-    let mut target_url = default_game.to_string();
-    let args: Vec<String> = std::env::args().collect();
-    let mut i = 1;
-    while i < args.len() {
-        if (args[i] == "--game-url" || args[i] == "--game-id" || args[i] == "-g") && i + 1 < args.len() {
-            target_url = args[i + 1].clone();
-            i += 1;
-        }
-        i += 1;
-    }
-    set_target_game(&target_url);
-    println!("🎮 Target Game URL: {}", target_url);
-    if let Ok(id) = TARGET_GAME_ID.read() {
-        println!("🔑 Target Game ID:  [{}]", *id);
-    }
-
-    print!("📐 Nạp bảng Preflop Equity... ");
-    std::io::stdout().flush().unwrap();
-    let _ = poker_tournament::equity::preflop_table();
-    println!("✅ Xong!");
-
-    print!("🧠 Nạp mô hình AI... ");
-    std::io::stdout().flush().unwrap();
-    let adv_mlp = MLP::load_from_file(ADV_MODEL_PATH).expect("Lỗi nạp deep_cfr_model.json");
-    let strat_mlp = MLP::load_from_file(STRAT_MODEL_PATH).ok();
-    println!("✅ Xong! (Strategy Net: {})", if strat_mlp.is_some() { "Có" } else { "Không" });
-
-    let policy = DeepCFRPolicy::with_strategy(Arc::new(RwLock::new(adv_mlp)), strat_mlp, false);
-    let decision_mode = if std::env::args().any(|a| a == "--roll") {
-        DecisionMode::PureGtoRoll
-    } else if std::env::args().any(|a| a == "--greedy" || a == "--max-ev") {
-        DecisionMode::PureMaxEv
-    } else {
-        DecisionMode::GuardedMixing
-    };
-    let use_os_enigo = std::env::args().any(|a| a == "--enigo" || a == "--use-enigo");
-
-    let listener = TcpListener::bind("127.0.0.1:3000").expect("Không thể mở cổng 3000");
-    println!("🌐 Server sẵn sàng tại http://127.0.0.1:3000");
-    let mode_desc = match decision_mode {
-        DecisionMode::GuardedMixing => "🛡️ TOP-EV GUARDED MIXING (Mặc định: Bảo vệ range + Chống All-in ngớ ngẩn + Trọng số EV-GTO) 🚀",
-        DecisionMode::PureMaxEv => "⚡ PURE MAX-EV GREEDY (Luôn chọn nước có EV cao nhất)",
-        DecisionMode::PureGtoRoll => "🎲 PURE GTO ROLL (Tung xúc xắc theo % GTO nguyên bản)",
-    };
-    println!("🎯 Chế độ ra quyết định: {}", mode_desc);
-    println!("🔇 Chế độ thực thi: {}", if use_os_enigo { "🖥️ OS Keyboard (Enigo - Cần cửa sổ focus)" } else { "🥷 100% SILENT IN-PAGE (Tampermonkey DOM - Không chiếm chuột, không chiếm phím, vừa làm việc vừa chơi)" });
-    println!("👀 Đang theo dõi, đồng bộ PokerNow và bật Auto-Bot...\n");
-
-    let mut state = HandState::new();
-
-    for mut stream in listener.incoming().flatten() {
-        let mut raw_data = Vec::with_capacity(16384);
-        let mut temp_buf = [0u8; 8192];
-
-        while let Ok(n) = stream.read(&mut temp_buf) {
-            if n == 0 { break; }
-            raw_data.extend_from_slice(&temp_buf[..n]);
-
-                if let Some(header_end) = raw_data.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let header_str = String::from_utf8_lossy(&raw_data[..header_end]);
-
-                    if header_str.starts_with("OPTIONS") {
-                        let response = "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
-                        let _ = stream.write_all(response.as_bytes());
-                        break;
-                    }
-
-                    let mut content_len = 0usize;
-                    for line in header_str.lines() {
-                        if line.to_lowercase().starts_with("content-length:") {
-                            if let Some(val_str) = line.split(':').nth(1) {
-                                content_len = val_str.trim().parse().unwrap_or(0);
-                            }
-                        }
-                    }
-
-                    if raw_data.len() >= header_end + 4 + content_len {
-                        let body_slice = &raw_data[header_end + 4 .. header_end + 4 + content_len];
-                        let body_str = String::from_utf8_lossy(body_slice);
-                        let trimmed = body_str.trim();
-
-                        let mut pending_action: Option<InPageAction> = None;
-                        if !trimmed.is_empty() {
-                            if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-                                if let Some(arr) = val.as_array() {
-                                    if arr.len() >= 2 {
-                                        let event_name = arr[0].as_str().unwrap_or("");
-                                        let payload = &arr[1];
-                                        if event_name == "registered" {
-                                            if let Some(cp) = payload.get("currentPlayer") {
-                                                if let Some(id) = cp.get("id").and_then(|v| v.as_str()) {
-                                                    state.hero_id = id.to_string();
-                                                    let name = cp.get("networkUsername").or_else(|| cp.get("name")).and_then(|v| v.as_str()).unwrap_or("Hero");
-                                                    println!("👤 Đã kết nối: {} | Hero ID: [{}]", name, id);
-                                                }
-                                            }
-                                            if let Some(gs) = payload.get("gameState") {
-                                                pending_action = process_game_update(&mut state, gs, &policy, decision_mode, use_os_enigo);
-                                            }
-                                        } else if event_name == "gC" {
-                                            pending_action = process_game_update(&mut state, payload, &policy, decision_mode, use_os_enigo);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        let resp_body = if let Some(ref cmd) = pending_action {
-                            serde_json::to_string(&serde_json::json!({
-                                "status": "ok",
-                                "bot_action": cmd
-                            })).unwrap_or_else(|_| r#"{"status":"ok"}"#.to_string())
-                        } else {
-                            r#"{"status":"ok"}"#.to_string()
-                        };
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
-                            resp_body.len(),
-                            resp_body
-                        );
-                        let _ = stream.write_all(response.as_bytes());
-                        let _ = stream.flush();
-                        break;
-                    }
-                }
-        }
-    }
-}
-
-fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRPolicy, mode: DecisionMode, use_os_enigo: bool) -> Option<InPageAction> {
+pub fn process_game_update(
+    state: &mut HandState, 
+    payload: &Value, 
+    policy: &DeepCFRPolicy, 
+    mode: DecisionMode, 
+    use_os_enigo: bool
+) -> Option<InPageAction> {
+    // 1. Nhận diện Hand ID mới
     if let Some(hi) = payload.get("hI").and_then(|v| v.as_str()) {
         if state.hand_id != hi { state.start_new_hand(hi); }
     }
 
+    // 2. Cập nhật Street (Preflop, Flop, Turn, River, Showdown)
     if let Some(gt_arr) = payload.get("gT").and_then(|v| v.as_array()) {
         if gt_arr.len() >= 2 {
             if let Some(st_num) = gt_arr[1].as_u64() {
@@ -610,6 +485,7 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
         }
     }
 
+    // 3. Cập nhật danh sách ghế ngồi (Seats) & gán seat_num chuẩn xác
     if let Some(arr) = payload.get("seats").and_then(|v| v.as_array()) {
         let mut v: Vec<(usize, String)> = Vec::new();
         for s in arr {
@@ -660,9 +536,11 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
         }
     }
 
+    // 4. Kích cỡ Blinds
     if let Some(bb) = payload.get("bigBlind").and_then(|v| v.as_u64()) { state.bb_size = bb as u32; }
     if let Some(sb) = payload.get("smallBlind").and_then(|v| v.as_u64()) { state.sb_size = sb as u32; }
     
+    // 5. Pot bàn chơi
     if let Some(p) = payload.get("pot") {
         if let Some(num) = p.as_u64() {
             state.pn_total_pot = num as u32;
@@ -671,15 +549,14 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
         }
     }
 
-    // 🟢 Lưu lại mức cược cao nhất trước khi đọc "cHB" từ gói JSON mới
     let mut prev_highest = state.highest_bet;
-
     if let Some(chb) = payload.get("cHB").and_then(|v| v.as_u64()) { state.highest_bet = chb as u32; }
     
     if let Some(mr) = payload.get("mR").and_then(|v| v.as_u64()) {
         state.min_raise = (mr as u32).saturating_sub(state.highest_bet).max(state.bb_size);
     }
 
+    // 6. Cập nhật stacks và tên người chơi
     if let Some(players_obj) = payload.get("players").and_then(|v| v.as_object()) {
         for (pid, pval) in players_obj {
             let entry = state.players.entry(pid.clone()).or_insert_with(|| PlayerTracker {
@@ -693,7 +570,7 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
         }
     }
 
-    // Đảm bảo seat_num được đồng bộ từ seats_order nếu entry.seat_num vẫn là 99
+    // Đồng bộ seat_num từ seats_order nếu entry.seat_num chưa xác định
     for (idx, pid) in state.seats_order.iter().enumerate() {
         if let Some(p) = state.players.get_mut(pid) {
             if p.seat_num == 99 {
@@ -702,6 +579,7 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
         }
     }
 
+    // 7. Cập nhật Dealer
     if let Some(did) = payload.get("dealerID").and_then(|v| v.as_str()) {
         state.dealer_id = Some(did.to_string());
     }
@@ -715,7 +593,7 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
         }
     }
 
-    // 🟢 Đọc gói "pGS" (fold / allIn) TRƯỚC "tB" để biết chính xác entry.is_all_in!
+    // 8. Đọc trạng thái Fold / All-In ("pGS") trước "tB"
     if let Some(pgs_obj) = payload.get("pGS").and_then(|v| v.as_object()) {
         for (pid, sval) in pgs_obj {
             let entry = state.players.entry(pid.clone()).or_insert_with(|| PlayerTracker { id: pid.clone(), ..Default::default() });
@@ -726,6 +604,7 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
         }
     }
 
+    // 9. Cập nhật tiền cược hiện tại ("tB") và ghi nhận hành vi Tố vào Action History
     if let Some(tb_obj) = payload.get("tB").and_then(|v| v.as_object()) {
         for (pid, bval) in tb_obj {
             let entry = state.players.entry(pid.clone()).or_insert_with(|| PlayerTracker { id: pid.clone(), ..Default::default() });
@@ -736,7 +615,7 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
                     let delta = new_bet - prev_bet;
                     entry.total_contributed += delta;
 
-                    // Nếu người chơi này cược vượt mức highest_bet trước đó -> Họ vừa Bet / Raise!
+                    // Nếu cược vượt mức highest_bet trước đó -> Ghi nhận Bet / Raise
                     if new_bet > prev_highest && (state.street != Street::Preflop || new_bet > state.bb_size) {
                         if pid != &state.hero_id {
                             state.has_evaluated_this_decision = false;
@@ -770,6 +649,7 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
         }
     }
 
+    // 10. Danh sách người chơi còn trong ván ("iHPI")
     if let Some(ihpi) = payload.get("iHPI").and_then(|v| v.as_array()) {
         let active_set: std::collections::HashSet<String> = ihpi.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
         if !active_set.is_empty() {
@@ -779,23 +659,28 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
         }
     }
 
+    // 11. Bài chung trên bàn ("oTC") - Sắp xếp khóa để đảm bảo thứ tự Flop -> Turn -> River
     if let Some(otc) = payload.get("oTC").and_then(|v| v.as_object()) {
+        let mut sorted_keys: Vec<&String> = otc.keys().collect();
+        sorted_keys.sort();
         let mut new_board = Vec::new();
-        for (_k, c_arr) in otc {
-            if let Some(arr) = c_arr.as_array() {
+        for k in sorted_keys {
+            if let Some(arr) = otc.get(k).and_then(|v| v.as_array()) {
                 for item in arr {
-                    if let Some(s) = item.as_str() { if let Some(c) = robust_parse_card(s) { new_board.push(c); } }
+                    if let Some(s) = item.as_str() { 
+                        if let Some(c) = robust_parse_card(s) { new_board.push(c); } 
+                    }
                 }
             }
         }
-        if new_board.len() > state.community_cards.len() {
-            let board_str: Vec<String> = new_board.iter().map(|c| format!("{}", c)).collect();
-            println!("🎴 [BÀI CHUNG]: [ {} ]", board_str.join(" "));
+        if !new_board.is_empty() && new_board != state.community_cards {
+            println!("🎴 [BÀI CHUNG MỚI]: {:?}", new_board);
             state.community_cards = new_board;
             state.has_evaluated_this_decision = false;
         }
     }
 
+    // 12. Bài tẩy ("pC")
     if let Some(pc_obj) = payload.get("pC").and_then(|v| v.as_object()) {
         for (pid, cdata) in pc_obj {
             let is_showdown = cdata
@@ -819,6 +704,7 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
         }
     }
 
+    // 13. Người chơi đến lượt hành động ("pITT" hoặc "cPI")
     let current_actor = payload.get("pITT").or_else(|| payload.get("cPI")).and_then(|v| v.as_str());
 
     if let Some(actor) = current_actor {
@@ -849,7 +735,18 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
     None
 }
 
-fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy, mode: DecisionMode, use_os_enigo: bool) -> Option<InPageAction> {
+// =========================================================================
+// 5. GTO DECISION & NEURAL NETWORK INFERENCE
+// =========================================================================
+
+pub fn run_gto_evaluation(
+    state: &HandState, 
+    hole: [Card; 2], 
+    policy: &DeepCFRPolicy, 
+    mode: DecisionMode, 
+    use_os_enigo: bool
+) -> Option<InPageAction> {
+    // Sắp xếp người chơi theo số ghế tăng dần theo chiều kim đồng hồ quanh bàn
     let mut sorted_players: Vec<&PlayerTracker> = state.players.values().collect();
     sorted_players.sort_by_key(|p| p.seat_num);
 
@@ -907,12 +804,21 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
         state.players.get(*pid).is_some_and(|pl| !pl.is_folded)
     }).count();
 
-    let button_idx = if let Some(ref did) = state.dealer_id { active_seats.iter().position(|id| id == did).unwrap_or(0) } else { 0 };
+    // Xác định Button Index với cơ chế fallback nếu dealer_id chưa tới
+    let button_idx = if let Some(ref did) = state.dealer_id { 
+        active_seats.iter().position(|id| id == did).unwrap_or(0) 
+    } else if let Some(d_seat) = state.dealer_seat {
+        active_seats.iter().position(|id| state.players.get(id).map(|p| p.seat_num) == Some(d_seat)).unwrap_or(0)
+    } else { 
+        0 
+    };
+
     let mut env = Environment::new(num_players, &initial_stacks, state.bb_size, state.sb_size, button_idx);
 
     let true_table_pot = (state.pn_total_pot + sum_current_bets).max(state.bb_size + state.sb_size);
     let safe_min_raise = state.min_raise.max(state.bb_size);
     
+    // ĐỒNG BỘ TOÀN DIỆN MÔI TRƯỜNG ĐẦY ĐỦ VÀO ENGINE
     env.state.pot = true_table_pot;
     env.state.current_highest_bet = actual_highest_bet;
     env.state.min_raise = safe_min_raise;
@@ -921,6 +827,8 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     env.state.current_player_idx = hero_seat;
     env.state.button_idx = button_idx;
     env.state.players = env_players;
+
+    // Ánh xạ chính xác lịch sử cược (action_history) theo player_id sang seat index trong Environment
     env.state.action_history = state.action_history.iter().filter_map(|rec| {
         let idx = active_seats.iter().position(|id| id == &rec.player_id)?;
         Some(ActionRecord {
@@ -936,6 +844,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     let to_call = actual_highest_bet.saturating_sub(hero_bet);
     let max_total_bet = state.hero_mavtb.unwrap_or(hero_stack_behind + hero_bet);
 
+    // Kiểm tra tính khả thi thực tế trên PokerNow UI
     let has_opp_with_chips = state.players.iter().any(|(pid, p)| {
         let opp_stack_behind = if p.is_all_in {
             0
@@ -948,9 +857,10 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     let mavtb_allows_raise = state.hero_mavtb.is_none_or(|m| m > actual_highest_bet);
     let can_raise = has_opp_with_chips && has_chips_to_raise && mavtb_allows_raise;
 
+    // Lấy ActionMask thuần túy từ engine tính toán
     let mut mask = env.get_action_mask();
 
-    // Chỉ hạn chế tố nếu trên bàn đối thủ đã All-In hết hoặc PokerNow UI giới hạn (mAVTB)
+    // Chỉ hạn chế tố nếu đối thủ đã All-In hết hoặc UI PokerNow (mAVTB) không cho phép
     if !can_raise {
         mask.0 &= !((1 << Action::BetSmall.to_index())
             | (1 << Action::BetPot33.to_index())
@@ -958,6 +868,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
             | (1 << Action::AllIn.to_index()));
     }
 
+    // NẠP VECTO ĐẶC TRƯNG VÀ TÍNH TOÁN BẰNG MẠNG NƠ-RON
     let features = env.state.encode_features(hero_seat);
 
     // 🛡️ CHỐT CHẶN CHỐNG ALL-IN BÀI RÁC Ở PREFLOP (ANTI-TRASH SHOVE GUARD):
@@ -1013,9 +924,47 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     }
     
     let call_status = if to_call == 0 { "(Đang check)" } else { "" };
-    println!("💰 Tổng Pot thực tế: {} chip | Cần Call: {} chip {}", true_table_pot, to_call, call_status);
+    println!("💰 Tổng Pot thực tế: {} chip | Cần Call: {} chip {} | Blind: {}/{} chip", true_table_pot, to_call, call_status, state.sb_size, state.bb_size);
+
+    let eff_bb = env.state.effective_stack_bb(hero_seat);
+    let eff_chips = (eff_bb * state.bb_size as f32).round() as u32;
+    println!("⚡ Effective Stack : {} chip ({:.1} BB)", eff_chips, eff_bb);
+
+    println!("🏦 [STACK CHIP THỰC TẾ]:");
+    for pid in &active_seats {
+        if let Some(p) = state.players.get(pid) {
+            let is_hero = pid == &state.hero_id;
+            let display_name = if !p.name.is_empty() && p.name != "Player" {
+                p.name.clone()
+            } else {
+                format!("Ghế #{}", p.seat_num)
+            };
+            let who = if is_hero { format!("{} (Hero)", display_name) } else { display_name };
+            let true_stack = if p.is_all_in {
+                0
+            } else {
+                p.stack.saturating_sub(p.current_bet)
+            };
+            let stack_bb = if state.bb_size > 0 { true_stack as f32 / state.bb_size as f32 } else { 0.0 };
+            let status_str = if p.is_all_in {
+                if p.current_bet > 0 {
+                    format!(" [ALL-IN {} chip]", p.current_bet)
+                } else {
+                    " [ALL-IN]".to_string()
+                }
+            } else if p.is_folded {
+                " [FOLD]".to_string()
+            } else if p.current_bet > 0 {
+                format!(" (Đang cược {} chip)", p.current_bet)
+            } else {
+                String::new()
+            };
+            println!("   • Ghế #{:<2} {:<16} : {:>6} chip ({:>5.1} BB){}", 
+                p.seat_num, who, true_stack, stack_bb, status_str);
+        }
+    }
     
-    // 📜 IN THÔNG TIN LỊCH SỬ HÀNH ĐỘNG (ACTION HISTORY) - CHỈ IN KHI ĐẾN LƯỢT HERO
+    // In Lịch sử cược rõ ràng, phản ánh trung thực số chip cược thực tế
     if state.action_history.is_empty() {
         println!("📜 [LỊCH SỬ CƯỢC]: Chưa có cú Bet/Raise nào (Chỉ có Post Blind hoặc Check)");
     } else {
@@ -1040,7 +989,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
         }
     }
 
-    // In tổng chip đã đóng góp vào Pot của từng người chơi theo thứ tự ghế ngồi
+    // In tổng chip đã đóng góp vào Pot theo tên người chơi & thứ tự ghế
     let mut active_p_list: Vec<&PlayerTracker> = state.players.values().collect();
     active_p_list.sort_by_key(|p| p.seat_num);
     let mut contrib_str = Vec::new();
@@ -1065,7 +1014,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     }
     println!("------------------------------------------------------------");
 
-    // LỌC VÀ CHUẨN HÓA XÁC SUẤT THEO GTO MIXED STRATEGY
+    // Lọc và chuẩn hóa xác suất GTO
     let mut clean_probs = [0.0f32; NUM_ACTIONS];
     let mut sum_clean = 0.0f32;
     for (i, &p) in probs.iter().enumerate().take(NUM_ACTIONS) {
@@ -1078,45 +1027,74 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     if sum_clean <= 1e-4 {
         for (i, &p) in probs.iter().enumerate().take(NUM_ACTIONS) {
             if mask.is_index_valid(i) {
-                clean_probs[i] = p.max(0.01);
-                sum_clean += clean_probs[i];
+                clean_probs[i] = p;
+                sum_clean += p;
             }
         }
     }
     if sum_clean > 0.0 {
-        for p in &mut clean_probs {
-            *p /= sum_clean;
-        }
+        for p in &mut clean_probs { *p /= sum_clean; }
     }
 
-    // CHỌN HÀNH ĐỘNG THEO CHẾ ĐỘ
+    // Ra quyết định theo chế độ đã cấu hình
     let (chosen_idx, decision_note) = match mode {
         DecisionMode::PureMaxEv => {
-            // 1. PURE MAX-EV GREEDY (Argmax)
-            let mut b_idx = 0;
-            let mut b_ev = f32::NEG_INFINITY;
-            for (i, &adv) in raw_adv.iter().enumerate().take(NUM_ACTIONS) {
-                if mask.is_index_valid(i)
-                    && (adv > b_ev + 1e-4 || ((adv - b_ev).abs() <= 1e-4 && clean_probs[i] > clean_probs[b_idx]))
-                {
-                    b_ev = adv;
-                    b_idx = i;
+            // 1. Tìm mức EV cao nhất trong các action hợp lệ
+            let mut max_ev = f32::NEG_INFINITY;
+            for (i, &ev) in raw_adv.iter().enumerate().take(NUM_ACTIONS) {
+                if mask.is_index_valid(i) && ev > max_ev {
+                    max_ev = ev;
                 }
             }
-            (b_idx, "⚡ [MAX-EV GREEDY] Luôn chọn nước có EV cao nhất".to_string())
+
+            // 2. Lọc các action co-optimal (EV nằm trong phạm vi sai số delta = 0.015 EV).
+            // Trong các ứng viên ngang ngửa EV này, ưu tiên action có Tần suất GTO (clean_probs) cao nhất!
+            // Nếu tần suất GTO cũng xấp xỉ nhau, ưu tiên action có EV cao hơn.
+            let ev_tolerance = 0.015f32;
+            let mut best_i = 0;
+            let mut best_gto_p = -1.0f32;
+            let mut best_ev = f32::NEG_INFINITY;
+
+            for (i, &ev) in raw_adv.iter().enumerate().take(NUM_ACTIONS) {
+                if !mask.is_index_valid(i) { continue; }
+                if ev >= max_ev - ev_tolerance {
+                    let p = clean_probs[i];
+                    if p > best_gto_p + 1e-4 {
+                        best_gto_p = p;
+                        best_i = i;
+                        best_ev = ev;
+                    } else if (p - best_gto_p).abs() <= 1e-4 && ev > best_ev {
+                        best_i = i;
+                        best_ev = ev;
+                    }
+                }
+            }
+
+            let best_act = Action::from_index(best_i).unwrap();
+            let note = if (max_ev - best_ev).abs() > 1e-4 {
+                format!(
+                    "⚡ [THUẦN EV MAX + GTO TIE-BREAK] Ưu tiên GTO ({:.1}%): {:?} (EV: {:>+6.2}, ngang ngửa Max EV {:>+6.2})",
+                    best_gto_p * 100.0, best_act, best_ev, max_ev
+                )
+            } else {
+                format!(
+                    "⚡ [THUẦN EV MAX] Nước đi tối đa kỳ vọng: {:?} (EV: {:>+6.2}, Tần suất GTO: {:.1}%)",
+                    best_act, best_ev, best_gto_p * 100.0
+                )
+            };
+            (best_i, note)
         }
         DecisionMode::PureGtoRoll => {
-            // 2. PURE GTO RANDOM ROLL (WeightedIndex trên toàn bộ clean_probs)
             let mut rng = rand::thread_rng();
             let idx = if let Ok(dist) = rand::distributions::WeightedIndex::new(clean_probs) {
                 use rand::distributions::Distribution;
                 dist.sample(&mut rng)
             } else {
                 let mut b_idx = 0;
-                let mut b_p = -1.0;
+                let mut m_p = -1.0;
                 for (i, &p) in clean_probs.iter().enumerate() {
-                    if mask.is_index_valid(i) && p > b_p {
-                        b_p = p;
+                    if p > m_p {
+                        m_p = p;
                         b_idx = i;
                     }
                 }
@@ -1125,13 +1103,8 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
             (idx, format!("🎲 [PURE GTO ROLL] Tung xúc xắc theo % lý thuyết ({:.1}%)", clean_probs[idx] * 100.0))
         }
         DecisionMode::GuardedMixing => {
-            // 3. TOP-EV GUARDED MIXING:
-            //   - Phòng hộ: Khóa mọi action tự sát (đặc biệt là All-In rác)
-            //   - Vượt trội: Nếu 1 nước chênh > 0.35 BB, chọn thẳng 100%
-            //   - Bảo vệ range: Nếu nhiều nước xấp xỉ EV, tung xúc xắc theo % GTO đã tái chuẩn hóa
             let mut rng = rand::thread_rng();
 
-            // Tìm EV cao nhất trong các action hợp lệ
             let mut ev_max = f32::NEG_INFINITY;
             let mut best_ev_idx = 0;
             for (i, &ev) in raw_adv.iter().enumerate().take(NUM_ACTIONS) {
@@ -1141,8 +1114,8 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
                 }
             }
 
-            let delta_general = 0.20; // Ngưỡng dung sai EV thông thường (0.20 BB)
-            let delta_allin = 0.08;   // Ngưỡng cực kỳ khắt khe cho All-In (0.08 BB) để triệt tiêu All-in ngớ ngẩn
+            let delta_general = 0.20;
+            let delta_allin = 0.08;
 
             let mut safe_candidates = Vec::new();
             let mut blocked_suicidal = Vec::new();
@@ -1164,12 +1137,10 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
                 }
             }
 
-            // A. Trường hợp ưu thế áp đảo (> 0.35 BB) hoặc chỉ có 1 ứng viên an toàn duy nhất:
             if ev_max - second_best_ev > 0.35 || safe_candidates.len() <= 1 {
                 let note = format!("⚡ [ƯU THẾ ÁP ĐẢO] EV vượt trội rõ ràng (+{:.2} so với {:+.2}) -> Chọn 100%", ev_max, second_best_ev);
                 (best_ev_idx, note)
             } else {
-                // B. Trường hợp các nước đi tương đương EV: Tung xúc xắc bảo vệ range!
                 let mut guarded_probs = [0.0f32; NUM_ACTIONS];
                 let mut sum_guarded = 0.0f32;
                 for &idx in &safe_candidates {
@@ -1213,10 +1184,9 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
             Action::Fold => "0".to_string(),
             Action::CheckCall => {
                 if to_call == 0 { "Check".to_string() } 
-                else if hero_stack_behind <= to_call { format!("Call All-in ({})", hero_stack_behind) } 
                 else { format!("Call {}", to_call) }
-            },
-            Action::AllIn => format!("All-In ({})", max_total_bet),
+            }
+            Action::AllIn => format!("All-In ({})", hero_stack_behind),
             Action::BetSmall | Action::BetPot33 | Action::BetPot75 => {
                 let frac = match act { 
                     Action::BetSmall => 0.15,
@@ -1232,14 +1202,14 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
         }
     };
 
-    println!("📊 KHUYẾN NGHỊ TỪ GTO SOLVER (MIXED STRATEGY):");
+    println!("📊 BẢNG ĐÁNH GIÁ NƯỚC ĐI [THUẦN EV MAX]:");
     for (i, &p) in probs.iter().enumerate() {
         let act = Action::from_index(i).unwrap();
         let is_valid = mask.is_index_valid(i);
         let rec = if is_valid && i == chosen_idx { 
             match mode {
+                DecisionMode::PureMaxEv => " ⭐ TỐI ĐA EV (ƯU TIÊN GTO)",
                 DecisionMode::GuardedMixing => " ⭐ ĐÃ CHỌN (GUARDED)",
-                DecisionMode::PureMaxEv => " ⭐ TỐI ĐA EV (CHỌN)",
                 DecisionMode::PureGtoRoll => " ⭐ ĐÃ ROLL TRÚNG",
             }
         } else { 
@@ -1264,16 +1234,16 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
         let raw_val = raw_adv.get(i).copied().unwrap_or(0.0);
         let chip_desc = get_action_desc(act);
 
-        println!("    {:<14}: {:>5.1}% (EV: {:>+6.2}) | [{:<15}]{}{}", act.name(), p * 100.0, raw_val, chip_desc, rec, status);
+        println!("    {:<14}: EV: {:>+6.2} (Tần suất GTO: {:>5.1}%) | [{:<15}]{}{}", act.name(), raw_val, p * 100.0, chip_desc, rec, status);
     }
     
     if let Some(act) = Action::from_index(chosen_idx) {
         println!("{}", decision_note);
-        println!("👉 Quyết định cuối cùng: {:?} (EV: {:>+6.2} | Tần suất GTO: {:.1}%)", act, raw_adv.get(chosen_idx).copied().unwrap_or(0.0), clean_probs[chosen_idx] * 100.0);
+        println!("👉 Quyết định cuối cùng: {:?} (EV: {:>+6.2})", act, raw_adv.get(chosen_idx).copied().unwrap_or(0.0));
     }
     println!("============================================================\n");
 
-    // TỰ ĐỘNG THỰC THI HÀNH ĐỘNG ĐÃ ROLL ĐƯỢC LÊN GIAO DIỆN
+    // Đóng gói lệnh hành động gửi sang Browser hoặc gõ Enigo
     if let Some(best_action) = Action::from_index(chosen_idx) {
         let mut target_total = actual_highest_bet;
         match best_action {
@@ -1305,11 +1275,19 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
             best_action
         };
 
+        let delay_ms: u64 = rand::thread_rng().gen_range(1500..=3000);
+        println!(
+            "⏳ [HUMAN DELAY] Đã tạo độ trễ ngẫu nhiên: {}ms ({:.2}s) trước khi thực hiện nước đi...",
+            delay_ms,
+            delay_ms as f64 / 1000.0
+        );
+
         let in_page_cmd = match safe_action {
             Action::Fold => InPageAction {
                 action: "fold".to_string(),
                 amount: 0,
                 to_call: 0,
+                delay_ms,
             },
             Action::CheckCall => {
                 if to_call == 0 {
@@ -1317,12 +1295,14 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
                         action: "check".to_string(),
                         amount: 0,
                         to_call: 0,
+                        delay_ms,
                     }
                 } else {
                     InPageAction {
                         action: "call".to_string(),
                         amount: to_call,
                         to_call,
+                        delay_ms,
                     }
                 }
             }
@@ -1330,6 +1310,7 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
                 action: "all_in".to_string(),
                 amount: max_total_bet,
                 to_call,
+                delay_ms,
             },
             Action::BetSmall | Action::BetPot33 | Action::BetPot75 => {
                 let final_bet = target_total.min(max_total_bet);
@@ -1338,25 +1319,179 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
                         action: "all_in".to_string(),
                         amount: max_total_bet,
                         to_call,
+                        delay_ms,
                     }
                 } else {
                     InPageAction {
                         action: "raise".to_string(),
                         amount: final_bet,
                         to_call,
+                        delay_ms,
                     }
                 }
             }
         };
 
         if use_os_enigo {
-            execute_bot_action(safe_action, to_call, target_total, max_total_bet, can_raise);
+            thread::spawn(move || {
+                println!("⏳ [ENIGO DELAY] Đang đợi {:.2}s trước khi gõ phím...", delay_ms as f64 / 1000.0);
+                thread::sleep(Duration::from_millis(delay_ms));
+                execute_bot_action(safe_action, to_call, target_total, max_total_bet, can_raise);
+            });
         } else {
-            println!("🥷 [SILENT MODE] Lệnh hành động đã gửi ngầm sang Browser: {:?} (Số chip: {})", in_page_cmd.action.to_uppercase(), in_page_cmd.amount);
+            println!(
+                "🥷 [SILENT MODE] Lệnh hành động đã gửi ngầm sang Browser: {:?} (Số chip: {}, Trễ: {:.2}s)",
+                in_page_cmd.action.to_uppercase(),
+                in_page_cmd.amount,
+                delay_ms as f64 / 1000.0
+            );
         }
 
         return Some(in_page_cmd);
     }
 
     None
+}
+
+// =========================================================================
+// 6. MAIN SERVER & APPLICATION ENTRY POINT
+// =========================================================================
+
+fn main() {
+    println!("============================================================");
+    println!("⚡ POKERNOW REAL-TIME ASSISTANT & AUTO-BOT [THUẦN EV MAX] (v3)");
+    println!("============================================================");
+
+    // Cấu hình URL / ID phòng game để tự động focus
+    let default_game = "https://www.pokernow.com/games/pglq3HyXKRV6Klg6v5XNQA0_i";
+    let mut target_url = default_game.to_string();
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if (args[i] == "--game-url" || args[i] == "--game-id" || args[i] == "-g") && i + 1 < args.len() {
+            target_url = args[i + 1].clone();
+            i += 1;
+        }
+        i += 1;
+    }
+    set_target_game(&target_url);
+    println!("🎮 Target Game URL: {}", target_url);
+    if let Ok(id) = TARGET_GAME_ID.read() {
+        println!("🔑 Target Game ID:  [{}]", *id);
+    }
+
+    print!("📐 Nạp bảng Preflop Equity... ");
+    std::io::stdout().flush().unwrap();
+    let _ = poker_tournament::equity::preflop_table();
+    println!("✅ Xong!");
+
+    print!("🧠 Nạp mô hình AI... ");
+    std::io::stdout().flush().unwrap();
+    let adv_mlp = MLP::load_from_file(ADV_MODEL_PATH).expect("Lỗi nạp deep_cfr_model_tour.json");
+    let strat_mlp = MLP::load_from_file(STRAT_MODEL_PATH).ok();
+    println!("✅ Xong! (Strategy Net: {})", if strat_mlp.is_some() { "Có" } else { "Không" });
+
+    let policy = DeepCFRPolicy::with_strategy(Arc::new(RwLock::new(adv_mlp)), strat_mlp, true);
+    let decision_mode = if std::env::args().any(|a| a == "--roll") {
+        DecisionMode::PureGtoRoll
+    } else if std::env::args().any(|a| a == "--guarded") {
+        DecisionMode::GuardedMixing
+    } else {
+        DecisionMode::PureMaxEv // Mặc định: Đánh thuần theo EV Max!
+    };
+    let use_os_enigo = std::env::args().any(|a| a == "--enigo" || a == "--use-enigo");
+
+    let listener = TcpListener::bind("127.0.0.1:3000").expect("Không thể mở cổng 3000");
+    println!("🌐 Server sẵn sàng tại http://127.0.0.1:3000");
+    let mode_desc = match decision_mode {
+        DecisionMode::PureMaxEv => "⚡ THUẦN THEO EV MAX (Argmax EV / Advantage - Chọn 100% nước đi có kỳ vọng cao nhất, Không Roll xúc xắc) 🚀",
+        DecisionMode::GuardedMixing => "🛡️ TOP-EV GUARDED MIXING (Bảo vệ range + Chống All-in ngớ ngẩn + Trọng số EV-GTO)",
+        DecisionMode::PureGtoRoll => "🎲 PURE GTO ROLL (Tung xúc xắc theo % GTO nguyên bản)",
+    };
+    println!("🎯 Chế độ ra quyết định: {}", mode_desc);
+    println!("🔇 Chế độ thực thi: {}", if use_os_enigo { "🖥️ OS Keyboard (Enigo - Cần cửa sổ focus)" } else { "🥷 100% SILENT IN-PAGE (Tampermonkey DOM - Không chiếm chuột, không chiếm phím, vừa làm việc vừa chơi)" });
+    println!("👀 Đang theo dõi, đồng bộ PokerNow và bật Auto-Bot...\n");
+
+    let mut state = HandState::new();
+
+    for mut stream in listener.incoming().flatten() {
+        let mut raw_data = Vec::with_capacity(16384);
+        let mut temp_buf = [0u8; 8192];
+
+        while let Ok(n) = stream.read(&mut temp_buf) {
+            if n == 0 { break; }
+            raw_data.extend_from_slice(&temp_buf[..n]);
+
+            if let Some(header_end) = raw_data.windows(4).position(|w| w == b"\r\n\r\n") {
+                let header_str = String::from_utf8_lossy(&raw_data[..header_end]);
+
+                if header_str.starts_with("OPTIONS") {
+                    let response = "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+                    let _ = stream.write_all(response.as_bytes());
+                    break;
+                }
+
+                let mut content_len = 0usize;
+                for line in header_str.lines() {
+                    if line.to_lowercase().starts_with("content-length:") {
+                        if let Some(val_str) = line.split(':').nth(1) {
+                            content_len = val_str.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+
+                if raw_data.len() >= header_end + 4 + content_len {
+                    let body_slice = &raw_data[header_end + 4 .. header_end + 4 + content_len];
+                    let body_str = String::from_utf8_lossy(body_slice);
+                    let trimmed = body_str.trim();
+
+                    let mut pending_action: Option<InPageAction> = None;
+                    if !trimmed.is_empty() {
+                        if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+                            if let Some(arr) = val.as_array() {
+                                if arr.len() >= 2 {
+                                    let event_name = arr[0].as_str().unwrap_or("");
+                                    let payload = &arr[1];
+                                    if event_name == "registered" {
+                                        if let Some(cp) = payload.get("currentPlayer") {
+                                            if let Some(id) = cp.get("id").and_then(|v| v.as_str()) {
+                                                state.hero_id = id.to_string();
+                                                let name = cp.get("networkUsername").or_else(|| cp.get("name")).and_then(|v| v.as_str()).unwrap_or("Hero");
+                                                println!("👤 Đã kết nối: {} | Hero ID: [{}]", name, id);
+                                            }
+                                        }
+
+                                        if let Some(gs) = payload.get("gameState") {
+                                            pending_action = process_game_update(&mut state, gs, &policy, decision_mode, use_os_enigo);
+                                        }
+                                    } else if event_name == "gC" {
+                                        pending_action = process_game_update(&mut state, payload, &policy, decision_mode, use_os_enigo);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let mut resp_map = serde_json::Map::new();
+                    resp_map.insert("status".to_string(), serde_json::Value::String("ok".to_string()));
+                    if let Some(ref cmd) = pending_action {
+                        if let Ok(v) = serde_json::to_value(cmd) {
+                            resp_map.insert("bot_action".to_string(), v);
+                        }
+                    }
+
+                    let resp_body = serde_json::to_string(&serde_json::Value::Object(resp_map))
+                        .unwrap_or_else(|_| r#"{"status":"ok"}"#.to_string());
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                    break;
+                }
+            }
+        }
+    }
 }

@@ -185,8 +185,8 @@
     // =========================================================================
     // 💬 HỆ THỐNG GỬI TIN NHẮN CHAT TỰ ĐỘNG (BẤM 'M' -> FOCUS -> NHẬP -> ENTER)
     // =========================================================================
-    const BOT_RESEARCH_NOTICE = "Notice: You are playing against an AI bot for research purposes only.";
-    let hasAnnouncedChat = false;
+    const BOT_RESEARCH_NOTICE = "";
+    let hasAnnouncedChat = true;
 
     function findChatInput() {
         // Selector chính xác theo thuộc tính của PokerNow:
@@ -521,13 +521,15 @@
     // 🌐 GIAO TIẾP VỚI RUST BACKEND (:3000)
     // =========================================================================
 
+    let pendingActionTimeout = null;
+
     function sendToRust(payload) {
         GM_xmlhttpRequest({
             method: "POST",
             url: "http://127.0.0.1:3000/packet",
             headers: { "Content-Type": "application/json" },
             data: payload,
-            timeout: 2000,
+            timeout: 5000,
             onload: function(response) {
                 try {
                     const data = JSON.parse(response.responseText);
@@ -537,8 +539,16 @@
                         sendInPageChat(data.chat_message);
                     }
                     if (data && data.bot_action) {
+                        if (pendingActionTimeout) {
+                            clearTimeout(pendingActionTimeout);
+                        }
+                        const delay = data.bot_action.delay_ms || (Math.floor(Math.random() * 2001) + 3000);
                         console.log("📥 [SILENT BOT] Nhận lệnh từ Rust:", data.bot_action);
-                        executeSilentAction(data.bot_action);
+                        console.log(`⏳ [HUMAN DELAY] Đợi ${(delay / 1000).toFixed(1)}s trước khi thực hiện lệnh...`);
+                        pendingActionTimeout = setTimeout(() => {
+                            executeSilentAction(data.bot_action);
+                            pendingActionTimeout = null;
+                        }, delay);
                     }
                 } catch(e) {
                     console.error("❌ Lỗi parse response từ Rust:", e);

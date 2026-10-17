@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Senior Systems Architect"]
 description = "High-Performance Texas Hold'em 2-8 Player GTO Self-Play Simulator"
+default-run = "poker_tournament"
 
 [dependencies]
 rand = "0.8"

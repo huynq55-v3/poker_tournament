@@ -1,0 +1,643 @@
+// ==UserScript==
+// @name         PokerStars Universal WebSocket Sniffer & Silent Auto-Bot (v2.0)
+// @namespace    http://tampermonkey.net/
+// @version      2.0
+// @description  Bắt trọn 100% gói tin 2 chiều & Tự động click/nhập chip ngầm trong tab PokerStars Web (AngularJS DOM Auto-Player)
+// @match        *://*.pokerstars.com/*
+// @match        *://*.pokerstars.net/*
+// @match        *://*.pokerstars.eu/*
+// @match        *://*.pokerstars.uk/*
+// @match        *://*.pokerstars.bet/*
+// @match        *://*.pokerstars.*/*
+// @match        *://*.starsweb.*/*
+// @match        *://play.pokerstars.*/*
+// @run-at       document-start
+// @allFrames    true
+// @grant        unsafeWindow
+// @grant        GM_xmlhttpRequest
+// @connect      127.0.0.1
+// @connect      localhost
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    console.log("🕵️‍♂️ [POKERSTARS SNIFFER] Script khởi động! Đang hook WebSocket hai chiều...");
+
+    const win = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+    const NativeWebSocket = win.WebSocket;
+
+    const DUMP_URL = "http://127.0.0.1:3002/packet";
+
+    let pendingActionTimeout = null;
+
+    // =========================================================================
+    // 🥷 TỰ ĐỘNG THAO TÁC TRÊN BÀN POKERSTARS (IN-PAGE ANGULAR DOM CLICKER)
+    // =========================================================================
+
+    function isElementVisible(el) {
+        if (!el) return false;
+        if (el.disabled || el.getAttribute('disabled') !== null) return false;
+        if (el.getAttribute('aria-hidden') === 'true') return false;
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) return true;
+        return el.offsetParent !== null;
+    }
+
+    function clickElement(el) {
+        if (!el) return false;
+        try {
+            el.focus();
+            ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(evtName => {
+                try {
+                    const ev = new MouseEvent(evtName, {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window
+                    });
+                    el.dispatchEvent(ev);
+                } catch (err) {}
+            });
+            if (typeof el.click === 'function') {
+                el.click();
+            }
+            return true;
+        } catch (e) {
+            try {
+                el.click();
+                return true;
+            } catch (e2) {
+                console.error("❌ [POKERSTARS BOT] Lỗi click nút:", e2);
+                return false;
+            }
+        }
+    }
+
+    function queryAllContexts(selector) {
+        let results = [];
+        try {
+            results = Array.from(document.querySelectorAll(selector));
+        } catch(e) {}
+        try {
+            const iframes = Array.from(document.querySelectorAll('iframe'));
+            for (const f of iframes) {
+                try {
+                    const doc = f.contentDocument || (f.contentWindow && f.contentWindow.document);
+                    if (doc) {
+                        results = results.concat(Array.from(doc.querySelectorAll(selector)));
+                    }
+                } catch(e) {}
+            }
+        } catch(e) {}
+        return results;
+    }
+
+    function findBetInput() {
+        const selectors = [
+            'input.action-slider-val-input',
+            'input[ng-model="model.raiseAmountInputText"]',
+            'input[ng-model*="raiseAmountInputText"]',
+            '.action-slider-val-input',
+            'input[keyboard-resize]',
+            'table-action-btns-primaries input[type="text"]',
+            'input[pattern="[0-9\\.]*"]'
+        ];
+        for (const sel of selectors) {
+            const els = queryAllContexts(sel);
+            for (const el of els) {
+                if (isElementVisible(el)) return el;
+            }
+            if (els.length > 0 && els[0].isConnected) return els[0];
+        }
+        return null;
+    }
+
+    function setAngularInputValue(inputEl, value) {
+        if (!inputEl) {
+            console.error("❌ [SET INPUT] Không tìm thấy phần tử input cược!");
+            return false;
+        }
+        const strVal = String(value);
+        console.log(`✍️ [SET INPUT] Đang điền ${strVal} vào ô cược:`, inputEl);
+
+        const win = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+
+        // 1. Kích hoạt Focus và FocusEvent
+        try {
+            inputEl.focus();
+            inputEl.dispatchEvent(new (win.FocusEvent || FocusEvent)('focus', { bubbles: true }));
+        } catch(e) {}
+
+        // 2. Select toàn bộ nội dung hiện có
+        try {
+            inputEl.select();
+            if (typeof inputEl.setSelectionRange === 'function') {
+                inputEl.setSelectionRange(0, inputEl.value.length);
+            }
+        } catch(e) {}
+
+        // 3. Browser-native execCommand (mô phỏng gõ phím thật từ engine Chromium)
+        try {
+            document.execCommand('selectAll', false, null);
+            document.execCommand('delete', false, null);
+            document.execCommand('insertText', false, strVal);
+        } catch(e) {}
+
+        // 4. Native Prototype Property Setter
+        try {
+            const proto = (win.HTMLInputElement && win.HTMLInputElement.prototype) || window.HTMLInputElement.prototype;
+            const nativeSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set
+                || Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+            if (nativeSetter) {
+                nativeSetter.call(inputEl, strVal);
+            } else {
+                inputEl.value = strVal;
+            }
+        } catch(e) {
+            inputEl.value = strVal;
+        }
+
+        // 5. Kích hoạt chuỗi sự kiện DOM hoàn chỉnh
+        const Evt = win.Event || Event;
+        const InputEvt = win.InputEvent || InputEvent;
+        const KeyEvt = win.KeyboardEvent || KeyboardEvent;
+
+        try {
+            inputEl.dispatchEvent(new InputEvt('beforeinput', {
+                bubbles: true,
+                cancelable: true,
+                data: strVal,
+                inputType: 'insertText'
+            }));
+        } catch(e) {}
+        inputEl.dispatchEvent(new Evt('input', { bubbles: true, cancelable: true }));
+        inputEl.dispatchEvent(new Evt('change', { bubbles: true, cancelable: true }));
+        inputEl.dispatchEvent(new KeyEvt('keydown', { bubbles: true, key: 'Enter', keyCode: 13, which: 13 }));
+        inputEl.dispatchEvent(new KeyEvt('keyup', { bubbles: true, key: 'Enter', keyCode: 13, which: 13 }));
+
+        // 6. CANONICAL ANGULARJS 1.X CONTROLLER & SCOPE SYNC
+        try {
+            const ng = win.angular;
+            if (ng && ng.element) {
+                const ngEl = ng.element(inputEl);
+
+                // A. Gọi ngModelController (cơ chế chuẩn của ng-model)
+                const ngModel = ngEl.controller('ngModel') || ngEl.data('$ngModelController');
+                if (ngModel) {
+                    console.log("🎯 [ANGULAR ngModelController] Gọi $setViewValue và $commitViewValue:", strVal);
+                    ngModel.$setViewValue(strVal);
+                    ngModel.$setDirty();
+                    ngModel.$setTouched();
+                    if (typeof ngModel.$commitViewValue === 'function') {
+                        ngModel.$commitViewValue();
+                    }
+                    ngModel.$render();
+                }
+
+                // B. Duyệt cây Scope tìm model.raiseAmountInputText
+                let curScope = ngEl.scope() || ngEl.isolateScope();
+                let depth = 0;
+                while (curScope && depth < 10) {
+                    let updated = false;
+                    if (curScope.model && typeof curScope.model === 'object') {
+                        curScope.model.raiseAmountInputText = strVal;
+                        updated = true;
+                    }
+                    if (curScope.$ctrl && curScope.$ctrl.model && typeof curScope.$ctrl.model === 'object') {
+                        curScope.$ctrl.model.raiseAmountInputText = strVal;
+                        updated = true;
+                    }
+                    if ('raiseAmountInputText' in curScope) {
+                        curScope.raiseAmountInputText = strVal;
+                        updated = true;
+                    }
+                    if (updated) {
+                        console.log(`🎯 [ANGULAR Scope] Đã gán model.raiseAmountInputText = ${strVal} tại depth ${depth}`);
+                        if (!curScope.$$phase && !curScope.$root.$$phase) {
+                            curScope.$apply();
+                        } else {
+                            curScope.$evalAsync();
+                        }
+                        break;
+                    }
+                    curScope = curScope.$parent;
+                    depth++;
+                }
+
+                // C. Yêu cầu $rootScope cập nhật toàn bộ view
+                const rootScope = ngEl.injector() ? ngEl.injector().get('$rootScope') : (ngEl.scope() ? ngEl.scope().$root : null);
+                if (rootScope && !rootScope.$$phase) {
+                    rootScope.$applyAsync();
+                }
+            }
+        } catch(err) {
+            console.warn("⚠️ [ANGULAR SYNC ERROR]:", err);
+        }
+
+        // 7. Kích hoạt Blur để Angular hoàn thành ng-blur
+        try {
+            inputEl.dispatchEvent(new (win.FocusEvent || FocusEvent)('blur', { bubbles: true }));
+        } catch(e) {}
+
+        console.log(`✅ [SET INPUT] Hoàn tất! Giá trị input hiện tại trên DOM: "${inputEl.value}"`);
+        return true;
+    }
+
+    function findActionButton(actionType) {
+        // actionType: 'fold', 'check', 'call', 'raise', 'all_in'
+        const act = actionType.toLowerCase();
+
+        // 1. Ưu tiên tìm theo ID & class cụ thể của PokerStars Web
+        if (act === 'fold') {
+            const list = queryAllContexts('#tableBtnFold, .h5c-btn-action-fold, [ng-click*="actionBtnFold"], [trans-id="TXTWBCLI_TABLE_BTN_FOLD"]');
+            for (const b of list) { if (isElementVisible(b)) return b; }
+        } else if (act === 'check') {
+            const list = queryAllContexts('#tableBtnCheck, .h5c-btn-action-check, [ng-click*="actionBtnCheck"]');
+            for (const b of list) { if (isElementVisible(b)) return b; }
+        } else if (act === 'call') {
+            const list = queryAllContexts('#tableBtnCall, .h5c-btn-action-call, [ng-click*="actionBtnCall"]');
+            for (const b of list) { if (isElementVisible(b)) return b; }
+        } else if (act === 'raise') {
+            const list = queryAllContexts('#tableBtnRaise, #tableBtnBet, .h5c-btn-action-raise, .h5c-btn-action-bet, [ng-click*="actionBtnRaise"], [ng-click*="actionBtnBet"]');
+            for (const b of list) { if (isElementVisible(b)) return b; }
+        }
+
+        // 2. Tìm trong khối action container của PokerStars: <table-action-btns-primaries>
+        const containers = queryAllContexts('table-action-btns-primaries, .action-btns-primaries');
+        const searchScopes = containers.length > 0 ? containers : [document];
+
+        for (const scope of searchScopes) {
+            const candidates = Array.from(scope.querySelectorAll(
+                'a.h5c-btn-table, button, .h5c-btn-action, [role="button"], a, table-action-btn-primary-content'
+            )).filter(el => isElementVisible(el));
+
+            for (const el of candidates) {
+                const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+                const cls = (el.className || '').toLowerCase();
+                const id = (el.id || '').toLowerCase();
+                const trans = (el.getAttribute('trans-id') || '').toLowerCase();
+
+                if (act === 'fold') {
+                    if (text.includes('fold') || cls.includes('fold') || id.includes('fold') || trans.includes('fold')) {
+                        return el.closest('a') || el;
+                    }
+                } else if (act === 'check') {
+                    if (text === 'check' || (text.includes('check') && !text.includes('call')) || cls.includes('check') || id.includes('check') || trans.includes('check')) {
+                        return el.closest('a') || el;
+                    }
+                } else if (act === 'call') {
+                    if (text.includes('call') || cls.includes('call') || id.includes('call') || trans.includes('call')) {
+                        return el.closest('a') || el;
+                    }
+                } else if (act === 'raise') {
+                    if (text.includes('raise') || text.includes('bet') || cls.includes('raise') || cls.includes('bet') || id.includes('raise') || id.includes('bet')) {
+                        return el.closest('a') || el;
+                    }
+                } else if (act === 'all_in') {
+                    if (text.includes('all in') || text.includes('all-in') || text === 'max' || cls.includes('all-in') || cls.includes('allin')) {
+                        return el.closest('a') || el;
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    function executePokerStarsAction(cmd) {
+        if (!cmd || !cmd.action) return;
+        const act = cmd.action.toLowerCase();
+        console.log(`🤖 [POKERSTARS AUTO-PLAY] Bắt đầu thực thi: ${act.toUpperCase()} | Số chip: ${cmd.amount || 0}`);
+
+        if (act === 'fold') {
+            const btn = findActionButton('fold');
+            if (btn) {
+                console.log("👉 [CLICK FOLD]:", btn);
+                clickElement(btn);
+            } else {
+                console.warn("⚠️ [POKERSTARS BOT] Không tìm thấy nút FOLD, thử tìm Check...");
+                const checkBtn = findActionButton('check');
+                if (checkBtn) clickElement(checkBtn);
+            }
+        } else if (act === 'check') {
+            const btn = findActionButton('check');
+            if (btn) {
+                console.log("👉 [CLICK CHECK]:", btn);
+                clickElement(btn);
+            } else {
+                console.warn("⚠️ [POKERSTARS BOT] Không tìm thấy nút CHECK (có thể đã có người cược), thử Call...");
+                const callBtn = findActionButton('call');
+                if (callBtn) clickElement(callBtn);
+            }
+        } else if (act === 'call') {
+            const btn = findActionButton('call') || findActionButton('check');
+            if (btn) {
+                console.log("👉 [CLICK CALL/CHECK]:", btn);
+                clickElement(btn);
+            } else {
+                console.warn("⚠️ [POKERSTARS BOT] Không tìm thấy nút CALL!");
+            }
+        } else if (act === 'raise') {
+            const betInput = findBetInput();
+            if (betInput && cmd.amount > 0) {
+                console.log(`✍️ [NHẬP CHIP CƯỢC] Đang điền ${cmd.amount} vào ô cược PokerStars...`);
+                setAngularInputValue(betInput, cmd.amount);
+
+                // Kiểm tra lại sau 100ms
+                setTimeout(() => {
+                    if (betInput.value !== String(cmd.amount)) {
+                        console.log("🔄 [RETRY INPUT] Ô cược chưa nhận đúng, thử điền lại lần 2...");
+                        setAngularInputValue(betInput, cmd.amount);
+                    }
+
+                    // Chờ thêm 150ms để PokerStars cập nhật nút "Raise to [amount]" rồi bấm
+                    setTimeout(() => {
+                        const raiseBtn = findActionButton('raise');
+                        if (raiseBtn) {
+                            console.log("👉 [CLICK RAISE]:", raiseBtn);
+                            clickElement(raiseBtn);
+                        } else {
+                            console.warn("⚠️ [POKERSTARS BOT] Không tìm thấy nút RAISE sau khi nhập chip, fallback sang Call/Check...");
+                            const callBtn = findActionButton('call') || findActionButton('check');
+                            if (callBtn) clickElement(callBtn);
+                        }
+                    }, 150);
+                }, 100);
+            } else {
+                // Nếu không có ô input, bấm trực tiếp nút Raise/Bet
+                const raiseBtn = findActionButton('raise');
+                if (raiseBtn) {
+                    console.log("👉 [CLICK RAISE TRỰC TIẾP]:", raiseBtn);
+                    clickElement(raiseBtn);
+                } else {
+                    const callBtn = findActionButton('call') || findActionButton('check');
+                    if (callBtn) clickElement(callBtn);
+                }
+            }
+        } else if (act === 'all_in') {
+            const allInBtn = findActionButton('all_in');
+            if (allInBtn) {
+                console.log("👉 [CLICK ALL-IN]:", allInBtn);
+                clickElement(allInBtn);
+            } else {
+                // Điền max stack vào ô cược rồi bấm Raise
+                const betInput = findBetInput();
+                if (betInput && cmd.amount > 0) {
+                    setAngularInputValue(betInput, cmd.amount);
+                    setTimeout(() => {
+                        const raiseBtn = findActionButton('raise');
+                        if (raiseBtn) clickElement(raiseBtn);
+                    }, 150);
+                } else {
+                    const raiseBtn = findActionButton('raise') || findActionButton('call');
+                    if (raiseBtn) clickElement(raiseBtn);
+                }
+            }
+        }
+    }
+
+    // Bộ quét DOM để nhận diện 2 lá bài tẩy của Hero làm dự phòng (Fallback Scraper)
+    let lastSentCards = "";
+    function scanHeroCardsFromDOM() {
+        try {
+            // Tìm các element chứa thông tin bài tẩy (thường ở vùng ghế ngồi của Hero hoặc có class card)
+            const cardRegex = /\b(10|[2-9TJQKA])([shdc♠♥♦♣])\b/i;
+            const suitMap = { '♠': 's', '♥': 'h', '♦': 'd', '♣': 'c', 'S': 's', 'H': 'h', 'D': 'd', 'C': 'c' };
+
+            const elements = document.querySelectorAll('[class*="card"], [class*="Card"], [data-card], [aria-label*="card"], [aria-label*="Card"]');
+            const foundCards = [];
+
+            elements.forEach(el => {
+                const text = el.innerText || el.textContent || '';
+                const aria = el.getAttribute('aria-label') || '';
+                const cls = el.className || '';
+                const combined = `${aria} ${cls} ${text}`;
+
+                // Regex tìm rank và suit (ví dụ: As, Kd, 10h, card-as, card_10s)
+                const matches = combined.match(/(10|[2-9TJQKA])[-_ ]?([shdcSHDC♠♥♦♣])/gi);
+                if (matches) {
+                    for (let m of matches) {
+                        let clean = m.replace(/[-_ ]/g, '').toUpperCase();
+                        let r = clean.slice(0, -1);
+                        let sRaw = clean.slice(-1);
+                        let s = suitMap[sRaw] || sRaw.toLowerCase();
+                        let standardCard = r + s;
+                        if (!foundCards.includes(standardCard)) {
+                            foundCards.push(standardCard);
+                        }
+                    }
+                }
+            });
+
+            if (foundCards.length >= 2) {
+                const key = foundCards.slice(0, 2).sort().join(",");
+                if (key !== lastSentCards) {
+                    lastSentCards = key;
+                    console.log(`🃏 [DOM HERO CARDS]: Nhận diện bài tẩy từ web: [ ${foundCards[0]}  ${foundCards[1]} ]`);
+                    sendPacketToRust({
+                        source: "pokerstars_web",
+                        cards: [foundCards[0], foundCards[1]]
+                    });
+                }
+            }
+        } catch(e) {}
+    }
+
+    setInterval(scanHeroCardsFromDOM, 500);
+
+    // Bộ quét DOM để nhận diện thông tin bàn chơi (Blinds) và Hero Username nếu có
+    let lastSentHeroId = "";
+    let lastSentBlinds = "";
+    function scanTableInfoFromDOM() {
+        try {
+            // 1. Quét tìm Blinds trong header/title ví dụ: "100/200", "50/100"
+            const bodyText = document.body ? document.body.innerText : "";
+            const blindsMatch = bodyText.match(/\b(\d{1,6})\s*\/\s*(\d{1,6})\b/);
+            if (blindsMatch) {
+                const sb = parseInt(blindsMatch[1], 10);
+                const bb = parseInt(blindsMatch[2], 10);
+                const blindsKey = `${sb}/${bb}`;
+                if (bb > 0 && blindsKey !== lastSentBlinds) {
+                    lastSentBlinds = blindsKey;
+                    console.log(`🏛️ [DOM TABLE INFO]: Phát hiện Blinds từ giao diện: ${sb} / ${bb}`);
+                    sendPacketToRust({
+                        source: "pokerstars_web",
+                        sb: sb,
+                        bb: bb
+                    });
+                }
+            }
+
+            // 2. Quét tìm Username nếu có
+            let foundUser = null;
+            if (win.StarsWeb && win.StarsWeb.session && win.StarsWeb.session.user) {
+                foundUser = win.StarsWeb.session.user.id || win.StarsWeb.session.user.screenName;
+            }
+            if (!foundUser) {
+                const userEl = document.querySelector('[data-testid*="username"], .player-username, .user-name');
+                if (userEl) foundUser = userEl.innerText?.trim();
+            }
+            if (foundUser && foundUser !== lastSentHeroId) {
+                lastSentHeroId = foundUser;
+                console.log(`👤 [DOM USER]: Phát hiện Hero Username: ${foundUser}`);
+                sendPacketToRust({
+                    source: "pokerstars_web",
+                    hero_id: foundUser
+                });
+            }
+        } catch(e) {}
+    }
+    setInterval(scanTableInfoFromDOM, 1000);
+
+    // Hàm chuyển ArrayBuffer / Uint8Array thành Hex String
+    function bufToHex(buffer) {
+        const u8 = new Uint8Array(buffer);
+        let hex = '';
+        for (let i = 0; i < u8.length; i++) {
+            hex += u8[i].toString(16).padStart(2, '0');
+        }
+        return hex;
+    }
+
+    // Gửi packet đã chuẩn hóa về Rust HTTP Server (:3002)
+    function sendPacketToRust(packetInfo) {
+        try {
+            GM_xmlhttpRequest({
+                method: "POST",
+                url: DUMP_URL,
+                headers: { "Content-Type": "application/json" },
+                data: JSON.stringify(packetInfo),
+                timeout: 5000,
+                onload: function(response) {
+                    try {
+                        const data = JSON.parse(response.responseText);
+                        if (data && data.bot_action) {
+                            if (pendingActionTimeout) {
+                                clearTimeout(pendingActionTimeout);
+                            }
+                            const delay = data.bot_action.delay_ms || (Math.floor(Math.random() * 2001) + 3000);
+                            console.log("📥 [POKERSTARS BOT] Nhận lệnh từ Rust (:3002):", data.bot_action);
+                            console.log(`⏳ [HUMAN DELAY] Đợi ${(delay / 1000).toFixed(1)}s trước khi thao tác...`);
+                            pendingActionTimeout = setTimeout(() => {
+                                executePokerStarsAction(data.bot_action);
+                                pendingActionTimeout = null;
+                            }, delay);
+                        }
+                    } catch(e) {}
+                },
+                onerror: function() {},
+                ontimeout: function() {}
+            });
+        } catch(e) {
+            console.error("❌ [SNIFFER] Lỗi gửi packet về Rust:", e);
+        }
+    }
+
+    function processAndSend(direction, wsUrl, data) {
+        const ts = Date.now();
+
+        if (typeof data === 'string') {
+            let parsedJson = null;
+            try {
+                parsedJson = JSON.parse(data);
+            } catch(e) {}
+
+            sendPacketToRust({
+                source: "pokerstars_web",
+                direction: direction, // "INCOMING" (Server -> Client) | "OUTGOING" (Client -> Server)
+                url: wsUrl,
+                timestamp: ts,
+                format: parsedJson ? "json" : "text",
+                data: parsedJson ? parsedJson : data
+            });
+
+            if (parsedJson) {
+                console.log(`📡 [WS ${direction === 'INCOMING' ? '⬇️' : '⬆️'}] [JSON]`, parsedJson);
+            } else {
+                console.log(`📡 [WS ${direction === 'INCOMING' ? '⬇️' : '⬆️'}] [TEXT]`, data.length > 200 ? data.substring(0, 200) + '...' : data);
+            }
+        } else if (data instanceof ArrayBuffer) {
+            const hex = bufToHex(data);
+            console.log(`📦 [WS ${direction === 'INCOMING' ? '⬇️' : '⬆️'}] [BINARY ArrayBuffer] Size: ${data.byteLength} bytes`);
+            sendPacketToRust({
+                source: "pokerstars_web",
+                direction: direction,
+                url: wsUrl,
+                timestamp: ts,
+                format: "binary_hex",
+                byte_length: data.byteLength,
+                data: hex
+            });
+        } else if (data instanceof Uint8Array) {
+            const hex = bufToHex(data.buffer);
+            console.log(`📦 [WS ${direction === 'INCOMING' ? '⬇️' : '⬆️'}] [BINARY Uint8Array] Size: ${data.byteLength} bytes`);
+            sendPacketToRust({
+                source: "pokerstars_web",
+                direction: direction,
+                url: wsUrl,
+                timestamp: ts,
+                format: "binary_hex",
+                byte_length: data.byteLength,
+                data: hex
+            });
+        } else if (data instanceof Blob) {
+            const reader = new FileReader();
+            reader.onload = function() {
+                const buf = reader.result;
+                const hex = bufToHex(buf);
+                console.log(`📦 [WS ${direction === 'INCOMING' ? '⬇️' : '⬆️'}] [BINARY Blob] Size: ${data.size} bytes`);
+                sendPacketToRust({
+                    source: "pokerstars_web",
+                    direction: direction,
+                    url: wsUrl,
+                    timestamp: ts,
+                    format: "binary_hex",
+                    byte_length: data.size,
+                    data: hex
+                });
+            };
+            reader.readAsArrayBuffer(data);
+        } else {
+            console.log(`❓ [WS ${direction === 'INCOMING' ? '⬇️' : '⬆️'}] [UNKNOWN TYPE]:`, data);
+        }
+    }
+
+    function CustomWebSocket(url, protocols) {
+        const ws = protocols ? new NativeWebSocket(url, protocols) : new NativeWebSocket(url);
+        const wsUrl = typeof url === 'string' ? url : (url.url || 'unknown_ws');
+
+        console.log(`🔌 [WS KẾT NỐI MỚI]: ${wsUrl}`);
+
+        // 1. Hook CHIỀU GỬI ĐI (Client -> Server)
+        const nativeSend = ws.send.bind(ws);
+        ws.send = function(data) {
+            try {
+                processAndSend("OUTGOING", wsUrl, data);
+            } catch(e) {
+                console.error("❌ [SNIFFER] Lỗi hook send:", e);
+            }
+            return nativeSend(data);
+        };
+
+        // 2. Hook CHIỀU NHẬN VỀ (Server -> Client)
+        ws.addEventListener('message', function(event) {
+            try {
+                processAndSend("INCOMING", wsUrl, event.data);
+            } catch(e) {
+                console.error("❌ [SNIFFER] Lỗi hook message:", e);
+            }
+        }, false);
+
+        return ws;
+    }
+
+    CustomWebSocket.prototype = NativeWebSocket.prototype;
+    CustomWebSocket.CONNECTING = NativeWebSocket.CONNECTING;
+    CustomWebSocket.OPEN = NativeWebSocket.OPEN;
+    CustomWebSocket.CLOSING = NativeWebSocket.CLOSING;
+    CustomWebSocket.CLOSED = NativeWebSocket.CLOSED;
+
+    win.WebSocket = CustomWebSocket;
+
+    console.log("✅ [POKERSTARS SNIFFER] Hook NativeWebSocket thành công!");
+})();

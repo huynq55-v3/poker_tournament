@@ -5,11 +5,37 @@ pub struct TournamentStackSampler;
 
 impl TournamentStackSampler {
 
-    /// Stack bằng nhau (đầu giải / cash game / benchmark) với đầy đủ các mốc Push/Fold (8, 10, 12 BB)
+    /// Stack bằng nhau (đầu giải / cash game / benchmark) với đầy đủ các mốc Push/Fold (8, 10, 12 BB) và Deep Stack (100 BB)
     pub fn sample_equal_stacks<R: Rng>(rng: &mut R, num_players: usize, bb_size: u32) -> Vec<u32> {
-        const DEPTHS: [u32; 9] = [8, 10, 12, 15, 20, 25, 35, 50, 75];
+        const DEPTHS: [u32; 10] = [8, 10, 12, 15, 20, 25, 35, 50, 75, 100];
         let d = DEPTHS[rng.gen_range(0..DEPTHS.len())];
         vec![d * bb_size; num_players]
+    }
+
+    /// Mô phỏng phân phối Stack thực tế bàn Cash Game PokerStars 6-Max (Max 100 BB):
+    /// - 20% Short/Mid-stack (40 - 70 BB): Người chơi thận trọng / buy-in min
+    /// - 50% Standard 100 BB Buy-in (80 - 110 BB): Người chơi mới vào / auto-rebuy
+    /// - 30% Deep-stack thắng trận tích lũy tiền không rút ra được (120 - 250 BB): Anti-Ratholing
+    pub fn sample_cash_game_stacks<R: Rng>(
+        rng: &mut R,
+        num_players: usize,
+        bb_size: u32,
+    ) -> Vec<u32> {
+        (0..num_players)
+            .map(|_| {
+                let roll: f32 = rng.gen();
+                let bb_val: f32 = if roll < 0.20 {
+                    rng.gen_range(40.0..=70.0)
+                } else if roll < 0.70 {
+                    rng.gen_range(80.0..=110.0)
+                } else {
+                    rng.gen_range(120.0..=250.0)
+                };
+                let chip_unit = (bb_size / 2).max(1);
+                let chips = (bb_val * bb_size as f32).round() as u32;
+                (chips / chip_unit) * chip_unit
+            })
+            .collect()
     }
 
     /// Sample asymmetric stacks using a Dirichlet distribution approximation via Gamma distributions.
