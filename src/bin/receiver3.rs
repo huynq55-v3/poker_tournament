@@ -466,6 +466,11 @@ pub fn process_game_update(
                 };
                 if new_street != state.street {
                     for p in state.players.values_mut() {
+                        if p.is_all_in {
+                            p.stack = 0;
+                        } else {
+                            p.stack = p.stack.saturating_sub(p.current_bet);
+                        }
                         p.current_bet = 0;
                     }
                     state.highest_bet = 0;
@@ -705,7 +710,7 @@ pub fn process_game_update(
             if actor == state.hero_id {
                 state.hero_mavtb = Some(mavtb_u32);
                 if let Some(p) = state.players.get_mut(actor) {
-                    p.stack = mavtb_u32.saturating_sub(p.current_bet);
+                    p.stack = mavtb_u32;
                 }
             }
         }
@@ -744,7 +749,14 @@ pub fn run_gto_evaluation(
 
     let active_seats: Vec<String> = sorted_players
         .into_iter()
-        .filter(|p| p.id == state.hero_id || p.stack > 0 || p.current_bet > 0 || p.is_all_in)
+        .filter(|p| {
+            let stack_behind = if p.is_all_in {
+                0
+            } else {
+                p.stack.saturating_sub(p.current_bet)
+            };
+            p.id == state.hero_id || stack_behind > 0 || p.current_bet > 0 || p.is_all_in
+        })
         .map(|p| p.id.clone())
         .collect();
 
@@ -766,7 +778,11 @@ pub fn run_gto_evaluation(
             actual_highest_bet = p_track.current_bet;
         }
         
-        let true_stack_behind = p_track.stack;
+        let true_stack_behind = if p_track.is_all_in {
+            0
+        } else {
+            p_track.stack.saturating_sub(p_track.current_bet)
+        };
         let starting_stack = true_stack_behind + p_track.current_bet;
         initial_stacks.push(starting_stack.max(state.bb_size));
 
@@ -827,7 +843,12 @@ pub fn run_gto_evaluation(
 
     // Kiểm tra tính khả thi thực tế trên PokerNow UI
     let has_opp_with_chips = state.players.iter().any(|(pid, p)| {
-        pid != &state.hero_id && !p.is_folded && !p.is_all_in && p.stack > 0
+        let opp_stack_behind = if p.is_all_in {
+            0
+        } else {
+            p.stack.saturating_sub(p.current_bet)
+        };
+        pid != &state.hero_id && !p.is_folded && !p.is_all_in && opp_stack_behind > 0
     });
     let has_chips_to_raise = hero_stack_behind > to_call;
     let mavtb_allows_raise = state.hero_mavtb.is_none_or(|m| m > actual_highest_bet);
@@ -900,7 +921,45 @@ pub fn run_gto_evaluation(
     }
     
     let call_status = if to_call == 0 { "(Đang check)" } else { "" };
-    println!("💰 Tổng Pot thực tế: {} chip | Cần Call: {} chip {}", true_table_pot, to_call, call_status);
+    println!("💰 Tổng Pot thực tế: {} chip | Cần Call: {} chip {} | Blind: {}/{} chip", true_table_pot, to_call, call_status, state.sb_size, state.bb_size);
+
+    let eff_bb = env.state.effective_stack_bb(hero_seat);
+    let eff_chips = (eff_bb * state.bb_size as f32).round() as u32;
+    println!("⚡ Effective Stack : {} chip ({:.1} BB)", eff_chips, eff_bb);
+
+    println!("🏦 [STACK CHIP THỰC TẾ]:");
+    for pid in &active_seats {
+        if let Some(p) = state.players.get(pid) {
+            let is_hero = pid == &state.hero_id;
+            let display_name = if !p.name.is_empty() && p.name != "Player" {
+                p.name.clone()
+            } else {
+                format!("Ghế #{}", p.seat_num)
+            };
+            let who = if is_hero { format!("{} (Hero)", display_name) } else { display_name };
+            let true_stack = if p.is_all_in {
+                0
+            } else {
+                p.stack.saturating_sub(p.current_bet)
+            };
+            let stack_bb = if state.bb_size > 0 { true_stack as f32 / state.bb_size as f32 } else { 0.0 };
+            let status_str = if p.is_all_in {
+                if p.current_bet > 0 {
+                    format!(" [ALL-IN {} chip]", p.current_bet)
+                } else {
+                    " [ALL-IN]".to_string()
+                }
+            } else if p.is_folded {
+                " [FOLD]".to_string()
+            } else if p.current_bet > 0 {
+                format!(" (Đang cược {} chip)", p.current_bet)
+            } else {
+                String::new()
+            };
+            println!("   • Ghế #{:<2} {:<16} : {:>6} chip ({:>5.1} BB){}", 
+                p.seat_num, who, true_stack, stack_bb, status_str);
+        }
+    }
     
     // In Lịch sử cược rõ ràng, phản ánh trung thực số chip cược thực tế
     if state.action_history.is_empty() {
@@ -977,15 +1036,50 @@ pub fn run_gto_evaluation(
     // Ra quyết định theo chế độ đã cấu hình
     let (chosen_idx, decision_note) = match mode {
         DecisionMode::PureMaxEv => {
-            let mut best_i = 0;
+            // 1. Tìm mức EV cao nhất trong các action hợp lệ
             let mut max_ev = f32::NEG_INFINITY;
             for (i, &ev) in raw_adv.iter().enumerate().take(NUM_ACTIONS) {
                 if mask.is_index_valid(i) && ev > max_ev {
                     max_ev = ev;
-                    best_i = i;
                 }
             }
-            (best_i, format!("⚡ [THUẦN EV MAX] Nước đi tối đa kỳ vọng: {:?} (EV: {:>+6.2})", Action::from_index(best_i).unwrap(), max_ev))
+
+            // 2. Lọc các action co-optimal (EV nằm trong phạm vi sai số delta = 0.015 EV).
+            // Trong các ứng viên ngang ngửa EV này, ưu tiên action có Tần suất GTO (clean_probs) cao nhất!
+            // Nếu tần suất GTO cũng xấp xỉ nhau, ưu tiên action có EV cao hơn.
+            let ev_tolerance = 0.015f32;
+            let mut best_i = 0;
+            let mut best_gto_p = -1.0f32;
+            let mut best_ev = f32::NEG_INFINITY;
+
+            for (i, &ev) in raw_adv.iter().enumerate().take(NUM_ACTIONS) {
+                if !mask.is_index_valid(i) { continue; }
+                if ev >= max_ev - ev_tolerance {
+                    let p = clean_probs[i];
+                    if p > best_gto_p + 1e-4 {
+                        best_gto_p = p;
+                        best_i = i;
+                        best_ev = ev;
+                    } else if (p - best_gto_p).abs() <= 1e-4 && ev > best_ev {
+                        best_i = i;
+                        best_ev = ev;
+                    }
+                }
+            }
+
+            let best_act = Action::from_index(best_i).unwrap();
+            let note = if (max_ev - best_ev).abs() > 1e-4 {
+                format!(
+                    "⚡ [THUẦN EV MAX + GTO TIE-BREAK] Ưu tiên GTO ({:.1}%): {:?} (EV: {:>+6.2}, ngang ngửa Max EV {:>+6.2})",
+                    best_gto_p * 100.0, best_act, best_ev, max_ev
+                )
+            } else {
+                format!(
+                    "⚡ [THUẦN EV MAX] Nước đi tối đa kỳ vọng: {:?} (EV: {:>+6.2}, Tần suất GTO: {:.1}%)",
+                    best_act, best_ev, best_gto_p * 100.0
+                )
+            };
+            (best_i, note)
         }
         DecisionMode::PureGtoRoll => {
             let mut rng = rand::thread_rng();
@@ -1111,7 +1205,7 @@ pub fn run_gto_evaluation(
         let is_valid = mask.is_index_valid(i);
         let rec = if is_valid && i == chosen_idx { 
             match mode {
-                DecisionMode::PureMaxEv => " ⭐ TỐI ĐA EV (CHỌN 100%)",
+                DecisionMode::PureMaxEv => " ⭐ TỐI ĐA EV (ƯU TIÊN GTO)",
                 DecisionMode::GuardedMixing => " ⭐ ĐÃ CHỌN (GUARDED)",
                 DecisionMode::PureGtoRoll => " ⭐ ĐÃ ROLL TRÚNG",
             }

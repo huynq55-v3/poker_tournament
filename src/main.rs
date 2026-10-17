@@ -37,7 +37,7 @@ fn main() {
     // Capacity 1.5M - 2M mẫu là vừa vặn bộ nhớ RAM
     let mut trainer = DeepCFRTrainer::new(FEATURE_DIM, &hidden_dims, 2_500_000, true);
     trainer.fixed_players = None; // Tiếp tục ưu tiên bàn 6-8 max
-    trainer.use_icm = true;       // 🟢 BẮT BUỘC: Bật hàm thưởng Tournament ICM
+    trainer.use_icm = false;       // 🟢 BẮT BUỘC: Bật hàm thưởng Tournament ICM
     trainer.lr = 0.0005;          // 🟢 Giảm nhẹ learning rate để tránh dao động All-in rác
 
     let total_iterations = 10_000;    // 🚀 Chạy liên tục 10,000 iterations

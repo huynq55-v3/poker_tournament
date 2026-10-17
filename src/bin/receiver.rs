@@ -594,8 +594,11 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
                 };
                 if new_street != state.street {
                     for p in state.players.values_mut() {
-                        // PokerNow cập nhật stack thực tế liên tục qua players.stack và mAVTB,
-                        // chỉ reset current_bet về 0 ở vòng mới, không trừ đúp stack!
+                        if p.is_all_in {
+                            p.stack = 0;
+                        } else {
+                            p.stack = p.stack.saturating_sub(p.current_bet);
+                        }
                         p.current_bet = 0;
                     }
                     state.highest_bet = 0;
@@ -824,9 +827,7 @@ fn process_game_update(state: &mut HandState, payload: &Value, policy: &DeepCFRP
             if actor == state.hero_id {
                 state.hero_mavtb = Some(mavtb_u32);
                 if let Some(p) = state.players.get_mut(actor) {
-                    // mAVTB là tổng cược tối đa hợp lệ trên PokerNow (bao gồm cả bet hiện tại).
-                    // Stack còn lại sau lưng của người chơi = mAVTB - current_bet.
-                    p.stack = mavtb_u32.saturating_sub(p.current_bet);
+                    p.stack = mavtb_u32;
                 }
             }
         }
@@ -854,7 +855,14 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
 
     let active_seats: Vec<String> = sorted_players
         .into_iter()
-        .filter(|p| p.id == state.hero_id || p.stack > 0 || p.current_bet > 0 || p.is_all_in)
+        .filter(|p| {
+            let stack_behind = if p.is_all_in {
+                0
+            } else {
+                p.stack.saturating_sub(p.current_bet)
+            };
+            p.id == state.hero_id || stack_behind > 0 || p.current_bet > 0 || p.is_all_in
+        })
         .map(|p| p.id.clone())
         .collect();
 
@@ -876,7 +884,11 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
             actual_highest_bet = p_track.current_bet;
         }
         
-        let true_stack_behind = p_track.stack;
+        let true_stack_behind = if p_track.is_all_in {
+            0
+        } else {
+            p_track.stack.saturating_sub(p_track.current_bet)
+        };
         let starting_stack = true_stack_behind + p_track.current_bet;
         initial_stacks.push(starting_stack.max(state.bb_size));
 
@@ -925,7 +937,12 @@ fn run_gto_evaluation(state: &HandState, hole: [Card; 2], policy: &DeepCFRPolicy
     let max_total_bet = state.hero_mavtb.unwrap_or(hero_stack_behind + hero_bet);
 
     let has_opp_with_chips = state.players.iter().any(|(pid, p)| {
-        pid != &state.hero_id && !p.is_folded && !p.is_all_in && p.stack > 0
+        let opp_stack_behind = if p.is_all_in {
+            0
+        } else {
+            p.stack.saturating_sub(p.current_bet)
+        };
+        pid != &state.hero_id && !p.is_folded && !p.is_all_in && opp_stack_behind > 0
     });
     let has_chips_to_raise = hero_stack_behind > to_call;
     let mavtb_allows_raise = state.hero_mavtb.is_none_or(|m| m > actual_highest_bet);
