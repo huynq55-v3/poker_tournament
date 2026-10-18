@@ -1,4 +1,5 @@
 use poker_tournament::deep_cfr::DeepCFRPolicy;
+use poker_tournament::environment::state::ActionRecord;
 use poker_tournament::environment::{Action, Environment, NUM_ACTIONS, PlayerState, Street};
 use poker_tournament::neural_network::MLP;
 use poker_tournament::poker_core::{Card, Rank, Suit};
@@ -67,6 +68,8 @@ pub struct PlayerTracker {
     pub total_contributed: u32,
     pub is_folded: bool,
     pub is_all_in: bool,
+    pub is_sitting_out: bool,
+    pub is_in_hand: bool,
 }
 
 pub fn extract_user_id_from_payload(val: &Value) -> Option<String> {
@@ -120,6 +123,8 @@ impl Default for PlayerTracker {
             total_contributed: 0,
             is_folded: false,
             is_all_in: false,
+            is_sitting_out: false,
+            is_in_hand: true,
         }
     }
 }
@@ -188,11 +193,15 @@ impl HandState {
         self.current_turn_seat = None;
         self.action_history.clear();
 
-        for p in self.players.values_mut() {
-            p.current_bet = 0;
-            p.total_contributed = 0;
-            p.is_folded = false;
-            p.is_all_in = false;
+        if new_h_id.starts_with("6Z.") {
+            self.players.clear();
+        } else {
+            for p in self.players.values_mut() {
+                p.current_bet = 0;
+                p.total_contributed = 0;
+                p.is_folded = false;
+                p.is_all_in = false;
+            }
         }
     }
 }
@@ -521,19 +530,44 @@ pub fn run_gto_evaluation(
     let mut sorted_players: Vec<&PlayerTracker> = state.players.values().collect();
     sorted_players.sort_by_key(|p| p.seat_num);
 
-    let active_seats: Vec<String> = sorted_players
-        .into_iter()
+    let mut active_seats: Vec<String> = sorted_players
+        .iter()
         .filter(|p| {
-            let stack_behind = if p.is_all_in { 0 } else { p.stack.saturating_sub(p.current_bet) };
-            (!state.hero_id.is_empty() && p.name.eq_ignore_ascii_case(&state.hero_id)) 
+            let is_hero = (!state.hero_id.is_empty() && p.name.eq_ignore_ascii_case(&state.hero_id)) 
                 || Some(p.seat_num) == state.hero_seat 
-                || p.id == state.hero_id 
-                || stack_behind > 0 
-                || p.current_bet > 0 
-                || p.is_all_in
+                || p.id == state.hero_id;
+            
+            if is_hero {
+                return true;
+            }
+
+            // Loại bỏ người ngồi đợi blind hoặc tạm nghỉ mà chưa tham gia ván
+            let is_waiting_or_sitting_out = (!p.is_in_hand || p.is_sitting_out) 
+                && p.current_bet == 0 
+                && p.total_contributed == 0 
+                && !p.is_all_in;
+
+            if is_waiting_or_sitting_out {
+                return false;
+            }
+
+            // Người chơi hợp lệ của ván đấu: còn chip, có cược, đã góp chip, đã all-in, hoặc chưa fold
+            p.stack > 0 || p.current_bet > 0 || p.total_contributed > 0 || p.is_all_in || !p.is_folded
         })
         .map(|p| p.id.clone())
         .collect();
+
+    // 🛡️ CHỐT CHẶN BẢO VỆ 1: Nếu active_seats < 2, tự động tìm thêm đối thủ đang ngồi tại bàn
+    if active_seats.len() < 2 {
+        for p in &sorted_players {
+            if !active_seats.contains(&p.id) {
+                active_seats.push(p.id.clone());
+                if active_seats.len() >= 2 {
+                    break;
+                }
+            }
+        }
+    }
 
     if active_seats.is_empty() { return None; }
 
@@ -562,7 +596,8 @@ pub fn run_gto_evaluation(
             actual_highest_bet = p_track.current_bet;
         }
         
-        let true_stack_behind = if p_track.is_all_in { 0 } else { p_track.stack.saturating_sub(p_track.current_bet) };
+        // Trong PokerStars socket (0x0076 & 0x006c), p_track.stack đã là stack còn lại (stack behind)
+        let true_stack_behind = if p_track.is_all_in { 0 } else { p_track.stack };
         let starting_stack = true_stack_behind + p_track.current_bet;
         initial_stacks.push(starting_stack.max(state.bb_size));
 
@@ -574,6 +609,17 @@ pub fn run_gto_evaluation(
         if seat_idx == hero_seat { ps.hole_cards = [Some(hole[0]), Some(hole[1])]; }
         
         sum_current_bets += p_track.current_bet;
+        env_players.push(ps);
+    }
+
+    // 🛡️ CHỐT CHẶN BẢO VỆ 2: Đảm bảo 100% initial_stacks.len() == num_players (Triệt tiêu vĩnh viễn assertion failure!)
+    while initial_stacks.len() < num_players {
+        let opp_stack = (actual_highest_bet).max(state.bb_size * 50);
+        initial_stacks.push(opp_stack);
+        let dummy_seat = env_players.len();
+        let mut ps = PlayerState::new(dummy_seat, opp_stack, true);
+        ps.current_bet = actual_highest_bet;
+        ps.total_contributed = actual_highest_bet;
         env_players.push(ps);
     }
 
@@ -625,27 +671,110 @@ pub fn run_gto_evaluation(
     env.state.players = env_players;
     env.state.is_cash_game = IS_CASH_GAME.load(Ordering::Relaxed);
 
+    // ÁNH XẠ CHÍNH XÁC LỊCH SỬ CƯỢC VÀO ENGINE CHO MẠNG NƠ-RON HỌC VÀ TRÍCH XUẤT ĐẶC TRƯNG
+    env.state.action_history = state.action_history.iter().filter_map(|rec| {
+        let idx = active_seats.iter().position(|id| id == &rec.player_id)?;
+        Some(ActionRecord {
+            player_idx: idx,
+            street: rec.street,
+            action: rec.action,
+            amount: rec.amount,
+        })
+    }).collect();
+
     let hero_player = &env.state.players[hero_seat];
     let to_call = actual_highest_bet.saturating_sub(hero_player.current_bet).min(hero_player.stack);
 
     let mut mask = env.get_action_mask();
     let features = env.state.encode_features(hero_seat);
 
-    // 🛡️ CHỐT CHẶN CHỐNG ALL-IN BÀI RÁC Ở PREFLOP (ANTI-TRASH SHOVE GUARD)
+    // 🛡️ CHỐT CHẶN ALL-IN AN TOÀN CASH GAME (TIER 1: EQUITY & SỨC MẠNH BÀI TẨY)
+    // Trong PokerStars cash game (đặc biệt bàn 100 BB), All-in rủi ro toàn bộ tiền thật.
+    // Chỉ cho phép nút All-In nếu bài có Equity mạnh hoặc Monster Value / Combo Draw thực thụ:
     let chen_strength = features[167];
     let eff_stack_bb = env.state.effective_stack_bb(hero_seat);
     let eff_chips = (eff_stack_bb * state.bb_size as f32).round() as u32;
 
-    if state.street == Street::Preflop {
-        let min_shove_chen = if eff_stack_bb < 8.0 { 0.20 } else if eff_stack_bb < 15.0 { 0.26 } else { 0.32 };
-        if chen_strength < min_shove_chen && mask.is_valid(Action::AllIn) {
+    if mask.is_valid(Action::AllIn) {
+        let is_all_in_allowed = if eff_stack_bb < 15.0 {
+            // Stack ngắn (< 15 BB): cho phép All-in push/fold nếu bài tẩy đủ điểm Chen hoặc Equity khá
+            if state.street == Street::Preflop {
+                chen_strength >= 0.28
+            } else {
+                features[168] >= 0.40 || features[166] >= 0.22
+            }
+        } else {
+            // Stack sâu (>= 15 BB, 50-100+ BB): Tiêu chuẩn All-in cực kỳ khắt khe!
+            match state.street {
+                Street::Preflop => {
+                    // Preflop Deep-Stack:
+                    // - Nếu stack >= 40 BB: Chỉ All-in bài siêu cấp (AA, KK, QQ, AKs - Chen >= 0.45)
+                    // - Nếu stack 15-40 BB: Bài rất mạnh (TT+, AJs+, AKo - Chen >= 0.38)
+                    if eff_stack_bb >= 40.0 {
+                        chen_strength >= 0.45
+                    } else {
+                        chen_strength >= 0.38
+                    }
+                }
+                Street::Flop | Street::Turn => {
+                    // Postflop Deep-Stack:
+                    // 1. Monster Made Hand: Two Pair trở lên (cat >= 0.30) hoặc Overpair Kicker khủng (cat >= 0.22 && str >= 0.75)
+                    // 2. HOẶC Monster Combo Draw: Flush Draw + Straight Draw, hoặc raw equity >= 0.50
+                    let hand_cat = features[166];
+                    let hand_str = features[167];
+                    let raw_eq = features[168];
+                    let has_flush_draw = features[171] >= 0.5;
+                    let has_straight_draw = features[172] >= 0.5;
+
+                    let is_monster_made = hand_cat >= 0.30 || (hand_cat >= 0.22 && hand_str >= 0.75);
+                    let is_monster_draw = (has_flush_draw && has_straight_draw) || raw_eq >= 0.50;
+
+                    is_monster_made || is_monster_draw
+                }
+                Street::River => {
+                    // River Deep-Stack: Không còn Draw. BẮT BUỘC Two Pair trở lên (cat >= 0.30)!
+                    // Khóa cứng All-in nếu chỉ cầm One Pair hoặc High Card ở River!
+                    features[166] >= 0.30
+                }
+                Street::Showdown => false,
+            }
+        };
+
+        if !is_all_in_allowed && (mask.is_valid(Action::Fold) || mask.is_valid(Action::CheckCall) || mask.is_valid(Action::BetPot33) || mask.is_valid(Action::BetPot75) || mask.is_valid(Action::BetSmall)) {
+            println!(
+                "🛡️  [CASH ALL-IN GUARD] Bài chưa đủ điều kiện Equity mạnh ({:.1} BB, {:?}, Cat: {:.2}, Chen: {:.2}) -> Khóa All-In!",
+                eff_stack_bb, state.street, features[166], chen_strength
+            );
+            mask.0 &= !(1 << Action::AllIn.to_index());
+        }
+    }
+
+    // Chốt chặn phụ chống bluff bài rác postflop (Air)
+    if state.street != Street::Preflop {
+        let hand_cat = features[166];
+        let has_flush_draw = features[171] >= 0.5;
+        let has_straight_draw = features[172] >= 0.5;
+        let is_pure_air = hand_cat < 0.15 && !has_flush_draw && !has_straight_draw;
+
+        if to_call > 0 && is_pure_air {
             if mask.is_valid(Action::Fold) || mask.is_valid(Action::CheckCall) {
                 println!(
-                    "🛡️  [ANTI-TRASH SHOVE] Bài tẩy {:?} quá yếu (Chen: {:.2} < {:.2} ở {:.1} BB) -> Khóa nút All-In!",
-                    hole, chen_strength, min_shove_chen, eff_stack_bb
+                    "🛡️  [POSTFLOP ANTI-SUICIDE] Bài tẩy {:?} không có đôi / không có draw (Air) khi đối thủ bet -> Khóa toàn bộ Tố / All-In!",
+                    hole
                 );
-                mask.0 &= !(1 << Action::AllIn.to_index());
+                mask.0 &= !((1 << Action::BetSmall.to_index())
+                    | (1 << Action::BetPot33.to_index())
+                    | (1 << Action::BetPot75.to_index())
+                    | (1 << Action::AllIn.to_index()));
             }
+        }
+
+        if in_hand_count >= 3 && is_pure_air {
+            println!(
+                "👥 [MULTIWAY AIR GUARD] Pot đông người ({} người) với bài rác -> Khóa BetPot75 & All-In!",
+                in_hand_count
+            );
+            mask.0 &= !((1 << Action::BetPot75.to_index()) | (1 << Action::AllIn.to_index()));
         }
     }
 
@@ -671,43 +800,72 @@ pub fn run_gto_evaluation(
 
     let (chosen_idx, decision_note) = match mode {
         DecisionMode::PureMaxEv => {
-            let mut max_ev = f32::NEG_INFINITY;
-            for (i, &ev) in raw_adv.iter().enumerate().take(NUM_ACTIONS) {
-                if mask.is_index_valid(i) && ev > max_ev {
-                    max_ev = ev;
+            // 1. Tìm action có tần suất GTO cao nhất (max_gto_p)
+            let mut max_gto_p = 0.0f32;
+            let mut best_gto_idx = 0;
+            for (i, &p) in clean_probs.iter().enumerate().take(NUM_ACTIONS) {
+                if mask.is_index_valid(i) && p > max_gto_p {
+                    max_gto_p = p;
+                    best_gto_idx = i;
                 }
             }
 
-            let ev_tolerance = 0.015f32;
-            let mut best_i = 0;
-            let mut best_gto_p = -1.0f32;
-            let mut best_ev = f32::NEG_INFINITY;
-
+            // 2. Lọc các action có tần suất GTO đáng tin cậy:
+            // - Với Action thông thường: p >= 8% và p >= max_gto_p * 0.30
+            // - 🛡️ ĐẶC BIỆT VỚI ALL-IN (TIER 2: STRATEGY % & ADVANTAGE EV CONFIRMATION):
+            //   Chỉ chấp nhận All-In nếu:
+            //   a) Mạng Strategy cho % cao: clean_probs[AllIn] >= 25% VÀ >= max_gto_p * 0.60
+            //   b) Mạng Advantage cho EV cao tuyệt đối: raw_adv[AllIn] > 0.10 (tránh EV dương ảo sát 0)
+            let min_gto_threshold = 0.08f32;
+            let mut candidates = Vec::new();
             for (i, &ev) in raw_adv.iter().enumerate().take(NUM_ACTIONS) {
                 if !mask.is_index_valid(i) { continue; }
-                if ev >= max_ev - ev_tolerance {
-                    let p = clean_probs[i];
-                    if p > best_gto_p + 1e-4 {
-                        best_gto_p = p;
-                        best_i = i;
-                        best_ev = ev;
-                    } else if (p - best_gto_p).abs() <= 1e-4 && ev > best_ev {
-                        best_i = i;
-                        best_ev = ev;
+                let p = clean_probs[i];
+                let act = Action::from_index(i).unwrap();
+
+                if act == Action::AllIn {
+                    let has_high_gto = p >= 0.25 && p >= max_gto_p * 0.60;
+                    let has_strong_ev = ev > 0.10;
+                    if has_high_gto && has_strong_ev {
+                        candidates.push((i, ev, p));
+                    } else {
+                        println!(
+                            "🛡️  [TIER 2 SHIELD] Loại All-In khỏi ứng viên do chưa đạt GTO/EV chuẩn (GTO: {:.1}%, EV: {:>+6.2})",
+                            p * 100.0, ev
+                        );
                     }
+                } else if p >= min_gto_threshold && p >= max_gto_p * 0.30 {
+                    candidates.push((i, ev, p));
+                }
+            }
+
+            if candidates.is_empty() {
+                let ev = raw_adv.get(best_gto_idx).copied().unwrap_or(0.0);
+                candidates.push((best_gto_idx, ev, max_gto_p));
+            }
+
+            // Chọn ứng viên có EV cao nhất trong danh sách GTO hợp lệ
+            let mut best_i = candidates[0].0;
+            let mut best_ev = candidates[0].1;
+            let mut best_p = candidates[0].2;
+            for &(idx, ev, p) in &candidates[1..] {
+                if ev > best_ev {
+                    best_i = idx;
+                    best_ev = ev;
+                    best_p = p;
                 }
             }
 
             let best_act = Action::from_index(best_i).unwrap();
-            let note = if (max_ev - best_ev).abs() > 1e-4 {
+            let note = if best_i == best_gto_idx {
                 format!(
-                    "⚡ [THUẦN EV MAX + GTO TIE-BREAK] Ưu tiên GTO ({:.1}%): {:?} (EV: {:>+6.2}, ngang ngửa Max EV {:>+6.2})",
-                    best_gto_p * 100.0, best_act, best_ev, max_ev
+                    "⚡ [GTO + EV MAX] Tuyến cược GTO chủ đạo: {:?} (Tần suất GTO: {:.1}%, EV: {:>+6.2})",
+                    best_act, best_p * 100.0, best_ev
                 )
             } else {
                 format!(
-                    "⚡ [THUẦN EV MAX] Nước đi tối đa kỳ vọng: {:?} (EV: {:>+6.2}, Tần suất GTO: {:.1}%)",
-                    best_act, best_ev, best_gto_p * 100.0
+                    "⚡ [GTO + EV MAX] Chọn nhánh EV cao hơn trong các tuyến GTO khả thi: {:?} (EV: {:>+6.2}, GTO: {:.1}%)",
+                    best_act, best_ev, best_p * 100.0
                 )
             };
             (best_i, note)
@@ -910,7 +1068,15 @@ pub fn run_gto_evaluation(
             best_action
         };
 
-        let delay_ms: u64 = rand::thread_rng().gen_range(1500..=3000);
+        // Độ trễ cược theo yêu cầu:
+        // - Check/Call/Fold: Không trễ (0 ms) -> Bấm ngay lập tức (snap check/call/fold).
+        // - Raise / Bet / All-in: Giảm bớt 1.5s so với mức cũ (1500..=3000 ms) -> Mức mới: 200..=1500 ms (0.2s - 1.5s)
+        let delay_ms: u64 = match safe_action {
+            Action::Fold | Action::CheckCall => 0,
+            Action::BetSmall | Action::BetPot33 | Action::BetPot75 | Action::AllIn => {
+                rand::thread_rng().gen_range(200..=1500)
+            }
+        };
 
         let in_page_cmd = match safe_action {
             Action::Fold => InPageAction {
@@ -962,11 +1128,16 @@ pub fn run_gto_evaluation(
             }
         };
 
+        let delay_str = if delay_ms == 0 {
+            "Tức thì (0s)".to_string()
+        } else {
+            format!("{:.2}s", delay_ms as f64 / 1000.0)
+        };
         println!(
-            "🥷 [AUTO-BOT] Đã gửi lệnh tự bấm sang PokerStars Web: {:?} (Số chip: {}, Trễ: {:.2}s)",
+            "🥷 [AUTO-BOT] Đã gửi lệnh tự bấm sang PokerStars Web: {:?} (Số chip: {}, Trễ: {})",
             in_page_cmd.action.to_uppercase(),
             in_page_cmd.amount,
-            delay_ms as f64 / 1000.0
+            delay_str
         );
         println!("============================================================\n");
         Some(in_page_cmd)
@@ -1022,9 +1193,11 @@ pub fn process_pokerstars_thrift_packet(
     decision_mode: DecisionMode,
     use_os_enigo: bool,
 ) -> Option<InPageAction> {
-    // Tự động nhận diện ván mới khi Hand ID thay đổi từ socket
+    // Tự động nhận diện ván mới khi Hand ID thay đổi từ socket (hỗ trợ cả Cash 6R, Play 6P và Zoom xoay vòng 6Z)
     if let Some(h_id) = thrift_data.get_field(1).and_then(|v| v.get_str()) {
-        if !h_id.is_empty() && (h_id.starts_with("6R.") || h_id.starts_with("6P.")) && h_id != state.hand_id {
+        let is_valid_hand_topic = (h_id.starts_with("6R.") || h_id.starts_with("6P.") || h_id.starts_with("6Z.")) 
+            && h_id.matches('.').count() >= 2;
+        if !h_id.is_empty() && is_valid_hand_topic && h_id != state.hand_id {
             state.start_new_hand(h_id);
         }
     }
@@ -1034,8 +1207,21 @@ pub fn process_pokerstars_thrift_packet(
         let mut found_cards = Vec::new();
         extract_cards_from_thrift(thrift_data, &mut found_cards);
         if found_cards.len() == 2 && (opcode == 0x006c || opcode == 0x008b || opcode == 0x005a) {
-            state.hero_cards = Some([found_cards[0], found_cards[1]]);
-            println!("🃏 [NHẬN DIỆN BÀI TẨY HERO TỪ SOCKET (0x{:04x})]: [ {}  {} ]", opcode, found_cards[0], found_cards[1]);
+            let is_hero_pkt = if opcode == 0x006c {
+                if let Some(p_data) = thrift_data.get_field(2) {
+                    let seat = p_data.get_field(1).and_then(|v| v.get_i32()).unwrap_or(-1) as usize;
+                    Some(seat) == state.hero_seat
+                } else {
+                    false
+                }
+            } else {
+                true
+            };
+
+            if is_hero_pkt {
+                state.hero_cards = Some([found_cards[0], found_cards[1]]);
+                println!("🃏 [NHẬN DIỆN BÀI TẨY HERO TỪ SOCKET (0x{:04x})]: [ {}  {} ]", opcode, found_cards[0], found_cards[1]);
+            }
         }
     }
 
@@ -1095,45 +1281,76 @@ pub fn process_pokerstars_thrift_packet(
                 println!("🔘 [DEALER BUTTON]: Ghế #{}", dealer);
             }
 
+            // Reset trạng thái bàn chơi cho bàn mới (đặc biệt trong chế độ xoay vòng Zoom)
+            state.community_cards.clear();
+            state.action_history.clear();
+            state.street = Street::Preflop;
+            state.highest_bet = 0;
+            state.total_pot = 0;
+            state.has_evaluated_this_decision = false;
+            state.current_turn_seat = None;
+            state.players.clear();
+
             // Danh sách toàn bộ người chơi tại bàn khi mở bàn (Field 4)
             if let Some(player_list) = thrift_data.get_field(4).and_then(|v| v.get_list()) {
                 for p_data in player_list {
                     let seat = p_data.get_field(1).and_then(|v| v.get_i32()).unwrap_or(-1) as usize;
                     let seat_status = p_data.get_field(2).and_then(|v| v.get_i32()).unwrap_or(0);
-                    if seat_status != 0 {
-                        if let Some(info) = p_data.get_field(3) {
-                            let pname = info.get_field(1).and_then(|v| v.get_str()).unwrap_or("?").to_string();
-                            let country = info.get_field(2).and_then(|v| v.get_str()).unwrap_or("??").to_string();
-                            let raw_stack = info.get_field(7).and_then(|v| v.get_i32()).unwrap_or(0).max(0) as u32;
-                            let stack = raw_stack / 100;
-                            let raw_cur_bet = p_data.get_field(4).and_then(|v| v.get_i32()).unwrap_or(0).max(0) as u32;
-                            let cur_bet = raw_cur_bet / 100;
+                    let pid = format!("seat_{}", seat);
 
-                            if !state.hero_id.is_empty() && pname.eq_ignore_ascii_case(&state.hero_id) {
-                                state.hero_seat = Some(seat);
-                                println!("🎯 [HERO NHẬN DIỆN]: Ghế #{} là Hero [{}]!", seat, pname);
-                            } else if state.hero_seat == Some(seat) && !pname.is_empty() && pname != "Player" {
-                                state.hero_id = pname.clone();
-                                println!("🎯 [HERO NHẬN DIỆN]: Ghế #{} là Hero [{}]!", seat, pname);
-                            }
+                    if seat_status == 0 {
+                        state.players.remove(&pid);
+                    } else if let Some(info) = p_data.get_field(3) {
+                        let pname = info.get_field(1).and_then(|v| v.get_str()).unwrap_or("?").to_string();
+                        let country = info.get_field(2).and_then(|v| v.get_str()).unwrap_or("??").to_string();
+                        let is_sitting_in = match info.get_field(4) {
+                            Some(ThriftVal::Bool(b)) => *b,
+                            _ => true,
+                        };
+                        let is_in_hand = match info.get_field(5) {
+                            Some(ThriftVal::Bool(b)) => *b,
+                            _ => true,
+                        };
+                        let raw_stack = info.get_field(7).and_then(|v| v.get_i32()).unwrap_or(0).max(0) as u32;
+                        let stack = raw_stack / 100;
+                        let raw_cur_bet = p_data.get_field(4).and_then(|v| v.get_i32()).unwrap_or(0).max(0) as u32;
+                        let cur_bet = raw_cur_bet / 100;
 
-                            let pid = format!("seat_{}", seat);
-                            let tracker = state.players.entry(pid.clone()).or_insert_with(|| PlayerTracker {
-                                id: pid.clone(),
-                                name: pname.clone(),
-                                seat_num: seat,
-                                stack,
-                                current_bet: cur_bet,
-                                total_contributed: cur_bet,
-                                is_folded: false,
-                                is_all_in: false,
-                            });
-                            tracker.name = pname.clone();
-                            tracker.seat_num = seat;
-                            tracker.stack = stack;
-                            tracker.current_bet = cur_bet;
-                            println!("👤 [BÀN CHƠI] Ghế #{}: {:<14} ({}) | Stack: {:>8} chip | Cược: {:>6} chip", seat, pname, country, stack, cur_bet);
+                        if !state.hero_id.is_empty() && pname.eq_ignore_ascii_case(&state.hero_id) {
+                            state.hero_seat = Some(seat);
+                            println!("🎯 [HERO NHẬN DIỆN]: Ghế #{} là Hero [{}]!", seat, pname);
+                        } else if state.hero_id.is_empty() && state.hero_seat == Some(seat) && !pname.is_empty() && pname != "Player" {
+                            state.hero_id = pname.clone();
+                            println!("🎯 [HERO NHẬN DIỆN]: Ghế #{} là Hero [{}]!", seat, pname);
                         }
+
+                        let tracker = state.players.entry(pid.clone()).or_insert_with(|| PlayerTracker {
+                            id: pid.clone(),
+                            name: pname.clone(),
+                            seat_num: seat,
+                            stack,
+                            current_bet: cur_bet,
+                            total_contributed: cur_bet,
+                            is_folded: false,
+                            is_all_in: false,
+                            is_sitting_out: !is_sitting_in,
+                            is_in_hand,
+                        });
+                        tracker.name = pname.clone();
+                        tracker.seat_num = seat;
+                        tracker.stack = stack;
+                        tracker.current_bet = cur_bet;
+                        tracker.is_sitting_out = !is_sitting_in;
+                        tracker.is_in_hand = is_in_hand;
+
+                        let status_note = if !is_sitting_in {
+                            " | ⏸️ [TẠM NGHỈ / SITTING OUT]"
+                        } else if !is_in_hand {
+                            " | ⏳ [ĐỢI BLIND / CHƯA CHƠI]"
+                        } else {
+                            ""
+                        };
+                        println!("👤 [BÀN CHƠI] Ghế #{}: {:<14} ({}) | Stack: {:>8} chip | Cược: {:>6} chip{}", seat, pname, country, stack, cur_bet, status_note);
                     }
                 }
             }
@@ -1141,9 +1358,23 @@ pub fn process_pokerstars_thrift_packet(
         0x006c => { // CẬP NHẬT GHẾ & NGƯỜI CHƠI (PLAYER SEAT)
             if let Some(p_data) = thrift_data.get_field(2) {
                 let seat = p_data.get_field(1).and_then(|v| v.get_i32()).unwrap_or(-1) as usize;
-                if let Some(info) = p_data.get_field(3) {
+                let seat_status = p_data.get_field(2).and_then(|v| v.get_i32()).unwrap_or(0);
+                let pid = format!("seat_{}", seat);
+
+                if seat_status == 0 {
+                    state.players.remove(&pid);
+                    println!("🚪 [RỜI BÀN] Ghế #{}: Đã rời bàn / ghế trống", seat);
+                } else if let Some(info) = p_data.get_field(3) {
                     let pname = info.get_field(1).and_then(|v| v.get_str()).unwrap_or("?").to_string();
                     let country = info.get_field(2).and_then(|v| v.get_str()).unwrap_or("??").to_string();
+                    let is_sitting_in = match info.get_field(4) {
+                        Some(ThriftVal::Bool(b)) => *b,
+                        _ => true,
+                    };
+                    let is_in_hand = match info.get_field(5) {
+                        Some(ThriftVal::Bool(b)) => *b,
+                        _ => true,
+                    };
                     let raw_stack = info.get_field(7).and_then(|v| v.get_i32()).unwrap_or(0).max(0) as u32;
                     let stack = raw_stack / 100;
                     let raw_cur_bet = p_data.get_field(4).and_then(|v| v.get_i32()).unwrap_or(0).max(0) as u32;
@@ -1152,12 +1383,11 @@ pub fn process_pokerstars_thrift_packet(
                     if !state.hero_id.is_empty() && pname.eq_ignore_ascii_case(&state.hero_id) {
                         state.hero_seat = Some(seat);
                         println!("🎯 [HERO NHẬN DIỆN]: Ghế #{} là Hero [{}]!", seat, pname);
-                    } else if state.hero_seat == Some(seat) && !pname.is_empty() && pname != "Player" {
+                    } else if state.hero_id.is_empty() && state.hero_seat == Some(seat) && !pname.is_empty() && pname != "Player" {
                         state.hero_id = pname.clone();
                         println!("🎯 [HERO NHẬN DIỆN]: Ghế #{} là Hero [{}]!", seat, pname);
                     }
 
-                    let pid = format!("seat_{}", seat);
                     let tracker = state.players.entry(pid.clone()).or_insert_with(|| PlayerTracker {
                         id: pid.clone(),
                         name: pname.clone(),
@@ -1166,13 +1396,34 @@ pub fn process_pokerstars_thrift_packet(
                         current_bet: cur_bet,
                         total_contributed: cur_bet,
                         is_folded: false,
-                        is_all_in: false,
+                        is_all_in: stack == 0 && cur_bet > 0,
+                        is_sitting_out: !is_sitting_in,
+                        is_in_hand,
                     });
                     tracker.name = pname.clone();
                     tracker.seat_num = seat;
                     tracker.stack = stack;
-                    tracker.current_bet = cur_bet;
-                    println!("👤 [NGƯỜI CHƠI] Ghế #{}: {:<14} ({}) | Stack: {:>8} chip | Cược: {:>6} chip", seat, pname, country, stack, cur_bet);
+                    if cur_bet > tracker.current_bet {
+                        tracker.current_bet = cur_bet;
+                    }
+                    tracker.is_sitting_out = !is_sitting_in;
+                    if !tracker.is_folded && (tracker.current_bet > 0 || tracker.total_contributed > 0 || tracker.is_all_in) {
+                        tracker.is_in_hand = true;
+                    } else {
+                        tracker.is_in_hand = is_in_hand;
+                    }
+                    if stack == 0 && (tracker.current_bet > 0 || tracker.total_contributed > 0) {
+                        tracker.is_all_in = true;
+                    }
+
+                    let status_note = if !is_sitting_in {
+                        " | ⏸️ [TẠM NGHỈ / SITTING OUT]"
+                    } else if !is_in_hand {
+                        " | ⏳ [ĐỢI BLIND / CHƯA CHƠI]"
+                    } else {
+                        ""
+                    };
+                    println!("👤 [NGƯỜI CHƠI] Ghế #{}: {:<14} ({}) | Stack: {:>8} chip | Cược: {:>6} chip{}", seat, pname, country, stack, cur_bet, status_note);
                 }
             }
         }
@@ -1199,19 +1450,106 @@ pub fn process_pokerstars_thrift_packet(
             };
 
             if let Some(p) = state.players.get_mut(&pid) {
+                let prev_bet = p.current_bet;
+                let delta = amount.saturating_sub(prev_bet);
+
                 if action_type == 10 || action_type == 7 {
                     p.is_folded = true;
+                    if Some(seat) == state.hero_seat {
+                        state.hero_cards = None;
+                        state.has_evaluated_this_decision = false;
+                        state.action_history.clear();
+                        state.community_cards.clear();
+                        state.street = Street::Preflop;
+                        state.total_pot = 0;
+                        state.highest_bet = 0;
+                        state.current_turn_seat = None;
+                        println!("🛡️ [HERO FOLD / ZOOM RESET] Hero đã Fold -> Đã reset trạng thái ván cũ!");
+                    } else {
+                        state.has_evaluated_this_decision = false;
+                    }
+                    state.action_history.push(HandActionRecord {
+                        player_id: pid.clone(),
+                        seat_num: seat,
+                        street: state.street,
+                        action: Action::Fold,
+                        amount: 0,
+                    });
                 } else if action_type == 11 {
                     p.is_folded = false;
-                } else {
+                    if Some(seat) != state.hero_seat {
+                        state.has_evaluated_this_decision = false;
+                    }
+                    state.action_history.push(HandActionRecord {
+                        player_id: pid.clone(),
+                        seat_num: seat,
+                        street: state.street,
+                        action: Action::CheckCall,
+                        amount: 0,
+                    });
+                } else if action_type == 12 { // CALL
                     p.is_folded = false;
-                    let prev_highest = state.highest_bet;
                     p.current_bet = amount;
-                    if amount > prev_highest {
-                        let raise_diff = amount - prev_highest;
+                    p.total_contributed += delta;
+                    if Some(seat) != state.hero_seat {
+                        state.has_evaluated_this_decision = false;
+                    }
+                    if p.stack == 0 || (p.stack > 0 && delta >= p.stack) {
+                        p.is_all_in = true;
+                        println!("🚨 [CALL ALL-IN DETECTED] Ghế #{} [{}] Call hết chip -> Đánh dấu ALL-IN!", seat, p.name);
+                    }
+                    state.action_history.push(HandActionRecord {
+                        player_id: pid.clone(),
+                        seat_num: seat,
+                        street: state.street,
+                        action: if p.is_all_in { Action::AllIn } else { Action::CheckCall },
+                        amount: delta,
+                    });
+                } else if action_type == 13 || action_type == 14 || action_type == 15 {
+                    p.is_folded = false;
+                    p.current_bet = amount;
+                    p.total_contributed += delta;
+                    if Some(seat) != state.hero_seat {
+                        state.has_evaluated_this_decision = false;
+                    }
+                    if action_type == 14 || p.stack == 0 || (p.stack > 0 && delta >= p.stack) {
+                        p.is_all_in = true;
+                        println!("🚨 [ALL-IN SHOVE DETECTED] Ghế #{} [{}] Tố hết chip -> Đánh dấu ALL-IN!", seat, p.name);
+                    }
+
+                    if amount > state.highest_bet {
+                        let raise_diff = amount - state.highest_bet;
                         if raise_diff >= state.min_raise {
                             state.min_raise = raise_diff;
                         }
+                        state.highest_bet = amount;
+                    }
+
+                    let act_enum = if action_type == 14 || p.is_all_in {
+                        Action::AllIn
+                    } else if delta <= state.bb_size * 2 && state.street != Street::Preflop {
+                        Action::BetSmall
+                    } else if (delta as f32) < (state.total_pot.max(state.bb_size * 2) as f32 * 0.50) {
+                        Action::BetPot33
+                    } else {
+                        Action::BetPot75
+                    };
+
+                    state.action_history.push(HandActionRecord {
+                        player_id: pid.clone(),
+                        seat_num: seat,
+                        street: state.street,
+                        action: act_enum,
+                        amount: delta,
+                    });
+                } else if action_type == 3 || action_type == 4 || action_type == 5 { // BLINDS / ANTE
+                    p.is_folded = false;
+                    p.current_bet = amount;
+                    p.total_contributed += delta;
+                    if Some(seat) != state.hero_seat {
+                        state.has_evaluated_this_decision = false;
+                    }
+                    if amount > state.highest_bet {
                         state.highest_bet = amount;
                     }
                 }
@@ -1283,6 +1621,9 @@ pub fn process_pokerstars_thrift_packet(
             let pid = format!("seat_{}", seat);
             if let Some(p) = state.players.get_mut(&pid) {
                 p.stack = stack;
+                if stack == 0 && (p.current_bet > 0 || p.total_contributed > 0) {
+                    p.is_all_in = true;
+                }
             }
         }
         0x0077 => { // CẬP NHẬT TIỀN CƯỢC (BET UPDATE)
@@ -1364,7 +1705,7 @@ pub fn process_pokerstars_thrift_packet(
             state.hero_seat = Some(seat);
             let pid = format!("seat_{}", seat);
             if let Some(p) = state.players.get(&pid) {
-                if !p.name.is_empty() && p.name != "Player" {
+                if !p.name.is_empty() && p.name != "Player" && state.hero_id.is_empty() {
                     state.hero_id = p.name.clone();
                 }
             }
@@ -1381,6 +1722,17 @@ pub fn process_pokerstars_thrift_packet(
                 }
                 if hero_cards.len() == 2 {
                     let hole = [hero_cards[0], hero_cards[1]];
+                    let is_new_cards = state.hero_cards != Some(hole);
+
+                    if is_new_cards && state.community_cards.is_empty() {
+                        state.has_evaluated_this_decision = false;
+                        state.community_cards.clear();
+                        state.action_history.clear();
+                        state.street = Street::Preflop;
+                        state.highest_bet = 0;
+                        state.min_raise = state.bb_size;
+                    }
+
                     state.hero_cards = Some(hole);
                     let hand_desc = thrift_data.get_field(4).and_then(|v| v.get_str()).unwrap_or("");
                     if !hand_desc.is_empty() {
@@ -1436,6 +1788,8 @@ pub fn process_pokerstars_thrift_packet(
 
                     state.has_evaluated_this_decision = true;
                     return run_gto_evaluation(state, hole, policy, decision_mode, use_os_enigo);
+                } else {
+                    println!("⏸️ [LƯỢT HERO] Đã đánh giá quyết định cho lượt này rồi (chờ thực thi lệnh cược).");
                 }
             } else {
                 state.has_evaluated_this_decision = false;

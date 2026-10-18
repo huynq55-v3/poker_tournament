@@ -1,12 +1,14 @@
 use poker_tournament::benchmark::{
-    append_csv, evaluate_against_champion_table, print_table, run_suite, score,
+    append_csv, evaluate_against_champion_table, evaluate_against_champion_tournament,
+    print_table, run_suite, score, simulate_demo_tournament, simulate_hero_tournament,
+    TournamentArenaResult,
 };
 use poker_tournament::deep_cfr::DeepCFRPolicy;
 use poker_tournament::deep_cfr::DeepCFRTrainer;
-use poker_tournament::environment::{Environment, FEATURE_DIM};
-use poker_tournament::gui_bridge::TableViewModel;
+use poker_tournament::environment::FEATURE_DIM;
 use poker_tournament::neural_network::MLP;
-use poker_tournament::self_play::SelfPlayEngine;
+use rand::thread_rng;
+use rayon::prelude::*;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -17,37 +19,35 @@ const LAST_STRAT: &str = "deep_cfr_last_strategy.json";
 const BENCH_CSV: &str = "benchmark_log.csv";
 
 /// Phân tích tham số dòng lệnh linh hoạt:
-/// - Tham số 1: Số người chơi trên bàn (6 hoặc 8 người)
-/// - Tham số 2: Hàm thưởng (ICM hoặc EV thuần)
+/// - Mặc định: Bàn 8-Max, Tournament ICM, 50 BB khởi điểm, giả lập đến khi hết tour
 fn parse_args() -> (usize, bool) {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("============================================================");
-        println!("🚀 POKER AI DEEP CFR TRAINING - HƯỚNG DẪN CẤU HÌNH 🚀");
+        println!("🚀 POKER AI DEEP CFR - TOURNAMENT 8-MAX (50 BB / HẾT TOUR) 🚀");
         println!("============================================================");
         println!("Cú pháp: cargo run --release -- [SỐ_NGƯỜI: 6|8] [CHẾ_ĐỘ: icm|ev]");
         println!("Hoặc:   cargo run --release -- [--players 6|8] [--icm|--ev]");
         println!();
         println!("Tham số 1: Quy mô bàn");
-        println!("  6 hoặc --players 6 hoặc --6max : Bàn 6-Max (tối đa 6 người chơi)");
-        println!("  8 hoặc --players 8 hoặc --8max : Bàn 8-Max (tối đa 8 người chơi)");
+        println!("  8 hoặc --players 8 hoặc --8max : Bàn 8-Max (Mặc định cho giải đấu)");
+        println!("  6 hoặc --players 6 hoặc --6max : Bàn 6-Max");
         println!();
         println!("Tham số 2: Hàm thưởng (Reward)");
         println!("  icm hoặc --icm                 : Bật Tournament ICM (Sit & Go, Payout Zero-Sum)");
         println!("  ev hoặc --ev hoặc --chip-ev    : Dùng Chip-EV thuần (Cash Game / EV Max)");
         println!();
-        println!("Độ sâu stack:");
-        println!("  🟢 Mỗi người chơi cầm 100 BB khi train (thay vì 50 BB max trước đây).");
+        println!("Độ sâu stack & Cơ chế giải đấu:");
+        println!("  🟢 Mỗi người chơi ban đầu có 50 BB (Tổng bàn 8-Max là 400 BB).");
+        println!("  🏆 Giả lập giải đấu toàn diện từ 8 người rụng dần đến khi chỉ còn 1 người vô địch (Hết tour).");
         println!();
         println!("Ví dụ thực chiến:");
-        println!("  1. Bàn 6-max, dùng EV thuần:");
-        println!("     cargo run --release -- 6 ev");
+        println!("  1. Bàn 8-max Tournament ICM (Khuyên dùng):");
+        println!("     cargo run --release");
         println!("  2. Bàn 6-max, dùng Tournament ICM:");
         println!("     cargo run --release -- 6 icm");
-        println!("  3. Bàn 8-max, dùng Tournament ICM:");
-        println!("     cargo run --release -- 8 icm");
-        println!("  4. Bàn 8-max, dùng EV thuần:");
+        println!("  3. Bàn 8-max, dùng EV thuần:");
         println!("     cargo run --release -- 8 ev");
         println!("============================================================");
         std::process::exit(0);
@@ -122,11 +122,13 @@ fn parse_args() -> (usize, bool) {
 
 fn main() {
     let (max_players, use_icm) = parse_args();
-    let mode_desc = if use_icm { "TOURNAMENT ICM" } else { "CHIP-EV THUẦN" };
+    let initial_bb = 50u32; // 🟢 Mỗi người chơi ban đầu có 50 BB (tổng 400 BB cả giải)
+    let mode_desc = if use_icm { "TOURNAMENT ICM (FULL RUN TO WINNER)" } else { "CHIP-EV THUẦN" };
 
     println!("============================================================");
-    println!("🚀 POKER AI DEEP CFR ({}-MAX ARENA GATING / 100 BB STACK) 🚀", max_players);
-    println!("⚙️  CẤU HÌNH TRAIN: Bàn {}-Max | Chế độ: {} | Stack: 100 BB/người", max_players, mode_desc);
+    println!("🚀 POKER AI DEEP CFR ({}-MAX TOURNAMENT / 50 BB KHỞI ĐIỂM) 🚀", max_players);
+    println!("⚙️  CẤU HÌNH: Bàn {}-Max | Chế độ: {} | Stack: {} BB/người", max_players, mode_desc, initial_bb);
+    println!("🏆 MỤC TIÊU: Giả lập giải đấu toàn diện từ {} người rụng dần đến khi hết tour!", max_players);
     println!("============================================================");
 
     let mut rng = rand::thread_rng();
@@ -136,29 +138,30 @@ fn main() {
     let _ = poker_tournament::equity::preflop_table();
     println!("   ✅ Ready in {:.1}s", t0.elapsed().as_secs_f64());
 
-    println!("\n[1] 🏋️ Deep CFR training with {}-Max Arena Gating & {} (100 BB Stack)...", max_players, mode_desc);
+    println!("\n[1] 🏋️ Deep CFR training with {}-Max Tournament Gating (50 BB Stack -> End of Tour)...", max_players);
     
     // Kiến trúc mạng nơ-ron: 3 tầng ẩn đủ sâu cho 176 features
     let hidden_dims = [256, 256, 128];
     
-    // Capacity 2.5M mẫu là vừa vặn bộ nhớ RAM
+    // Capacity 2.5M mẫu vừa vặn bộ nhớ RAM
     let mut trainer = DeepCFRTrainer::new(FEATURE_DIM, &hidden_dims, 2_500_000, use_icm);
-    trainer.max_players = max_players; // 🟢 Bàn max 6 hoặc max 8 người
-    trainer.fixed_players = None;      // Ưu tiên bàn max_players đã chọn (có cọ xát heads-up/short-handed)
-    trainer.use_icm = use_icm;         // 🟢 Bật Tournament ICM hoặc dùng Chip-EV thuần
-    trainer.stack_bb = 100;            // 🟢 Mỗi người chơi cầm 100 BB khi train thay vì 50 BB max
-    trainer.lr = 0.0005;               // Giảm nhẹ learning rate để tránh dao động All-in rác
+    trainer.max_players = max_players;   // 🟢 Bàn max 8 người (có phủ Heads-up, 3-max, Bubble 5-max)
+    trainer.fixed_players = None;        // Phủ đều mọi giai đoạn giải đấu
+    trainer.use_icm = use_icm;           // 🟢 Bật Tournament ICM (Malmuth-Harville)
+    trainer.stack_bb = initial_bb;       // 🟢 Mỗi người ban đầu 50 BB (tổng chip toàn giải bảo toàn 400 BB)
+    trainer.is_cash_game = false;        // Giải đấu Tournament (No rake)
+    trainer.lr = 0.0005;
 
-    let total_iterations = 10_000;     // Chạy liên tục 10,000 iterations
-    let traversals_per_iter = 250;     // Duyệt cây mỗi iter
-    let train_steps_per_iter = 400;    // Ép mạng học kỹ các tình huống
-    let batch_size = 512;              // Kích thước vàng cho SIMD/Rayon
+    let total_iterations = 10_000;       // Chạy liên tục 10,000 iterations
+    let traversals_per_iter = 250;       // Duyệt cây mỗi iter
+    let train_steps_per_iter = 400;      // Ép mạng học kỹ các tình huống
+    let batch_size = 512;                // Kích thước vàng cho SIMD/Rayon
 
-    let bench_every = 10;              // Benchmark và đấu trường Arena mỗi 10 iters
-    let arena_hands = 6000;            // Đủ tin cậy để soán ngôi Champion
-    let arena_stack_bb = 100;          // 🟢 Đấu trường Arena 100 BB thực chiến chuẩn
-    let bench_hands = 6000;            // Đánh giá đối thủ tĩnh
-    let depths = [100u32, 50u32, 25u32, 12u32]; // 🟢 Đầy đủ các mốc stack 100 BB, 50 BB, 25 BB và Push/Fold 12 BB!
+    let bench_every = 10;                // Đấu trường Arena mỗi 10 iters
+    let arena_tournaments = 100;         // Đấu 100 giải đấu Sit & Go trọn vẹn mỗi lần kiểm tra Champion
+    let arena_hands_cash = 6000;         // Nếu ở chế độ Cash EV
+    let bench_hands = 6000;              // Đánh giá đối thủ tĩnh
+    let depths = [50u32, 25u32, 12u32, 8u32]; // Các mốc stack tiêu biểu trong Tournament 50 BB
 
     let _ = std::fs::remove_file(BENCH_CSV);
 
@@ -178,37 +181,72 @@ fn main() {
 
         if iter % bench_every == 0 {
             let bt = Instant::now();
-
-            println!("\n   ⚔️  ĐẤU TRƯỜNG {}-MAX (100 BB): Challenger (Iter {}) vs Champion...", max_players, iter);
             let challenger_policy = DeepCFRPolicy::new(Arc::clone(&trainer.advantage_net), false);
             let champion_policy = DeepCFRPolicy::new(Arc::new(RwLock::new(current_champion_net.clone())), false);
 
-            let arena_res = evaluate_against_champion_table(
-                &challenger_policy,
-                &champion_policy,
-                arena_hands,
-                arena_stack_bb,
-                max_players,
-            );
-
-            println!(
-                "   📊 Kết quả Arena: {:+.2} ± {:.2} bb/100 | TrashShove: {:.2}% | {} ván trong {:.1}s",
-                arena_res.challenger_bb_per_100,
-                arena_res.ci95,
-                arena_res.challenger_trash_shove_pct,
-                arena_res.hands,
-                bt.elapsed().as_secs_f64()
-            );
-
-            if arena_res.is_winner {
-                println!(
-                    "   👑 SOÁN NGÔI THÀNH CÔNG! (+{:.2} bb/100) -> Đã lưu Champion mới vào {}!",
-                    arena_res.challenger_bb_per_100, BEST_ADV
+            if use_icm {
+                println!("\n   ⚔️  ĐẤU TRƯỜNG TOURNAMENT {}-MAX (50 BB Khởi Điểm - Đánh Đến Khi Hết Tour): Challenger (Iter {}) vs Champion...", max_players, iter);
+                let tour_res: TournamentArenaResult = evaluate_against_champion_tournament(
+                    &challenger_policy,
+                    &champion_policy,
+                    arena_tournaments,
+                    initial_bb,
+                    max_players,
                 );
-                current_champion_net = trainer.advantage_net.read().unwrap().clone();
-                let _ = trainer.save_models(BEST_ADV, BEST_STRAT);
+
+                println!(
+                    "   📊 Kết quả Tournament Arena: Vô địch: {} vs {} (Champ) | ITM (Top 3): {} | Rank TB: {:.2} vs {:.2} | ICM EV: {:+.3} | TrashShove: {:.2}% | {} ván ({:.1} ván/tour) trong {:.1}s",
+                    tour_res.challenger_first_places,
+                    tour_res.champion_first_places,
+                    tour_res.challenger_itm_count,
+                    tour_res.challenger_avg_rank,
+                    tour_res.champion_avg_rank,
+                    tour_res.challenger_avg_icm_payout,
+                    tour_res.challenger_trash_shove_pct,
+                    tour_res.total_hands,
+                    tour_res.avg_hands_per_tour,
+                    bt.elapsed().as_secs_f64()
+                );
+
+                if tour_res.is_winner {
+                    println!(
+                        "   👑 SOÁN NGÔI THÀNH CÔNG! Challenger vượt trội tại giải đấu (Rank TB {:.2} vs {:.2}) -> Đã lưu Champion mới vào {}!",
+                        tour_res.challenger_avg_rank, tour_res.champion_avg_rank, BEST_ADV
+                    );
+                    current_champion_net = trainer.advantage_net.read().unwrap().clone();
+                    let _ = trainer.save_models(BEST_ADV, BEST_STRAT);
+                } else {
+                    println!("   🛡️  Champion giữ vững ngôi vương. Chưa đủ cách biệt thống kê (hoặc TrashShove > 5%).");
+                }
             } else {
-                println!("   🛡️  Champion giữ vững ngôi vương. Chưa đủ cách biệt thống kê (hoặc TrashShove > 5%).");
+                println!("\n   ⚔️  ĐẤU TRƯỜNG {}-MAX (50 BB): Challenger (Iter {}) vs Champion...", max_players, iter);
+                let arena_res = evaluate_against_champion_table(
+                    &challenger_policy,
+                    &champion_policy,
+                    arena_hands_cash,
+                    initial_bb,
+                    max_players,
+                );
+
+                println!(
+                    "   📊 Kết quả Arena: {:+.2} ± {:.2} bb/100 | TrashShove: {:.2}% | {} ván trong {:.1}s",
+                    arena_res.challenger_bb_per_100,
+                    arena_res.ci95,
+                    arena_res.challenger_trash_shove_pct,
+                    arena_res.hands,
+                    bt.elapsed().as_secs_f64()
+                );
+
+                if arena_res.is_winner {
+                    println!(
+                        "   👑 SOÁN NGÔI THÀNH CÔNG! (+{:.2} bb/100) -> Đã lưu Champion mới vào {}!",
+                        arena_res.challenger_bb_per_100, BEST_ADV
+                    );
+                    current_champion_net = trainer.advantage_net.read().unwrap().clone();
+                    let _ = trainer.save_models(BEST_ADV, BEST_STRAT);
+                } else {
+                    println!("   🛡️  Champion giữ vững ngôi vương. Chưa đủ cách biệt thống kê (hoặc TrashShove > 5%).");
+                }
             }
 
             let r_adv = run_suite(&challenger_policy, bench_hands, &depths);
@@ -218,7 +256,7 @@ fn main() {
             let s = score(&r_adv);
             println!("   🧪 Benchmark log score: {:+.1} bb/100\n", s);
 
-            // Tự động lưu checkpoint mới nhất phòng khi dừng máy giữa chừng
+            // Tự động lưu checkpoint mới nhất
             let _ = trainer.save_models(LAST_ADV, LAST_STRAT);
         }
 
@@ -238,31 +276,68 @@ fn main() {
     let adv = MLP::load_from_file(BEST_ADV).unwrap_or_else(|_| trainer.advantage_net.read().unwrap().clone());
     let best_policy = Arc::new(DeepCFRPolicy::new(Arc::new(RwLock::new(adv)), false));
 
+    if use_icm {
+        println!("   🏆 Đang kiểm tra 500 giải đấu Tournament 8-max (50 BB khởi điểm, đánh đến khi hết tour)...");
+        let dummy_champ = DeepCFRPolicy::new(Arc::new(RwLock::new(current_champion_net.clone())), false);
+        let final_tour = evaluate_against_champion_tournament(
+            best_policy.as_ref(),
+            &dummy_champ,
+            500,
+            initial_bb,
+            max_players,
+        );
+        println!(
+            "   📊 Tổng kết 500 Tournaments: Vô địch: {} vs {} (Champ) | ITM: {} | Rank TB: {:.2} vs {:.2} | ICM Payout: {:+.3} | TB {:.1} ván/tour",
+            final_tour.challenger_first_places,
+            final_tour.champion_first_places,
+            final_tour.challenger_itm_count,
+            final_tour.challenger_avg_rank,
+            final_tour.champion_avg_rank,
+            final_tour.challenger_avg_icm_payout,
+            final_tour.avg_hands_per_tour
+        );
+    }
+
     let final_res = run_suite(best_policy.as_ref(), 10_000, &depths);
-    print_table("BEST checkpoint (10k hands/cell)", &final_res);
+    print_table("BEST checkpoint vs Baselines", &final_res);
     let _ = append_csv(BENCH_CSV, total_iterations, "final_best", &final_res);
 
-    println!("\n[3] 🎯 Action probabilities on a {}-player hand (100 BB stack)...", max_players);
-    let num_players = max_players;
-    let (bb, sb, button_idx) = (100, 50, 0);
-    let stacks = vec![100 * bb; num_players];
-    let mut env = Environment::new(num_players, &stacks, bb, sb, button_idx);
-    env.reset_hand(&mut rng, button_idx);
-    let mask = env.get_action_mask();
-    let table_vm = TableViewModel::from_game_state(&env.state, &mask, Some(best_policy.as_ref()), true);
-    println!("{}", serde_json::to_string_pretty(&table_vm).unwrap());
+    println!("\n[3] 🏆 LIVE SIMULATION: 1 GIẢI ĐẤU MẪU {}-MAX (50 BB) ĐÁNH ĐẾN KHI HẾT TOUR...", max_players);
+    simulate_demo_tournament(best_policy.as_ref(), max_players, initial_bb, &mut rng);
 
-    println!("\n[4] ⚡️ Self-play throughput...");
-    let engine = SelfPlayEngine::new();
-    let num_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(4);
-    let sim_start = Instant::now();
-    let rx = engine.run_parallel_simulation(Arc::clone(&best_policy), num_workers, 20_000, 10_000);
-    let mut total_transitions = 0u64;
-    while let Ok(_t) = rx.recv() {
-        total_transitions += 1;
+    println!("\n[4] ⚡️ TOURNAMENT SUITE: MÔ PHỎNG 1,000 GIẢI ĐẤU ĐO HIỆU NĂNG TOÀN DIỆN...");
+    let t_start = Instant::now();
+    let num_sim_tours = 1000;
+
+    let results: Vec<(usize, usize)> = (0..num_sim_tours)
+        .into_par_iter()
+        .map(|_| {
+            let mut trng = thread_rng();
+            simulate_hero_tournament(best_policy.as_ref(), max_players, initial_bb, &mut trng)
+        })
+        .collect();
+
+    let mut finishes = [0usize; 8];
+    let mut total_hands = 0usize;
+
+    for &(rank, hands) in &results {
+        if rank >= 1 && rank <= 8 {
+            finishes[rank - 1] += 1;
+        }
+        total_hands += hands;
     }
-    let elapsed = sim_start.elapsed().as_secs_f64();
-    let simulated = engine.total_simulated_hands.load(std::sync::atomic::Ordering::Relaxed);
-    println!("   🃏 {} hands, {} transitions, {:.1} hands/sec", simulated, total_transitions, simulated as f64 / elapsed);
+
+    let elapsed = t_start.elapsed().as_secs_f64();
+    let itm = finishes[0] + finishes[1] + finishes[2];
+    let avg_rank: f64 = finishes.iter().enumerate().map(|(i, &c)| (i + 1) as f64 * c as f64).sum::<f64>() / num_sim_tours as f64;
+
+    println!("   🏆 Tổng số giải đấu hoàn tất: {} giải trong {:.2}s ({:.1} tours/sec)", num_sim_tours, elapsed, num_sim_tours as f64 / elapsed);
+    println!("   🥇 Vô địch (Top 1)        : {:4} lần ({:5.1}%) [Kỳ vọng ngẫu nhiên: 12.5%]", finishes[0], finishes[0] as f64 * 100.0 / num_sim_tours as f64);
+    println!("   🥈 Á quân  (Top 2)        : {:4} lần ({:5.1}%)", finishes[1], finishes[1] as f64 * 100.0 / num_sim_tours as f64);
+    println!("   🥉 Hạng 3   (Top 3)        : {:4} lần ({:5.1}%)", finishes[2], finishes[2] as f64 * 100.0 / num_sim_tours as f64);
+    println!("   💰 Tỷ lệ vào tiền (ITM Top 3): {:4} lần ({:5.1}%)", itm, itm as f64 * 100.0 / num_sim_tours as f64);
+    println!("   💀 Bị loại sớm (Hạng 7-8)  : {:4} lần ({:5.1}%)", finishes[6] + finishes[7], (finishes[6] + finishes[7]) as f64 * 100.0 / num_sim_tours as f64);
+    println!("   📊 Thứ hạng trung bình     : {:.2} / {}", avg_rank, max_players);
+    println!("   ⏱️  Số ván trung bình/tour  : {:.1} ván", total_hands as f64 / num_sim_tours as f64);
     println!("\n📈 Benchmark history: {}", BENCH_CSV);
 }

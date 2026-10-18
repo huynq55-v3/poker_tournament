@@ -357,13 +357,33 @@ impl DeepCFRTrainer {
             .map(|_| {
                 let mut trng = rand::thread_rng();
                 let n = fixed.unwrap_or_else(|| {
-                    if max_p <= 6 {
+                    if max_p <= 4 {
+                        if trng.gen_bool(0.20) {
+                            2
+                        } else if trng.gen_bool(0.20) {
+                            3
+                        } else {
+                            max_p
+                        }
+                    } else if max_p <= 6 {
                         if trng.gen_bool(0.15) {
                             2
                         } else if trng.gen_bool(0.75) {
-                            6
+                            max_p
                         } else {
-                            trng.gen_range(3..=5)
+                            trng.gen_range(3..=max_p.saturating_sub(1).max(3))
+                        }
+                    } else if use_icm {
+                        // Tournament 8-Max: Phủ đều toàn bộ giải đấu từ đầu (8 người) đến chung kết (2 người)
+                        let roll: f32 = trng.gen();
+                        if roll < 0.35 {
+                            trng.gen_range(7..=8) // 35% Full Table (8 và 7 người)
+                        } else if roll < 0.70 {
+                            trng.gen_range(4..=6) // 35% Mid Table & Vòng Bubble sống còn
+                        } else if roll < 0.85 {
+                            3                     // 15% Vòng 3 người (In The Money)
+                        } else {
+                            2                     // 15% Chung kết Heads-Up tranh Vô Địch
                         }
                     } else {
                         if trng.gen_bool(0.15) {
@@ -378,9 +398,19 @@ impl DeepCFRTrainer {
                 let button = trng.gen_range(0..n);
                 let stacks = if is_cash {
                     TournamentStackSampler::sample_cash_game_stacks(&mut trng, n, bb_size)
+                } else if use_icm && stack_depth > 0 {
+                    // Mô phỏng diễn biến tournament bắt đầu với stack_depth (vd: 50 BB/người)
+                    // và bảo toàn tổng chip toàn giải (8 * 50 BB = 400 BB) khi người chơi rụng dần
+                    TournamentStackSampler::sample_tournament_progression_stacks(
+                        &mut trng,
+                        n,
+                        stack_depth,
+                        max_p,
+                        bb_size,
+                    )
                 } else if stack_depth > 0 {
                     vec![stack_depth * bb_size; n]
-                } else if trng.gen_bool(0.55) {
+                } else if trng.gen_bool(0.25) {
                     TournamentStackSampler::sample_equal_stacks(&mut trng, n, bb_size)
                 } else {
                     TournamentStackSampler::sample_dirichlet_stacks(&mut trng, n, bb_size)

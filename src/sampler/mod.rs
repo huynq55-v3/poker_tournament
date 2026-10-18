@@ -79,6 +79,49 @@ impl TournamentStackSampler {
         stacks
     }
 
+    /// Mô phỏng phân bổ stack trong các giai đoạn của giải đấu Tournament 8-max (50 BB khởi điểm, tổng 400 BB):
+    /// - Khi n = 8: 40% là ván đầu 50 BB đều nhau; 60% là chênh lệch nhẹ quanh 50 BB.
+    /// - Khi n < 8: 400 BB được dồn cho n người còn lại (trung bình 400 / n BB), phân bổ bất đối xứng Dirichlet.
+    pub fn sample_tournament_progression_stacks<R: Rng>(
+        rng: &mut R,
+        num_players: usize,
+        initial_bb_per_player: u32,
+        total_initial_players: usize,
+        bb_size: u32,
+    ) -> Vec<u32> {
+        let n = num_players.clamp(2, 8);
+        let total_chips = (total_initial_players as f64) * (initial_bb_per_player as f64) * (bb_size as f64);
+
+        if n == total_initial_players && rng.gen_bool(0.40) {
+            return vec![initial_bb_per_player * bb_size; n];
+        }
+
+        let alpha: f64 = rng.gen_range(0.6..1.6);
+        let gamma = Gamma::new(alpha, 1.0).unwrap();
+        let samples: Vec<f64> = (0..n).map(|_| gamma.sample(rng)).collect();
+        let sum: f64 = samples.iter().sum();
+
+        let mut stacks: Vec<u32> = samples
+            .iter()
+            .map(|&s| {
+                let proportion = s / sum;
+                let raw_chips = proportion * total_chips;
+                let min_chips = 4.0 * (bb_size as f64);
+                let max_chips = (total_chips - (n as f64 - 1.0) * min_chips).max(min_chips);
+                raw_chips.clamp(min_chips, max_chips).round() as u32
+            })
+            .collect();
+
+        let chip_unit = (bb_size / 2).max(1);
+        for s in &mut stacks {
+            *s = (*s / chip_unit) * chip_unit;
+            if *s < 4 * bb_size {
+                *s = 4 * bb_size;
+            }
+        }
+        stacks
+    }
+
     /// Sample stack sizes via Log-Normal distribution
     pub fn sample_log_normal_stacks<R: Rng>(
         rng: &mut R,
