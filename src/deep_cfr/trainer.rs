@@ -453,20 +453,23 @@ impl DeepCFRTrainer {
                 .into_par_iter()
                 .map(|_| {
                     let mut trng = rand::thread_rng();
-                    // Phân bổ có chủ đích: 50% cho 50 BB, 30% cho 25 BB, 20% cho 12 BB
+                    // Phân bổ có chủ đích đa tầng stack: 50 BB (40%), 25 BB (30%), 12 BB (15%), 8 BB (15%)
                     let roll: f32 = trng.gen();
-                    let target_depth = if roll < 0.50 {
+                    let target_depth = if roll < 0.40 {
                         50u32
-                    } else if roll < 0.80 {
+                    } else if roll < 0.70 {
                         25u32
-                    } else {
+                    } else if roll < 0.85 {
                         12u32
+                    } else {
+                        8u32
                     };
 
                     let n = match target_depth {
                         50 => max_p.clamp(6, 8),
                         25 => trng.gen_range(5..=max_p.clamp(6, 8)),
-                        _ => trng.gen_range(3..=6.min(max_p)),
+                        12 => trng.gen_range(3..=6.min(max_p)),
+                        _ => trng.gen_range(2..=max_p), // 8 BB phủ từ Heads-Up đến Short-handed & Full-ring
                     };
 
                     let button = trng.gen_range(0..n);
