@@ -59,11 +59,15 @@ impl DeepCFRPolicy {
             probs
         } else {
             // Khi toàn bộ Regret đều âm hoặc trong ngưỡng nhiễu:
-            // Tìm hành động hợp lệ có giá trị regret lớn nhất (Argmax)
+            // Tìm hành động hợp lệ có giá trị regret lớn nhất (Argmax),
+            // loại trừ AllIn để tránh việc All-in ngẫu nhiên do nhiễu float khi bài yếu.
             let mut best_idx = None;
             let mut best_val = f32::NEG_INFINITY;
 
             for (a_idx, &adv) in raw_advantages.iter().enumerate().take(NUM_ACTIONS) {
+                if a_idx == Action::AllIn.to_index() {
+                    continue;
+                }
                 if mask.is_index_valid(a_idx) && adv > best_val {
                     best_val = adv;
                     best_idx = Some(a_idx);
@@ -72,6 +76,10 @@ impl DeepCFRPolicy {
 
             if let Some(idx) = best_idx {
                 probs[idx] = 1.0;
+            } else if mask.is_index_valid(Action::CheckCall.to_index()) {
+                probs[Action::CheckCall.to_index()] = 1.0;
+            } else if mask.is_index_valid(Action::Fold.to_index()) {
+                probs[Action::Fold.to_index()] = 1.0;
             } else if let Some(first) = mask.valid_actions().first() {
                 probs[first.to_index()] = 1.0;
             }
@@ -100,10 +108,14 @@ impl DeepCFRPolicy {
             }
             probs
         } else {
-            // Fallback: chọn hành động hợp lệ có giá trị lớn nhất trong output
+            // Fallback: chọn hành động hợp lệ có giá trị lớn nhất trong output,
+            // loại trừ AllIn để tránh việc All-in ngẫu nhiên do nhiễu float khi bài yếu.
             let mut best_idx = None;
             let mut best_val = f32::NEG_INFINITY;
             for (a_idx, &v) in raw.iter().enumerate().take(NUM_ACTIONS) {
+                if a_idx == Action::AllIn.to_index() {
+                    continue;
+                }
                 if mask.is_index_valid(a_idx) && v > best_val {
                     best_val = v;
                     best_idx = Some(a_idx);
@@ -111,6 +123,10 @@ impl DeepCFRPolicy {
             }
             if let Some(idx) = best_idx {
                 probs[idx] = 1.0;
+            } else if mask.is_index_valid(Action::CheckCall.to_index()) {
+                probs[Action::CheckCall.to_index()] = 1.0;
+            } else if mask.is_index_valid(Action::Fold.to_index()) {
+                probs[Action::Fold.to_index()] = 1.0;
             } else if let Some(first) = mask.valid_actions().first() {
                 probs[first.to_index()] = 1.0;
             }

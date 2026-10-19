@@ -195,11 +195,11 @@ fn traverse<R: Rng>(env: &mut Environment, ctx: &mut Ctx, pay: &Payoff, rng: &mu
         });
         expected
     } else {
-        // 🟢 TRƯỜNG HỢP 1: Ghế đối thủ đóng vai Quân Xanh (áp dụng đều cho mọi vị trí tương đối)
-        // Cho traverser cọ xát đa dạng với cả 4 trường phái (TAG, LagShark, NashPushBot, IcmSniper)
-        // mà không cần tốn forward() của MLP!
-        if ctx.sparring_tag && ((curr + pay.traverser) % 2 == 1) {
-            let bot_kind = rng.gen_range(0..4);
+        // 🟢 TRƯỜNG HỢP 1: Bàn có Quân Xanh: Toàn bộ đối thủ (curr != traverser)
+        // đều sử dụng 1 trong 4 trường phái chuẩn mực (TAG, LagShark, NashPushBot, IcmSniper)
+        // cố định theo số ghế (curr % 4) để bắt chết các hành vi Shove láo, không bỏ sót ghế nào!
+        if ctx.sparring_tag {
+            let bot_kind = curr % 4;
             let a = match bot_kind {
                 0 => TightAggressive.select_action(&features, &mask),
                 1 => LagShark.select_action(&features, &mask),
@@ -352,92 +352,221 @@ impl DeepCFRTrainer {
         let effective_lr = (self.lr / (1.0 + 0.004 * self.iteration as f32)).max(0.00008);
 
         let snapshot: MLP = self.advantage_net.read().unwrap().clone();
-        let results: Vec<(Vec<AdvantageSample>, Vec<StrategySample>)> = (0..num_traversals)
-            .into_par_iter()
-            .map(|_| {
-                let mut trng = rand::thread_rng();
-                let n = fixed.unwrap_or_else(|| {
-                    if max_p <= 4 {
-                        if trng.gen_bool(0.20) {
-                            2
-                        } else if trng.gen_bool(0.20) {
-                            3
-                        } else {
-                            max_p
-                        }
-                    } else if max_p <= 6 {
-                        if trng.gen_bool(0.15) {
-                            2
-                        } else if trng.gen_bool(0.75) {
-                            max_p
-                        } else {
-                            trng.gen_range(3..=max_p.saturating_sub(1).max(3))
-                        }
-                    } else if use_icm {
-                        // Tournament 8-Max: Phủ đều toàn bộ giải đấu từ đầu (8 người) đến chung kết (2 người)
-                        let roll: f32 = trng.gen();
-                        if roll < 0.35 {
-                            trng.gen_range(7..=8) // 35% Full Table (8 và 7 người)
-                        } else if roll < 0.70 {
-                            trng.gen_range(4..=6) // 35% Mid Table & Vòng Bubble sống còn
-                        } else if roll < 0.85 {
-                            3                     // 15% Vòng 3 người (In The Money)
-                        } else {
-                            2                     // 15% Chung kết Heads-Up tranh Vô Địch
-                        }
-                    } else {
-                        if trng.gen_bool(0.15) {
-                            2
-                        } else if trng.gen_bool(0.80) {
-                            trng.gen_range(7..=8)
-                        } else {
-                            trng.gen_range(3..=6)
-                        }
-                    }
-                });
-                let button = trng.gen_range(0..n);
-                let stacks = if is_cash {
-                    TournamentStackSampler::sample_cash_game_stacks(&mut trng, n, bb_size)
-                } else if use_icm && stack_depth > 0 {
-                    // Mô phỏng diễn biến tournament bắt đầu với stack_depth (vd: 50 BB/người)
-                    // và bảo toàn tổng chip toàn giải (8 * 50 BB = 400 BB) khi người chơi rụng dần
-                    TournamentStackSampler::sample_tournament_progression_stacks(
-                        &mut trng,
-                        n,
-                        stack_depth,
-                        max_p,
-                        bb_size,
-                    )
-                } else if stack_depth > 0 {
-                    vec![stack_depth * bb_size; n]
-                } else if trng.gen_bool(0.25) {
-                    TournamentStackSampler::sample_equal_stacks(&mut trng, n, bb_size)
-                } else {
-                    TournamentStackSampler::sample_dirichlet_stacks(&mut trng, n, bb_size)
-                };
-                let start: Vec<f32> = stacks.iter().map(|&s| s as f32).collect();
+        let results: Vec<(Vec<AdvantageSample>, Vec<StrategySample>)> = if !is_cash && stack_depth > 0 {
+            // 🟢 TOURNAMENT HYBRID MODE:
+            // 1. Full Tournament Episodes (50% thông lượng): 8 người, 50 BB ban đầu, đánh đến khi hết giải.
+            // 2. Strategic Multi-Depth Booster (50% thông lượng): Bơm sâu dữ liệu 50 BB (50%), 25 BB (30%), 12 BB (20%).
+            let initial_bb = stack_depth;
+            let num_tournaments = if num_traversals < 50 { 1 } else { (num_traversals / 50).clamp(2, 6) };
+            let num_booster_hands = (num_traversals / 3).max(10);
 
-                let mut ctx = Ctx {
-                    net: &snapshot,
-                    adv_out: Vec::new(),
-                    strat_out: Vec::new(),
-                    weight: iter_weight,
-                    // 🟢 Bật chế độ Bể Quân Xanh (Sparring League: TAG, LAG, Nash, ICM) trong 20% số ván duyệt cây:
-                    // Đủ để trừng phạt thẳng tay các pha All-in rác mà vẫn giữ 80% Self-Play GTO thuần túy!
-                    sparring_tag: false,
-                };
-                for t in 0..n {
+            let tour_results: Vec<(Vec<AdvantageSample>, Vec<StrategySample>)> = (0..num_tournaments)
+                .into_par_iter()
+                .map(|_| {
+                    let mut trng = rand::thread_rng();
+                    let n = fixed.unwrap_or(max_p).clamp(2, 8);
+                    let stacks = vec![initial_bb * bb_size; n];
+                    let mut button = trng.gen_range(0..n);
+
                     let mut env = Environment::new(n, &stacks, bb_size, sb_size, button);
-                    if is_cash {
-                        env.state.is_cash_game = true;
+                    env.state.is_cash_game = false;
+
+                    let sparring_enabled = trng.gen_bool(0.60); // 60% bàn Tournament có Quân Xanh rèn giũa toàn diện
+                    let mut ctx = Ctx {
+                        net: &snapshot,
+                        adv_out: Vec::new(),
+                        strat_out: Vec::new(),
+                        weight: iter_weight,
+                        sparring_tag: sparring_enabled,
+                    };
+
+                    let mut hand_idx = 0;
+                    while hand_idx < 250 {
+                        let alive: Vec<usize> = (0..n).filter(|&i| env.state.players[i].stack > 0).collect();
+                        if alive.len() <= 1 {
+                            break;
+                        }
+
+                        // Tăng Blind Level định kỳ theo tiến trình giải đấu
+                        let blind_level = hand_idx / n;
+                        let (sb, bb) = crate::benchmark::arena::get_tournament_blinds(blind_level);
+                        env.state.sb_size = sb;
+                        env.state.bb_size = bb;
+
+                        // Chuyển Button tới người còn sống tiếp theo
+                        let mut next_btn = (button + 1) % n;
+                        while env.state.players[next_btn].stack == 0 {
+                            next_btn = (next_btn + 1) % n;
+                        }
+                        button = next_btn;
+
+                        // Ghi nhận stacks trước khi post blind để tính ICM EV / Chip EV chính xác
+                        let start: Vec<f32> = env.state.players.iter().map(|p| p.stack as f32).collect();
+
+                        env.reset_hand(&mut trng, button);
+
+                        if env.state.street != Street::Showdown {
+                            // MCCFR Chuẩn: Chọn ngẫu nhiên 1 người chơi còn sống làm Traverser duyệt cây ván này
+                            let traverser = alive[trng.gen_range(0..alive.len())];
+                            let pay = Payoff::new(&start, traverser, env.state.bb_size as f32, use_icm, false);
+                            let mut branch = env.clone();
+                            traverse(&mut branch, &mut ctx, &pay, &mut trng, 0);
+
+                            // Chơi ván bài thực tế để cập nhật stack và loại người chơi bị hết chip
+                            let mut guard = 0;
+                            while env.state.street != Street::Showdown && guard < 400 {
+                                guard += 1;
+                                let cur = env.state.current_player_idx;
+                                let mask = env.get_action_mask();
+                                if mask.0 == 0 {
+                                    break;
+                                }
+                                let feats = env.state.encode_features(cur);
+                                let action = if sparring_enabled && (cur != traverser) {
+                                    let bot_kind = cur % 4;
+                                    match bot_kind {
+                                        0 => TightAggressive.select_action(&feats, &mask),
+                                        1 => LagShark.select_action(&feats, &mask),
+                                        2 => NashPushBot.select_action(&feats, &mask),
+                                        _ => IcmSniper.select_action(&feats, &mask),
+                                    }
+                                } else {
+                                    let raw = snapshot.forward(&feats);
+                                    let probs = DeepCFRPolicy::compute_regret_matching_probs(&raw, &mask);
+                                    sample_action(&probs, &mask, &mut trng)
+                                };
+                                match env.step(action) {
+                                    Ok(true) | Err(_) => break,
+                                    Ok(false) => {}
+                                }
+                            }
+                        }
+
+                        hand_idx += 1;
                     }
-                    env.reset_hand(&mut trng, button);
-                    let pay = Payoff::new(&start, t, bb_size as f32, use_icm, is_cash);
-                    traverse(&mut env, &mut ctx, &pay, &mut trng, 0);
-                }
-                (ctx.adv_out, ctx.strat_out)
-            })
-            .collect();
+
+                    (ctx.adv_out, ctx.strat_out)
+                })
+                .collect();
+
+            let booster_results: Vec<(Vec<AdvantageSample>, Vec<StrategySample>)> = (0..num_booster_hands)
+                .into_par_iter()
+                .map(|_| {
+                    let mut trng = rand::thread_rng();
+                    // Phân bổ có chủ đích: 50% cho 50 BB, 30% cho 25 BB, 20% cho 12 BB
+                    let roll: f32 = trng.gen();
+                    let target_depth = if roll < 0.50 {
+                        50u32
+                    } else if roll < 0.80 {
+                        25u32
+                    } else {
+                        12u32
+                    };
+
+                    let n = match target_depth {
+                        50 => max_p.clamp(6, 8),
+                        25 => trng.gen_range(5..=max_p.clamp(6, 8)),
+                        _ => trng.gen_range(3..=6.min(max_p)),
+                    };
+
+                    let button = trng.gen_range(0..n);
+                    let stacks = if trng.gen_bool(0.40) {
+                        vec![target_depth * bb_size; n]
+                    } else {
+                        TournamentStackSampler::sample_tournament_progression_stacks(
+                            &mut trng,
+                            n,
+                            target_depth,
+                            max_p,
+                            bb_size,
+                        )
+                    };
+                    let start: Vec<f32> = stacks.iter().map(|&s| s as f32).collect();
+
+                    let mut ctx = Ctx {
+                        net: &snapshot,
+                        adv_out: Vec::new(),
+                        strat_out: Vec::new(),
+                        weight: iter_weight,
+                        sparring_tag: trng.gen_bool(0.70), // 70% Booster Hands có Quân Xanh trừng phạt toàn diện
+                    };
+
+                    for t in 0..n {
+                        let mut env = Environment::new(n, &stacks, bb_size, sb_size, button);
+                        env.state.is_cash_game = false;
+                        env.reset_hand(&mut trng, button);
+                        let pay = Payoff::new(&start, t, bb_size as f32, use_icm, false);
+                        let mut branch = env.clone();
+                        traverse(&mut branch, &mut ctx, &pay, &mut trng, 0);
+                    }
+                    (ctx.adv_out, ctx.strat_out)
+                })
+                .collect();
+
+            tour_results.into_iter().chain(booster_results.into_iter()).collect()
+        } else {
+            // Cash Game mode hoặc Random Dirichlet Stack mode (Final Table)
+            (0..num_traversals)
+                .into_par_iter()
+                .map(|_| {
+                    let mut trng = rand::thread_rng();
+                    let n = fixed.unwrap_or_else(|| {
+                        if max_p <= 4 {
+                            if trng.gen_bool(0.20) {
+                                2
+                            } else if trng.gen_bool(0.20) {
+                                3
+                            } else {
+                                max_p
+                            }
+                        } else if max_p <= 6 {
+                            if trng.gen_bool(0.15) {
+                                2
+                            } else if trng.gen_bool(0.75) {
+                                max_p
+                            } else {
+                                trng.gen_range(3..=max_p.saturating_sub(1).max(3))
+                            }
+                        } else {
+                            if trng.gen_bool(0.15) {
+                                2
+                            } else if trng.gen_bool(0.80) {
+                                trng.gen_range(7..=8)
+                            } else {
+                                trng.gen_range(3..=6)
+                            }
+                        }
+                    });
+                    let button = trng.gen_range(0..n);
+                    let stacks = if is_cash {
+                        TournamentStackSampler::sample_cash_game_stacks(&mut trng, n, bb_size)
+                    } else if trng.gen_bool(0.25) {
+                        TournamentStackSampler::sample_equal_stacks(&mut trng, n, bb_size)
+                    } else {
+                        TournamentStackSampler::sample_dirichlet_stacks(&mut trng, n, bb_size)
+                    };
+                    let start: Vec<f32> = stacks.iter().map(|&s| s as f32).collect();
+
+                    let mut ctx = Ctx {
+                        net: &snapshot,
+                        adv_out: Vec::new(),
+                        strat_out: Vec::new(),
+                        weight: iter_weight,
+                        sparring_tag: trng.gen_bool(0.50),
+                    };
+                    for t in 0..n {
+                        let mut env = Environment::new(n, &stacks, bb_size, sb_size, button);
+                        if is_cash {
+                            env.state.is_cash_game = true;
+                        }
+                        env.reset_hand(&mut trng, button);
+                        let pay = Payoff::new(&start, t, bb_size as f32, use_icm, is_cash);
+                        traverse(&mut env, &mut ctx, &pay, &mut trng, 0);
+                    }
+                    (ctx.adv_out, ctx.strat_out)
+                })
+                .collect()
+        };
 
         for (adv, strat) in results {
             for s in adv {

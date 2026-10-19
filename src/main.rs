@@ -165,8 +165,19 @@ fn main() {
 
     let _ = std::fs::remove_file(BENCH_CSV);
 
+    if std::path::Path::new(BEST_ADV).exists() {
+        println!("📥 Đang nạp checkpoint Champion có sẵn: {}", BEST_ADV);
+        match trainer.load_models(BEST_ADV, BEST_STRAT) {
+            Ok(true) => println!("   ✅ Đã nạp thành công Advantage Net và Strategy Net!"),
+            Ok(false) => println!("   ✅ Đã nạp Advantage Net (Strategy Net khởi tạo mới)!"),
+            Err(e) => println!("   ⚠️  Không thể nạp checkpoint ({}), tiếp tục khởi tạo mới.", e),
+        }
+    } else {
+        println!("🌱 Khởi tạo mạng mới hoàn toàn cho Tournament 8-Max.");
+        let _ = trainer.save_models(BEST_ADV, BEST_STRAT);
+    }
+
     let mut current_champion_net: MLP = trainer.advantage_net.read().unwrap().clone();
-    let _ = trainer.save_models(BEST_ADV, BEST_STRAT);
 
     let train_start = Instant::now();
     for iter in 1..=total_iterations {
