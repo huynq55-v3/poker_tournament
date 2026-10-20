@@ -1,4 +1,7 @@
-use crate::benchmark::{IcmSniper, LagShark, NashPushBot, TightAggressive};
+use crate::benchmark::{
+    BountyHunter, IcmSniper, LagShark, NashPushBot, NitTrap, StickyFish, ThreeBetAggro,
+    TightAggressive,
+};
 use crate::environment::action::Action;
 use crate::environment::engine::Environment;
 use crate::environment::state::Street;
@@ -356,9 +359,9 @@ fn play_arena_final_table_hand<R: Rng>(
     acc.sum_sq_diff += diff_bb * diff_bb;
 }
 
-/// Đấu trường 8-max đối đầu Biệt đội Heuristic All-Star:
+/// Đấu trường 8-max đối đầu Biệt đội Heuristic All-Star (luân phiên cả 8 trường phái quân xanh):
 /// Ghế 0, 2, 4, 6: Challenger
-/// Ghế 1: TightAggressive | Ghế 3: LagShark | Ghế 5: NashPushBot | Ghế 7: IcmSniper
+/// Ghế 1, 3, 5, 7: Luân phiên [&tag, &lag, &nash, &icm, &nit, &fish, &aggro, &bounty]
 pub fn evaluate_against_heuristic_team(
     challenger: &dyn Policy,
     total_hands: usize,
@@ -368,14 +371,29 @@ pub fn evaluate_against_heuristic_team(
     let lag = LagShark;
     let nash = NashPushBot;
     let icm = IcmSniper;
-    let opps: [&dyn Policy; 4] = [&tag, &lag, &nash, &icm];
+    let nit = NitTrap;
+    let fish = StickyFish;
+    let aggro = ThreeBetAggro;
+    let bounty = BountyHunter;
+    let opps: [&dyn Policy; 8] = [&tag, &lag, &nash, &icm, &nit, &fish, &aggro, &bounty];
 
     let acc = (0..total_hands)
         .into_par_iter()
         .fold(ArenaAcc::default, |mut acc, _| {
             let mut rng = thread_rng();
             let actual_depth = if rng.gen_bool(0.20) { 12 } else { stack_bb };
-            play_arena_team_hand(challenger, &opps, actual_depth, &mut acc, &mut rng, ARENA_PLAYERS);
+            let shift = rng.gen_range(0..8);
+            let rotated_opps: [&dyn Policy; 8] = [
+                opps[shift % 8],
+                opps[(shift + 1) % 8],
+                opps[(shift + 2) % 8],
+                opps[(shift + 3) % 8],
+                opps[(shift + 4) % 8],
+                opps[(shift + 5) % 8],
+                opps[(shift + 6) % 8],
+                opps[(shift + 7) % 8],
+            ];
+            play_arena_team_hand(challenger, &rotated_opps, actual_depth, &mut acc, &mut rng, ARENA_PLAYERS);
             acc
         })
         .reduce(ArenaAcc::default, |a, b| a.merge(&b));
@@ -394,6 +412,10 @@ pub fn evaluate_arena_suite(
         ("Arena_LagShark", evaluate_against_champion(challenger, &LagShark, hands_per_match, stack_bb)),
         ("Arena_NashPush", evaluate_against_champion(challenger, &NashPushBot, hands_per_match, stack_bb)),
         ("Arena_IcmSniper", evaluate_against_champion(challenger, &IcmSniper, hands_per_match, stack_bb)),
+        ("Arena_NitTrap", evaluate_against_champion(challenger, &NitTrap, hands_per_match, stack_bb)),
+        ("Arena_StickyFish", evaluate_against_champion(challenger, &StickyFish, hands_per_match, stack_bb)),
+        ("Arena_ThreeBetAggro", evaluate_against_champion(challenger, &ThreeBetAggro, hands_per_match, stack_bb)),
+        ("Arena_BountyHunter", evaluate_against_champion(challenger, &BountyHunter, hands_per_match, stack_bb)),
         ("Arena_HeuristicTeam", evaluate_against_heuristic_team(challenger, hands_per_match, stack_bb)),
     ]
 }
@@ -812,7 +834,11 @@ pub fn simulate_hero_tournament<R: Rng>(
     let lag = LagShark;
     let push = NashPushBot;
     let sniper = IcmSniper;
-    let opp_policies: [&dyn Policy; 4] = [&tag, &lag, &push, &sniper];
+    let nit = NitTrap;
+    let fish = StickyFish;
+    let aggro = ThreeBetAggro;
+    let bounty = BountyHunter;
+    let opp_policies: [&dyn Policy; 8] = [&tag, &lag, &push, &sniper, &nit, &fish, &aggro, &bounty];
 
     let mut finish_ranks = vec![0usize; n];
     let mut eliminated_count = 0;
@@ -853,7 +879,7 @@ pub fn simulate_hero_tournament<R: Rng>(
             let action = if cur == 0 {
                 hero.select_action(&feats, &mask)
             } else {
-                opp_policies[(cur - 1) % 4].select_action(&feats, &mask)
+                opp_policies[(cur - 1) % opp_policies.len()].select_action(&feats, &mask)
             };
             match env.step(action) {
                 Ok(true) | Err(_) => break,

@@ -14,8 +14,8 @@ use std::{thread, time::Duration};
 use enigo::{Enigo, Key, Keyboard, Settings};
 use rand::Rng;
 
-const ADV_MODEL_PATH: &str = "deep_cfr_model_tour.json";
-const STRAT_MODEL_PATH: &str = "deep_cfr_strategy_tour.json";
+const ADV_MODEL_PATH: &str = "deep_cfr_model.json";
+const STRAT_MODEL_PATH: &str = "deep_cfr_strategy.json";
 
 // =========================================================================
 // 1. DATA STRUCTURES & TYPES

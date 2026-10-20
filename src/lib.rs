@@ -16,4 +16,4 @@ pub use self_play::{SelfPlayEngine, Policy, Transition, UniformRandomPolicy};
 pub use gui_bridge::{TableViewModel, PlayerViewModel};
 pub use neural_network::{MLP, DenseLayer, LossType};
 pub use deep_cfr::{DeepCFRTrainer, DeepCFRPolicy, AdvantageMemory, StrategyMemory};
-pub use gui::{PokerGuiApp, BlindLevel, TournamentBlindSchedule};
+pub use gui::{PokerGuiApp, PokerNowApp, BlindLevel, TournamentBlindSchedule};

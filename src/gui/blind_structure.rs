@@ -11,6 +11,9 @@ pub struct BlindLevel {
 pub struct TournamentBlindSchedule {
     pub levels: Vec<BlindLevel>,
     pub current_idx: usize,
+    pub hands_per_level: usize,
+    pub hands_in_current_level: usize,
+    pub total_hands_played: usize,
     pub level_duration: Duration,
     pub current_level_started_at: Instant,
     pub is_paused: bool,
@@ -19,20 +22,21 @@ pub struct TournamentBlindSchedule {
 
 impl TournamentBlindSchedule {
     pub fn new(num_seats: usize) -> Self {
-        let mut raw_levels = vec![
-            (10, 20),
-            (20, 40),
-            (30, 60),
+        // Thang Blind chuẩn mực theo giải đấu Tournament Sit & Go
+        let raw_levels = vec![
             (50, 100),
             (75, 150),
             (100, 200),
             (150, 300),
-            (250, 500),
+            (200, 400),
+            (300, 600),
+            (500, 1000),
+            (800, 1600),
+            (1200, 2400),
+            (2000, 4000),
+            (3000, 6000),
+            (5000, 10000),
         ];
-
-        if num_seats > 6 {
-            raw_levels.push((300, 600));
-        }
 
         let levels = raw_levels
             .into_iter()
@@ -44,14 +48,47 @@ impl TournamentBlindSchedule {
             })
             .collect();
 
+        let hands_per_level = num_seats.clamp(2, 8); // Mặc định: 1 vòng cược quanh bàn (8 ván cho bàn 8 người)
+
         Self {
             levels,
             current_idx: 0,
+            hands_per_level,
+            hands_in_current_level: 0,
+            total_hands_played: 0,
             level_duration: Duration::from_secs(300),
             current_level_started_at: Instant::now(),
             is_paused: false,
             paused_at: None,
         }
+    }
+
+    /// Ghi nhận hoàn thành 1 ván bài. Tự động tăng Level Blind khi đủ số ván cố định!
+    pub fn on_hand_completed(&mut self) -> bool {
+        self.total_hands_played += 1;
+        self.hands_in_current_level += 1;
+
+        if self.hands_in_current_level >= self.hands_per_level && self.current_idx + 1 < self.levels.len() {
+            self.current_idx += 1;
+            self.hands_in_current_level = 0;
+            self.current_level_started_at = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Số ván còn lại trước khi tăng Level Blind tiếp theo
+    pub fn hands_remaining_in_level(&self) -> usize {
+        self.hands_per_level.saturating_sub(self.hands_in_current_level)
+    }
+
+    /// Chuỗi thông tin tiến độ Blind theo ván bài
+    pub fn formatted_hand_progress(&self) -> String {
+        format!(
+            "Ván {}/{} (còn {} ván tăng Blind)",
+            self.hands_in_current_level, self.hands_per_level, self.hands_remaining_in_level()
+        )
     }
 
     /// Thời gian đã trôi qua của level hiện tại (đóng băng khi đang pause)
@@ -148,21 +185,25 @@ mod tests {
 
     #[test]
     fn test_blind_schedule_progression() {
-        let mut schedule6 = TournamentBlindSchedule::new(6);
-        assert_eq!(schedule6.levels.len(), 8);
-        assert_eq!(schedule6.current_level().sb, 10);
-        assert_eq!(schedule6.current_level().bb, 20);
+        let mut schedule8 = TournamentBlindSchedule::new(8);
+        assert_eq!(schedule8.levels.len(), 12);
+        assert_eq!(schedule8.current_level().sb, 50);
+        assert_eq!(schedule8.current_level().bb, 100);
+        assert_eq!(schedule8.hands_per_level, 8);
 
-        let schedule8 = TournamentBlindSchedule::new(8);
-        assert_eq!(schedule8.levels.len(), 9);
-        assert_eq!(schedule8.levels.last().unwrap().bb, 600);
-        assert_eq!(schedule8.levels.last().unwrap().sb, 300);
+        // Chơi 7 ván -> chưa tăng level
+        for _ in 0..7 {
+            assert!(!schedule8.on_hand_completed());
+        }
+        assert_eq!(schedule8.current_level().level_num, 1);
+        assert_eq!(schedule8.hands_remaining_in_level(), 1);
 
-        schedule6.current_level_started_at = Instant::now() - Duration::from_secs(305);
-        let leveled_up = schedule6.update();
-        assert!(leveled_up);
-        assert_eq!(schedule6.current_level().sb, 20);
-        assert_eq!(schedule6.current_level().bb, 40);
+        // Ván thứ 8 -> Tăng Level 2 (75/150)!
+        assert!(schedule8.on_hand_completed());
+        assert_eq!(schedule8.current_level().level_num, 2);
+        assert_eq!(schedule8.current_level().sb, 75);
+        assert_eq!(schedule8.current_level().bb, 150);
+        assert_eq!(schedule8.hands_remaining_in_level(), 8);
     }
 
     #[test]

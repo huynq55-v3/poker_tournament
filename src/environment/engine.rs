@@ -153,7 +153,7 @@ impl Environment {
     }
 
     /// Tổng bet mục tiêu khi raise theo `frac` pot (pot sau khi call).
-    fn raise_target(&self, p_idx: usize, frac: f32) -> u32 {
+    pub fn raise_target(&self, p_idx: usize, frac: f32) -> u32 {
         let st = &self.state;
         let cb = st.players[p_idx].current_bet;
         let to_call = st.current_highest_bet.saturating_sub(cb);
@@ -313,6 +313,96 @@ impl Environment {
         });
 
         // Hand terminal nếu chỉ còn 1 người chưa fold
+        let active_in_hand: Vec<usize> = self
+            .state
+            .players
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.is_in_hand())
+            .map(|(i, _)| i)
+            .collect();
+
+        if active_in_hand.len() <= 1 {
+            self.resolve_terminal_fold(active_in_hand.first().copied());
+            return Ok(true);
+        }
+
+        if self.is_betting_round_complete() {
+            let hand_ended = self.advance_street();
+            return Ok(hand_ended);
+        }
+
+        self.advance_to_next_player();
+        Ok(false)
+    }
+
+    /// Thực hiện Raise đến mức chip mục tiêu cụ thể `target_total` (cho phép cược linh hoạt theo BB từ GUI).
+    pub fn step_raise_to(&mut self, target_total: u32) -> Result<bool, &'static str> {
+        let p_idx = self.state.current_player_idx;
+        if !self.state.players[p_idx].is_active() {
+            return Err("Người chơi hiện tại không active!");
+        }
+        let p = &self.state.players[p_idx];
+        let p_total = p.current_bet + p.stack;
+
+        let opponents_can_respond = self
+            .state
+            .players
+            .iter()
+            .enumerate()
+            .any(|(i, opp)| i != p_idx && opp.is_active());
+
+        if !opponents_can_respond && target_total > self.state.current_highest_bet {
+            return Err("Không có đối thủ nào còn active để đối mặt với cú Raise!");
+        }
+
+        let target_total = target_total.min(p_total);
+        let needed = target_total.saturating_sub(self.state.players[p_idx].current_bet);
+
+        let committed: u32;
+        let action: Action;
+
+        if needed >= self.state.players[p_idx].stack || target_total >= p_total {
+            committed = self.commit_all_in(p_idx);
+            action = Action::AllIn;
+        } else {
+            let min_raise_total = self.state.current_highest_bet + self.state.min_raise;
+            if target_total < min_raise_total {
+                return Err("Mức cược nhỏ hơn mức cược tối thiểu (Min Raise)!");
+            }
+
+            self.state.players[p_idx].stack -= needed;
+            self.state.players[p_idx].current_bet = target_total;
+            self.state.players[p_idx].total_contributed += needed;
+            self.state.pot += needed;
+            committed = needed;
+
+            let raise_size = target_total.saturating_sub(self.state.current_highest_bet);
+            if raise_size >= self.state.min_raise {
+                self.state.min_raise = raise_size;
+                self.street_has_acted.fill(false);
+            }
+            self.state.current_highest_bet = target_total;
+
+            let pot_after_call = self.state.pot.saturating_sub(needed);
+            let frac = if pot_after_call > 0 { raise_size as f32 / pot_after_call as f32 } else { 0.5 };
+            if frac <= 0.25 {
+                action = Action::BetSmall;
+            } else if frac <= 0.50 {
+                action = Action::BetPot33;
+            } else {
+                action = Action::BetPot75;
+            }
+        }
+
+        self.street_has_acted[p_idx] = true;
+        self.state.action_history.push(ActionRecord {
+            player_idx: p_idx,
+            street: self.state.street,
+            action,
+            amount: committed,
+        });
+
         let active_in_hand: Vec<usize> = self
             .state
             .players

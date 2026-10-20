@@ -15,6 +15,22 @@ pub enum HandCategory {
     StraightFlush = 9,
 }
 
+impl HandCategory {
+    pub fn name(&self) -> &'static str {
+        match self {
+            HandCategory::HighCard => "High Card",
+            HandCategory::OnePair => "One Pair",
+            HandCategory::TwoPair => "Two Pair",
+            HandCategory::ThreeOfAKind => "Three of a Kind",
+            HandCategory::Straight => "Straight",
+            HandCategory::Flush => "Flush",
+            HandCategory::FullHouse => "Full House",
+            HandCategory::FourOfAKind => "Four of a Kind",
+            HandCategory::StraightFlush => "Straight Flush",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct HandRank(pub u32);
 

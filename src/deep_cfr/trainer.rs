@@ -1,4 +1,7 @@
-use crate::benchmark::{IcmSniper, LagShark, NashPushBot, TightAggressive};
+use crate::benchmark::{
+    BountyHunter, IcmSniper, LagShark, NashPushBot, NitTrap, StickyFish, ThreeBetAggro,
+    TightAggressive,
+};
 use crate::deep_cfr::advantage_memory::{AdvantageMemory, AdvantageSample, SampleBatch};
 use crate::deep_cfr::policy::DeepCFRPolicy;
 use crate::deep_cfr::strategy_memory::{StrategyMemory, StrategySample};
@@ -196,15 +199,19 @@ fn traverse<R: Rng>(env: &mut Environment, ctx: &mut Ctx, pay: &Payoff, rng: &mu
         expected
     } else {
         // 🟢 TRƯỜNG HỢP 1: Bàn có Quân Xanh: Toàn bộ đối thủ (curr != traverser)
-        // đều sử dụng 1 trong 4 trường phái chuẩn mực (TAG, LagShark, NashPushBot, IcmSniper)
-        // cố định theo số ghế (curr % 4) để bắt chết các hành vi Shove láo, không bỏ sót ghế nào!
+        // đều sử dụng 1 trong 8 trường phái chuẩn mực (TAG, LagShark, NashPushBot, IcmSniper, NitTrap, StickyFish, ThreeBetAggro, BountyHunter)
+        // cố định theo số ghế (curr % 8) để bắt chết các hành vi Shove láo, không bỏ sót ghế nào!
         if ctx.sparring_tag {
-            let bot_kind = curr % 4;
+            let bot_kind = curr % 8;
             let a = match bot_kind {
                 0 => TightAggressive.select_action(&features, &mask),
                 1 => LagShark.select_action(&features, &mask),
                 2 => NashPushBot.select_action(&features, &mask),
-                _ => IcmSniper.select_action(&features, &mask),
+                3 => IcmSniper.select_action(&features, &mask),
+                4 => NitTrap.select_action(&features, &mask),
+                5 => StickyFish.select_action(&features, &mask),
+                6 => ThreeBetAggro.select_action(&features, &mask),
+                _ => BountyHunter.select_action(&features, &mask),
             };
             return step_and_continue(env, a, ctx, pay, rng, depth);
         }
@@ -423,12 +430,16 @@ impl DeepCFRTrainer {
                                 }
                                 let feats = env.state.encode_features(cur);
                                 let action = if sparring_enabled && (cur != traverser) {
-                                    let bot_kind = cur % 4;
+                                    let bot_kind = cur % 8;
                                     match bot_kind {
                                         0 => TightAggressive.select_action(&feats, &mask),
                                         1 => LagShark.select_action(&feats, &mask),
                                         2 => NashPushBot.select_action(&feats, &mask),
-                                        _ => IcmSniper.select_action(&feats, &mask),
+                                        3 => IcmSniper.select_action(&feats, &mask),
+                                        4 => NitTrap.select_action(&feats, &mask),
+                                        5 => StickyFish.select_action(&feats, &mask),
+                                        6 => ThreeBetAggro.select_action(&feats, &mask),
+                                        _ => BountyHunter.select_action(&feats, &mask),
                                     }
                                 } else {
                                     let raw = snapshot.forward(&feats);
