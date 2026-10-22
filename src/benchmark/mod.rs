@@ -645,10 +645,13 @@ impl Policy for NitTrap {
     }
 }
 
-/// 5. StickyFish (Inelastic Calling Station):
-/// - Vào pot cực rộng (VPIP 50-60%), thích limp xem flop với mọi lá bài.
-/// - Postflop: Đã dính bất kỳ con đôi hay sảnh/thùng chờ nào là CALL MỌI MỨC CƯỢC!
-/// - Không bao giờ bluff raise. Dạy AI bài học: Tối đa hóa Value Bet và TUYỆT ĐỐI KHÔNG BLUFF!
+/// 5. StickyFish (Inelastic Calling Station v2):
+/// - Vào pot rộng preflop (VPIP 45-55%), thích xem flop với bài có kết nối hoặc suited.
+/// - Postflop:
+///   + Khi có bài mạnh (Two Pair, Trips, Straight, Flush... cat >= 0.20): Chủ động Bet lấy value, không check thụ động!
+///   + Khi đối mặt bet vừa (to_call <= 0.75 pot): Lì lợm Call với mọi Pair và Draw (không bluff raise, không fold pair).
+///   + Bản năng sinh tồn: Khi đối mặt All-In hoặc Bet cực nặng (> 0.75 pot / stack commit lớn):
+///     Chỉ Call nếu có Top Pair trở lên (cat >= 0.11 và chen/equity tốt), dứt khoát Fold bài rác / bottom pair / gutshot yếu!
 #[derive(Clone)]
 pub struct StickyFish;
 impl Policy for StickyFish {
@@ -660,35 +663,79 @@ impl Policy for StickyFish {
         let cat = f[F_HAND_CAT];
         let has_draw = f[F_FLUSH_DRAW] > 0.5 || f[F_STRAIGHT_DRAW] > 0.5;
         let is_preflop = f[F_STREET_PREFLOP] > 0.5;
+        let call_ratio = f[F_TO_CALL_RATIO_STACK]; // Tỷ lệ chip phải bỏ ra so với stack hiện tại
+        let is_huge_bet = call_ratio > 0.35 || f[F_TO_CALL_NORM] > 0.25; // Bet > 5 BB hoặc > 35% stack / All-in
 
-        // Preflop:
+        // 1. Preflop:
         if is_preflop {
-            // Cầm siêu bài (AA, KK, chen >= 0.55): Shove hoặc Bet to
-            if chen >= 0.55 {
+            // Cầm siêu phẩm (AA, KK, AKs, chen >= 0.50): Raise to hoặc Shove
+            if chen >= 0.50 {
                 return pick(m, &[Action::AllIn, Action::BetPot75, Action::CheckCall]);
             }
-            // Thích vào xem flop với hầu hết mọi bài có kết nối (chen >= 0.12)
-            if chen >= 0.12 || eq >= 0.28 {
+            // Đối mặt với Bet lớn / Shove All-In:
+            if is_huge_bet {
+                if chen >= 0.35 || eq >= 0.38 {
+                    return pick(m, &[Action::CheckCall, Action::AllIn]);
+                }
+                return pick(m, &[Action::Fold, Action::CheckCall]);
+            }
+            // Thích xem Flop: Call mọi open-raise bình thường với bài có tiềm năng (chen >= 0.10 hoặc suited/connectors)
+            if chen >= 0.10 || eq >= 0.20 {
                 return pick(m, &[Action::CheckCall, Action::Fold]);
             }
+            // Unopened pot: Limp vào xem flop
             if !facing {
                 return pick(m, &[Action::CheckCall, Action::Fold]);
             }
             return pick(m, &[Action::Fold, Action::CheckCall]);
         }
 
-        // Postflop:
-        // Cầm bài cực mạnh (Trips, Fullhouse, cat >= 3/9): Bet to lấy tiền
-        if cat >= 0.33 {
-            return pick(m, &[Action::BetPot75, Action::BetPot33, Action::CheckCall]);
+        // 2. Postflop:
+        // A. Cầm bài rất mạnh (Two Pair, Trips, Straight, Flush... cat >= 0.20):
+        // Fish không check thụ động nữa! Chủ động Bet để lấy tiền từ đối thủ!
+        if cat >= 0.20 {
+            if facing {
+                // Đối mặt bet: Call hoặc Raise
+                return pick(m, &[Action::BetPot75, Action::CheckCall, Action::AllIn]);
+            } else {
+                return pick(m, &[Action::BetPot75, Action::BetPot33, Action::CheckCall]);
+            }
         }
 
-        // Nếu dính bất kỳ đôi nào (cat >= 1/9) hoặc có draw hoặc eq >= pot_odds - 0.10:
-        // Sticky Fish LÌ ĐÒN KHÔNG BAO GIỜ FOLD! Luôn Check-Call!
-        if cat >= 0.10 || has_draw || eq > (pot_odds - 0.08) {
-            return pick(m, &[Action::CheckCall, Action::Fold]);
+        // B. Cầm bài tốt (One Pair - cat >= 0.10):
+        if cat >= 0.10 {
+            if facing {
+                // Nếu đối thủ Shove All-In hoặc Bet cực to (> 35% stack):
+                // Phải có ít nhất Top Pair / bài tốt (eq > 0.45 hoặc chen > 0.30) mới call, không call tự sát với bottom pair!
+                if is_huge_bet && eq < 0.45 && chen < 0.30 {
+                    return pick(m, &[Action::Fold, Action::CheckCall]);
+                }
+                // Đối mặt bet thông thường (<= 0.75 pot): Dính One Pair là LÌ ĐÒN CALL 100%!
+                return pick(m, &[Action::CheckCall, Action::Fold]);
+            } else {
+                // Chưa ai bet: Fish cầm Top/Mid pair thỉnh thoảng lead bet (Donk bet 33% pot hoặc Check)
+                let rand = pseudo_rand(f);
+                if rand < 0.35 {
+                    return pick(m, &[Action::BetPot33, Action::BetSmall, Action::CheckCall]);
+                }
+                return pick(m, &[Action::CheckCall]);
+            }
         }
 
+        // C. Cầm sảnh/thùng chờ (Draws) hoặc có pot odds tốt:
+        if has_draw || eq > (pot_odds - 0.05) {
+            if facing {
+                // Đối mặt bet cực to / All-in khi chỉ có Draw:
+                if is_huge_bet && eq < pot_odds {
+                    return pick(m, &[Action::Fold, Action::CheckCall]);
+                }
+                return pick(m, &[Action::CheckCall, Action::Fold]);
+            } else {
+                return pick(m, &[Action::CheckCall]);
+            }
+        }
+
+        // D. Không có gì (Air / High Card):
         if facing {
             pick(m, &[Action::Fold, Action::CheckCall])
         } else {
@@ -908,16 +955,17 @@ impl Acc {
     }
 }
 
-fn play_hand<R: Rng>(
+fn play_hand_table<R: Rng>(
     hero: &dyn Policy,
     opp: &dyn Policy,
     stack_bb: u32,
     acc: &mut Acc,
     rng: &mut R,
+    num_players: usize,
 ) {
     let bb = 100u32;
     let sb = 50u32;
-    let n = TABLE_SIZE;
+    let n = num_players.clamp(2, TABLE_SIZE);
     let stacks = vec![stack_bb * bb; n];
     let button = rng.gen_range(0..n);
     let hero_seat = rng.gen_range(0..n);
@@ -960,6 +1008,35 @@ fn play_hand<R: Rng>(
     acc.sumsq += r * r;
 }
 
+#[allow(dead_code)]
+fn play_hand<R: Rng>(
+    hero: &dyn Policy,
+    opp: &dyn Policy,
+    stack_bb: u32,
+    acc: &mut Acc,
+    rng: &mut R,
+) {
+    play_hand_table(hero, opp, stack_bb, acc, rng, TABLE_SIZE);
+}
+
+fn run_match_table(
+    hero: &dyn Policy,
+    opp: &dyn Policy,
+    hands: usize,
+    stack_bb: u32,
+    num_players: usize,
+) -> Acc {
+    (0..hands)
+        .into_par_iter()
+        .fold(Acc::default, |mut acc, _| {
+            let mut rng = thread_rng();
+            play_hand_table(hero, opp, stack_bb, &mut acc, &mut rng, num_players);
+            acc
+        })
+        .reduce(Acc::default, |a, b| a.merge(&b))
+}
+
+#[allow(dead_code)]
 fn run_match(hero: &dyn Policy, opp: &dyn Policy, hands: usize, stack_bb: u32) -> Acc {
     (0..hands)
         .into_par_iter()
@@ -1087,8 +1164,15 @@ fn to_result(name: &str, stack_bb: u32, a: &Acc) -> BenchResult {
 pub fn run_suite(hero: &dyn Policy, hands: usize, depths: &[u32]) -> Vec<BenchResult> {
     let mut out = Vec::new();
     for (name, opp) in baseline_opponents() {
+        // Với đối thủ Random và Maniac: Đánh Heads-Up (2 người) để đo lường chính xác
+        // khả năng trừng phạt lối chơi bừa bãi mà không bị hiệu ứng xổ số/bingo 8 người làm méo mó phương sai
+        let num_players = if name == "Random" || name == "Maniac" {
+            2
+        } else {
+            TABLE_SIZE
+        };
         for &d in depths {
-            let acc = run_match(hero, opp.as_ref(), hands, d);
+            let acc = run_match_table(hero, opp.as_ref(), hands, d, num_players);
             out.push(to_result(name, d, &acc));
         }
     }
@@ -1138,7 +1222,8 @@ pub fn score(results: &[BenchResult]) -> f64 {
             }
             "StickyFish" => {
                 // Thước đo khai thác calling station: value bet dày, không bluff vô ích
-                total_score += r.bb_per_100.clamp(-150.0, 150.0) * 1.0;
+                // Giới hạn trần 50 để kiểm tra exploit mà không làm méo mó lạm phát điểm tổng
+                total_score += r.bb_per_100.clamp(-50.0, 50.0) * 0.4;
             }
             "ThreeBetAggro" => {
                 // Thước đo chống 3-bet bully và squeeze áp lực preflop
@@ -1149,14 +1234,16 @@ pub fn score(results: &[BenchResult]) -> f64 {
                 total_score += r.bb_per_100.clamp(-200.0, 150.0) * 1.1;
             }
             "CallStation" => {
-                // Farm gà chỉ lấy tối đa 150 điểm để không làm méo mó thước đo
-                total_score += r.bb_per_100.clamp(-100.0, 150.0) * 0.5;
+                // Farm gà chỉ lấy tối đa 50 điểm để không làm méo mó thước đo
+                total_score += r.bb_per_100.clamp(-50.0, 50.0) * 0.3;
             }
             "Maniac" => {
-                total_score += r.bb_per_100.clamp(-100.0, 100.0) * 0.8;
+                // Heads-Up trừng phạt All-In bừa bãi
+                total_score += r.bb_per_100.clamp(-50.0, 50.0) * 0.3;
             }
             "Random" => {
-                total_score += r.bb_per_100.clamp(-100.0, 100.0) * 0.3;
+                // Bot ngẫu nhiên chỉ là bài test sàn tối thiểu, không làm rung lắc bảng điểm
+                total_score += r.bb_per_100.clamp(-30.0, 30.0) * 0.1;
             }
             _ => {}
         }
@@ -1256,6 +1343,13 @@ mod tests {
             "AlwaysFold score out of expected range: {:.2}",
             res.bb_per_100
         );
+    }
+
+    #[test]
+    fn test_run_suite_smoke() {
+        let results = run_suite(&TightAggressive, 30, &[50]);
+        assert_eq!(results.len(), 13); // 12 baseline opponents + MixedTable
+        let _ = score(&results);
     }
 
     #[test]
@@ -1421,6 +1515,29 @@ mod tests {
         fish_mask.enable(Action::BetPot75);
         let fish_act = StickyFish.select_action(&f_fish, &fish_mask);
         assert_eq!(fish_act, Action::CheckCall, "StickyFish cầm One Pair đối mặt Bet vừa phải tuyệt đối không Fold!");
+
+        // StickyFish v2: Đối mặt All-In cực to khi chỉ có bài yếu (eq thấp, chen thấp) -> Biết Fold tránh tự sát!
+        let mut f_fish_huge = f_fish.clone();
+        f_fish_huge[F_TO_CALL_RATIO_STACK] = 0.80; // Shove 80% stack
+        f_fish_huge[F_TO_CALL_NORM] = 0.40;
+        f_fish_huge[F_EQUITY] = 0.25;
+        f_fish_huge[F_HAND_STRENGTH] = 0.15;
+        let fish_huge_act = StickyFish.select_action(&f_fish_huge, &fish_mask);
+        assert_eq!(fish_huge_act, Action::Fold, "StickyFish gặp cú Shove All-In cực to với bài yếu phải biết Fold!");
+
+        // StickyFish v2: Cầm Two Pair (cat 0.22) khi chưa ai bet -> Phải Bet lấy tiền, không check thụ động!
+        let mut f_fish_twopair = f_fish.clone();
+        f_fish_twopair[F_FACING_BET] = 0.0;
+        f_fish_twopair[F_HAND_CAT] = 0.22;
+        let mut fish_bet_mask = ActionMask::EMPTY;
+        fish_bet_mask.enable(Action::CheckCall);
+        fish_bet_mask.enable(Action::BetPot33);
+        fish_bet_mask.enable(Action::BetPot75);
+        let fish_tp_act = StickyFish.select_action(&f_fish_twopair, &fish_bet_mask);
+        assert!(
+            fish_tp_act == Action::BetPot75 || fish_tp_act == Action::BetPot33,
+            "StickyFish cầm Two Pair phải chủ động Bet lấy value!"
+        );
 
         // 3. ThreeBetAggro: Preflop đối mặt với Open-Raise cầm bài khủng (Chen 0.48) -> Phải 3-Bet Pot75 hoặc AllIn!
         let mut f_aggro = vec![0.0f32; FEATURE_DIM];
