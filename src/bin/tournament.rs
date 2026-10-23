@@ -721,8 +721,11 @@ pub fn process_game_update(
         if !state.hero_id.is_empty() && actor == state.hero_id {
             if !state.has_evaluated_this_decision {
                 if let Some(hole) = state.hero_cards {
-                    state.has_evaluated_this_decision = true;
-                    return run_gto_evaluation(state, hole, policy, mode, use_os_enigo);
+                    let action = run_gto_evaluation(state, hole, policy, mode, use_os_enigo);
+                    if action.is_some() {
+                        state.has_evaluated_this_decision = true;
+                    }
+                    return action;
                 } else {
                     println!("⏳ Đến lượt bạn nhưng ván này chưa nhận diện được bài tẩy!");
                 }
@@ -941,20 +944,6 @@ pub fn run_gto_evaluation(
                 in_hand_count
             );
             mask.0 &= !((1 << Action::BetPot75.to_index()) | (1 << Action::AllIn.to_index()));
-        }
-
-        // 3. Chống đẩy All-In tự sát ở River với bài yếu (Air hoặc Bottom Pair):
-        if state.street == Street::River {
-            let is_weak_river = hand_cat < 0.15 || (hand_cat < 0.25 && features[166] < 0.20);
-            if is_weak_river && mask.is_valid(Action::AllIn) {
-                if mask.is_valid(Action::Fold) || mask.is_valid(Action::CheckCall) {
-                    println!(
-                        "🛡️  [RIVER ANTI-SUICIDE] Không đẩy All-in ở River với bài yếu (Cat: {:.2}) -> Khóa All-In!",
-                        hand_cat
-                    );
-                    mask.0 &= !(1 << Action::AllIn.to_index());
-                }
-            }
         }
     }
 
@@ -1494,6 +1483,8 @@ fn main() {
     let mut state = HandState::new();
 
     for mut stream in listener.incoming().flatten() {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(5000)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(5000)));
         let mut raw_data = Vec::with_capacity(16384);
         let mut temp_buf = [0u8; 8192];
 
@@ -1566,8 +1557,12 @@ fn main() {
                         resp_body.len(),
                         resp_body
                     );
-                    let _ = stream.write_all(response.as_bytes());
-                    let _ = stream.flush();
+                    if stream.write_all(response.as_bytes()).is_err() || stream.flush().is_err() {
+                        if pending_action.is_some() {
+                            println!("⚠️ [MẠNG] Không thể gửi lệnh sang Browser (Client disconnected/timeout) -> Tự động reset cờ để tính lại!");
+                            state.has_evaluated_this_decision = false;
+                        }
+                    }
                     break;
                 }
             }

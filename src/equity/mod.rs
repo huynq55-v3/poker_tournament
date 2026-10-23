@@ -253,22 +253,20 @@ pub fn equity_vs_random(hole: [Card; 2], board: &[Card], num_opp: usize) -> f32 
 }
 
 /// Sức mạnh hiện tại (Current Hand Strength - HS 0..1) so với 1 đối thủ ngẫu nhiên trên mặt board hiện tại.
-/// Đánh giá xác suất bài của Hero thắng một tay bài ngẫu nhiên NGAY TRÊN MẶT BÀI HIỆN TẠI (không rollout tới river).
+/// Duyệt kiệt kê chính xác 100% (Exact Exhaustive Enumeration) toàn bộ ~990 - 1,081 tổ hợp bài đối thủ:
+/// - Flop: Duyệt chính xác C(47, 2) = 1,081 tổ hợp
+/// - Turn: Duyệt chính xác C(46, 2) = 1,035 tổ hợp
+/// - River: Duyệt chính xác C(45, 2) = 990 tổ hợp
+/// Sai số = 0% tuyệt đối, bao phủ 100% mọi thế bài dị (Set, Flush, Straight, Two Pair...)!
 pub fn current_hand_strength_vs_random(hole: [Card; 2], board: &[Card]) -> f32 {
     if board.len() < 3 {
         return crate::environment::state::chen_score(hole[0], hole[1]);
     }
-    let mut rng = XorShift::new(seed_for(hole, board, 1) ^ 0xFEED_FACE_CAFE_BEEF);
-    current_hand_strength(hole, board, 40, &mut rng)
+    current_hand_strength_exact(hole, board)
 }
 
-/// Đánh giá Current Hand Strength (HS) bằng Monte Carlo trên mặt bài hiện tại
-pub fn current_hand_strength(
-    hole: [Card; 2],
-    board: &[Card],
-    samples: usize,
-    rng: &mut XorShift,
-) -> f32 {
+/// Đánh giá Current Hand Strength (HS) chính xác 100% bằng cách duyệt qua toàn bộ các cặp bài đối thủ
+pub fn current_hand_strength_exact(hole: [Card; 2], board: &[Card]) -> f32 {
     if board.len() < 3 {
         return crate::environment::state::chen_score(hole[0], hole[1]);
     }
@@ -295,7 +293,7 @@ pub fn current_hand_strength(
         }
     }
 
-    if m < 2 || samples == 0 {
+    if m < 2 {
         return 0.5;
     }
 
@@ -305,24 +303,26 @@ pub fn current_hand_strength(
     }
 
     let mut wins = 0.0f32;
-    for _ in 0..samples {
-        let idx0 = rng.below(m);
-        let mut idx1 = rng.below(m - 1);
-        if idx1 >= idx0 {
-            idx1 += 1;
-        }
-        opp_cards[board_len] = Card(pool[idx0]);
-        opp_cards[board_len + 1] = Card(pool[idx1]);
-        let opp_rank = evaluate_7_cards(&opp_cards[..board_len + 2]);
+    for i in 0..m {
+        opp_cards[board_len] = Card(pool[i]);
+        for j in (i + 1)..m {
+            opp_cards[board_len + 1] = Card(pool[j]);
+            let opp_rank = evaluate_7_cards(&opp_cards[..board_len + 2]);
 
-        if my_rank > opp_rank {
-            wins += 1.0;
-        } else if my_rank == opp_rank {
-            wins += 0.5;
+            if my_rank > opp_rank {
+                wins += 1.0;
+            } else if my_rank == opp_rank {
+                wins += 0.5;
+            }
         }
     }
 
-    wins / samples as f32
+    let total_combos = (m * (m - 1)) / 2;
+    if total_combos == 0 {
+        0.5
+    } else {
+        wins / total_combos as f32
+    }
 }
 
 /// 5 đặc trưng: [flush draw, straight draw, board có đôi, max cùng chất trên board / 5, lá cao nhất board / 12]
@@ -433,5 +433,20 @@ mod tests {
         // flush draw: 2 lá cơ trên tay + 2 lá cơ trên flop
         let f = board_and_draw_features([c("As"), c("Ks")], &[c("2s"), c("7s"), c("9h")]);
         assert_eq!(f[0], 1.0); // A,K,2,7 spade = 4 lá spade -> có flush draw
+    }
+
+    #[test]
+    fn test_current_hand_strength_exact_nuts_and_air() {
+        // 1. Royal Flush on River: HS must be exactly 1.0 (win against all 990 combos)
+        let royal_hole = [c("As"), c("Ks")];
+        let royal_board = [c("Qs"), c("Js"), c("Ts"), c("2h"), c("3d")];
+        let hs_nuts = current_hand_strength_vs_random(royal_hole, &royal_board);
+        assert_eq!(hs_nuts, 1.0, "Royal flush must have exact 1.0 HS");
+
+        // 2. Pure 72o air on AKQ board:
+        let air_hole = [c("7h"), c("2d")];
+        let scary_board = [c("As"), c("Ks"), c("Qs"), c("4c"), c("5d")];
+        let hs_air = current_hand_strength_vs_random(air_hole, &scary_board);
+        assert!(hs_air < 0.10, "Pure air on scary board must have HS < 0.10, got {}", hs_air);
     }
 }

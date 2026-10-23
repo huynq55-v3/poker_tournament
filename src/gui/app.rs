@@ -466,16 +466,6 @@ impl PokerGuiApp {
             if in_hand_count >= 3 && is_pure_air {
                 mask.0 &= !((1 << Action::BetPot75.to_index()) | (1 << Action::AllIn.to_index()));
             }
-
-            // Chống đẩy All-In tự sát ở River với bài yếu:
-            if self.env.state.street == Street::River {
-                let is_weak_river = hand_cat < 0.15 || (hand_cat < 0.25 && features[166] < 0.20);
-                if is_weak_river && mask.is_valid(Action::AllIn) {
-                    if mask.is_valid(Action::Fold) || mask.is_valid(Action::CheckCall) {
-                        mask.0 &= !(1 << Action::AllIn.to_index());
-                    }
-                }
-            }
         }
 
         let mut probs = self.policy.get_action_probs(&features, &mask);

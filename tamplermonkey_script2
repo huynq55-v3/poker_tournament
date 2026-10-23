@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         PokerNow to Localhost Forwarder (Stable v8.7 Silent React Bot)
+// @name         PokerNow to Localhost Forwarder (Stable v8.8 Silent React Bot)
 // @namespace    http://tampermonkey.net/
-// @version      8.7
+// @version      8.8
 // @description  Bắt trọn 100% gói tin gửi về receiver.rs & Tự chơi ngầm 100% trong tab (React DOM Clicker - Không chiếm chuột, không chiếm phím)
 // @match        *://pokernow.com/games/*
 // @match        *://www.pokernow.com/games/*
@@ -511,9 +511,11 @@
             done = true;
         }
 
-        // Nếu bàn chơi đang trong hoạt ảnh chưa kịp hiện nút fold/check/call, thử lại sau 150ms (tối đa 4 lần)
-        if (!done && attempt < 4) {
+        // Nếu bàn chơi đang trong hoạt ảnh chưa kịp hiện nút fold/check/call, thử lại sau 150ms (tối đa 12 lần ~ 1.8s)
+        if (!done && attempt < 12) {
             setTimeout(() => executeSilentAction(cmd, attempt + 1), 150);
+        } else if (!done && attempt >= 12) {
+            console.warn("⚠️ [SILENT BOT] Đã thử 12 lần nhưng không tìm thấy nút hành động hợp lệ trên DOM:", cmd);
         }
     }
 
@@ -529,7 +531,7 @@
             url: "http://127.0.0.1:3000/packet",
             headers: { "Content-Type": "application/json" },
             data: payload,
-            timeout: 5000,
+            timeout: 25000,
             onload: function(response) {
                 try {
                     const data = JSON.parse(response.responseText);
@@ -557,7 +559,9 @@
             onerror: function(err) {
                 // Server chưa bật hoặc lỗi kết nối
             },
-            ontimeout: function() {}
+            ontimeout: function() {
+                console.warn("⚠️ [SILENT BOT] Request sang Rust bị timeout sau 25 giây! Kiểm tra xem Solver có đang bị treo không.");
+            }
         });
     }
 
