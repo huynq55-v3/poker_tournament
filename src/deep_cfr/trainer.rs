@@ -464,27 +464,60 @@ impl DeepCFRTrainer {
                 .into_par_iter()
                 .map(|_| {
                     let mut trng = rand::thread_rng();
-                    // Phân bổ có chủ đích đa tầng stack: 50 BB (40%), 25 BB (30%), 12 BB (15%), 8 BB (15%)
-                    let roll: f32 = trng.gen();
-                    let target_depth = if roll < 0.40 {
-                        50u32
-                    } else if roll < 0.70 {
-                        25u32
-                    } else if roll < 0.85 {
-                        12u32
+                    // 🟢 DÀNH RIÊNG 35% BOOSTER CHO HEADS-UP (1-vs-1) ĐỂ HUẤN LUYỆN SÁT THỦ HEADS-UP:
+                    let is_hu = trng.gen_bool(0.35);
+                    let (n, target_depth) = if is_hu {
+                        // Heads-Up: Quét đều mọi tầng stack từ Deep Stack đến Push/Fold
+                        let hu_depth = match trng.gen_range(0..5) {
+                            0 => 50u32,
+                            1 => 35u32,
+                            2 => 20u32,
+                            3 => 12u32,
+                            _ => 8u32,
+                        };
+                        (2, hu_depth)
                     } else {
-                        8u32
-                    };
-
-                    let n = match target_depth {
-                        50 => max_p.clamp(6, 8),
-                        25 => trng.gen_range(5..=max_p.clamp(6, 8)),
-                        12 => trng.gen_range(3..=6.min(max_p)),
-                        _ => trng.gen_range(2..=max_p), // 8 BB phủ từ Heads-Up đến Short-handed & Full-ring
+                        // 65% còn lại cho các giai đoạn Multiway trong giải đấu:
+                        // Phân bổ có chủ đích: 50 BB (40%), 25 BB (30%), 12 BB (15%), 8 BB (15%)
+                        let roll: f32 = trng.gen();
+                        let depth = if roll < 0.40 {
+                            50u32
+                        } else if roll < 0.70 {
+                            25u32
+                        } else if roll < 0.85 {
+                            12u32
+                        } else {
+                            8u32
+                        };
+                        let players = match depth {
+                            50 => max_p.clamp(6, 8),
+                            25 => trng.gen_range(5..=max_p.clamp(6, 8)),
+                            12 => trng.gen_range(3..=6.min(max_p)),
+                            _ => trng.gen_range(3..=max_p),
+                        };
+                        (players, depth)
                     };
 
                     let button = trng.gen_range(0..n);
-                    let stacks = if trng.gen_bool(0.40) {
+                    let stacks = if is_hu {
+                        // Trong Heads-Up:
+                        // - 50% bàn Chipleader đè Short-stack (Dirichlet Asymmetric, ví dụ 70% vs 30% chip)
+                        //   để mạng học cách dùng ưu thế stack lớn cướp blind và trừng phạt đối thủ!
+                        // - 50% bàn Equal Stack theo target_depth
+                        if trng.gen_bool(0.50) {
+                            let total = target_depth * 2 * bb_size;
+                            let leader_share: f32 = trng.gen_range(0.55..0.85);
+                            let s0 = ((total as f32) * leader_share).round() as u32;
+                            let s1 = total.saturating_sub(s0).max(4 * bb_size);
+                            if trng.gen_bool(0.50) {
+                                vec![s0, s1]
+                            } else {
+                                vec![s1, s0]
+                            }
+                        } else {
+                            vec![target_depth * bb_size; 2]
+                        }
+                    } else if trng.gen_bool(0.40) {
                         vec![target_depth * bb_size; n]
                     } else {
                         TournamentStackSampler::sample_tournament_progression_stacks(
@@ -526,25 +559,25 @@ impl DeepCFRTrainer {
                     let mut trng = rand::thread_rng();
                     let n = fixed.unwrap_or_else(|| {
                         if max_p <= 4 {
-                            if trng.gen_bool(0.20) {
+                            if trng.gen_bool(0.35) {
                                 2
-                            } else if trng.gen_bool(0.20) {
+                            } else if trng.gen_bool(0.25) {
                                 3
                             } else {
                                 max_p
                             }
                         } else if max_p <= 6 {
-                            if trng.gen_bool(0.15) {
+                            if trng.gen_bool(0.35) {
                                 2
-                            } else if trng.gen_bool(0.75) {
+                            } else if trng.gen_bool(0.45) {
                                 max_p
                             } else {
                                 trng.gen_range(3..=max_p.saturating_sub(1).max(3))
                             }
                         } else {
-                            if trng.gen_bool(0.15) {
+                            if trng.gen_bool(0.35) {
                                 2
-                            } else if trng.gen_bool(0.80) {
+                            } else if trng.gen_bool(0.45) {
                                 trng.gen_range(7..=8)
                             } else {
                                 trng.gen_range(3..=6)

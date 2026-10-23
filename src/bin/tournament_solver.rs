@@ -832,6 +832,8 @@ pub fn run_gto_evaluation(
         state.players.get(*pid).is_some_and(|pl| !pl.is_folded)
     }).count();
 
+    let num_alive = state.players.values().filter(|p| p.stack > 0 || p.is_all_in).count().max(2);
+
     // Xác định Button Index với cơ chế fallback nếu dealer_id chưa tới
     let button_idx = if let Some(ref did) = state.dealer_id { 
         active_seats.iter().position(|id| id == did).unwrap_or(0) 
@@ -1004,10 +1006,12 @@ pub fn run_gto_evaluation(
 
     println!("\n============================================================");
     println!("🎯 [ĐẾN LƯỢT BẠN] - VÒNG: {:?}", state.street);
-    if in_hand_count <= 2 {
-        println!("⚔️  [ĐỐI ĐẦU 1-VS-1 HEADS-UP] Chỉ còn 2 người trong ván bài!");
+    if num_alive <= 2 {
+        println!("⚔️  [CHUNG KẾT HEADS-UP TOURNAMENT] Chỉ còn 2 người duy nhất tranh ngôi VÔ ĐỊCH!");
+    } else if in_hand_count <= 2 {
+        println!("👥 [POT ĐỐI ĐẦU 1-VS-1] (2 người trong ván / Bàn còn {} người sống sót tranh Top 4)", num_alive);
     } else {
-        println!("👥 Số người còn trong ván: {} / Tổng số ghế: {}", in_hand_count, num_players);
+        println!("👥 Số người còn trong ván: {} / Tổng số người còn chip: {}", in_hand_count, num_alive);
     }
     println!("🃏 Bài tẩy : [ {} {} ]", hole[0], hole[1]);
     if !state.community_cards.is_empty() {
@@ -1154,7 +1158,7 @@ pub fn run_gto_evaluation(
     }
 
     // Ra quyết định theo chế độ đã cấu hình: 100% Thuần EV Max, không Roll xúc xắc
-    let (chosen_idx, decision_note) = match mode {
+    let (mut chosen_idx, mut decision_note) = match mode {
         DecisionMode::PureMaxEv => {
             if let Some(ref res) = solver_result_opt {
                 // Chọn Action hợp lệ có EV (res.action_evs) cao nhất tuyệt đối từ Search Tree
@@ -1264,6 +1268,44 @@ pub fn run_gto_evaluation(
             (best_ev_idx, note)
         }
     };
+
+    // 🛡️ CHỐT CHẶN BẢO VỆ SINH TỒN VÀO TOP 4 (ICM TOP 4 SURVIVAL GUARD):
+    // Khi giải đấu còn đông người (num_alive > 4 - tức là còn 5-8 người, chưa vào Top 4) và Hero có stack tốt (eff_bb >= 10.0 BB):
+    // Nếu nước đi được chọn là All-In, kiểm tra xem EV của All-In có thực sự vượt trội phương án an toàn
+    // (Check hoặc Fold) ít nhất 0.12 ICM hay không.
+    // Nếu biên lợi nhuận mỏng (< +0.12 ICM), TUYỆT ĐỐI KHÔNG ĐÁNH ĐỔI MẠNG SỐNG GIẢI ĐẤU mà chọn nước đi an toàn!
+    if Action::from_index(chosen_idx) == Some(Action::AllIn) && num_alive > 4 && eff_bb >= 10.0 {
+        let (safe_act, safe_idx) = if to_call == 0 && mask.is_valid(Action::CheckCall) {
+            (Action::CheckCall, Action::CheckCall.to_index())
+        } else if mask.is_valid(Action::Fold) {
+            (Action::Fold, Action::Fold.to_index())
+        } else if mask.is_valid(Action::CheckCall) {
+            (Action::CheckCall, Action::CheckCall.to_index())
+        } else {
+            (Action::AllIn, Action::AllIn.to_index())
+        };
+
+        if safe_act != Action::AllIn {
+            let (ev_allin, ev_safe) = if let Some(ref res) = solver_result_opt {
+                (res.action_evs[Action::AllIn.to_index()], res.action_evs[safe_idx])
+            } else {
+                (raw_adv[Action::AllIn.to_index()], raw_adv[safe_idx])
+            };
+
+            let edge = ev_allin - ev_safe;
+            if edge < 0.12 {
+                println!(
+                    "🛡️  [ICM TOP 4 SURVIVAL GUARD] Bàn còn {} người (>4). Biên EV All-In ({:+.2}) so với {} ({:+.2}) quá mỏng ({:+.2} < +0.12 ICM) -> Chuyển sang {} để bảo toàn mạng sống vào Top 4! 🏆",
+                    num_alive, ev_allin, safe_act.name(), ev_safe, edge, safe_act.name()
+                );
+                chosen_idx = safe_idx;
+                decision_note = format!(
+                    "🛡️ [TOP 4 SURVIVAL GUARD] Chọn {} thay vì All-In mạo hiểm ({:+.2} vs {:+.2})",
+                    safe_act.name(), ev_safe, ev_allin
+                );
+            }
+        }
+    }
 
     let get_action_desc = |act: Action| -> String {
         match act {

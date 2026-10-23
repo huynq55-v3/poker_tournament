@@ -449,7 +449,7 @@ impl GameState {
     }
 }
 
-fn chen_score(c0: Card, c1: Card) -> f32 {
+pub fn chen_score(c0: Card, c1: Card) -> f32 {
     fn pts(r: u8) -> f32 {
         match r {
             12 => 10.0,

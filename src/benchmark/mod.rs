@@ -96,9 +96,21 @@ fn anti_shove_chen_threshold(n: f32) -> f32 {
     }
 }
 
-/// Bài rác preflop thực sự (72o, 83o, 93o, J2o...): điểm Chen chuẩn hóa dưới 0.22
-/// (Không tính nhầm các bài 22..55, A9o, KTo, QJs đang push đúng Nash ở 12BB là rác!)
-const TRASH_CHEN: f32 = 0.22;
+/// Ngưỡng xác định bài rác Preflop thích ứng theo quy mô bàn (Heads-Up vs Multiway):
+/// - Bàn đông người (5 - 8 người): Chen < 0.22 là rác (như 72o, 83o, 94o, K4o).
+/// - Bàn 3 - 4 người (Short-handed): Chen < 0.16 là rác.
+/// - Bàn Heads-Up (2 người): Đối đầu 1-vs-1, K-high/Q-high có equity > 50%, chỉ Chen < 0.10 (72o, 82o, 42o, 32o) mới thực sự là rác!
+#[inline]
+pub fn trash_chen_threshold(in_hand: usize) -> f32 {
+    if in_hand <= 2 {
+        0.10
+    } else if in_hand <= 4 {
+        0.16
+    } else {
+        0.22
+    }
+}
+pub const TRASH_CHEN: f32 = 0.22;
 const TABLE_SIZE: usize = 8;
 
 // ===================================================================== Baselines
@@ -985,7 +997,8 @@ fn play_hand_table<R: Rng>(
         let action = if cur == hero_seat {
             let a = hero.select_action(&feats, &mask);
             acc.acts[a.to_index()] += 1;
-            if feats[F_STREET_PREFLOP] > 0.5 && feats[F_HAND_STRENGTH] < TRASH_CHEN {
+            let in_hand_cnt = env.state.players.iter().filter(|p| p.is_in_hand()).count();
+            if feats[F_STREET_PREFLOP] > 0.5 && feats[F_HAND_STRENGTH] < trash_chen_threshold(in_hand_cnt) {
                 acc.trash += 1;
                 if a == Action::AllIn {
                     acc.trash_shove += 1;
@@ -1080,7 +1093,8 @@ fn play_mixed_hand<R: Rng>(
         let action = if cur == hero_seat {
             let a = hero.select_action(&feats, &mask);
             acc.acts[a.to_index()] += 1;
-            if feats[F_STREET_PREFLOP] > 0.5 && feats[F_HAND_STRENGTH] < TRASH_CHEN {
+            let in_hand_cnt = env.state.players.iter().filter(|p| p.is_in_hand()).count();
+            if feats[F_STREET_PREFLOP] > 0.5 && feats[F_HAND_STRENGTH] < trash_chen_threshold(in_hand_cnt) {
                 acc.trash += 1;
                 if a == Action::AllIn {
                     acc.trash_shove += 1;
@@ -1192,8 +1206,9 @@ pub fn score(results: &[BenchResult]) -> f64 {
     let mut max_trash_shove = 0.0f64;
 
     for r in results {
-        // Thu thập tỷ lệ shove rác lớn nhất trên toàn bộ các bàn
-        if r.trash_shove_pct > max_trash_shove {
+        // Thu thập tỷ lệ shove rác lớn nhất trên các bàn chuẩn mực (MixedTable, TAG, IcmSniper, ...)
+        // (Không tính phạt khi khai thác bot đánh bừa như Random / Maniac)
+        if r.opponent != "Random" && r.opponent != "Maniac" && r.trash_shove_pct > max_trash_shove {
             max_trash_shove = r.trash_shove_pct;
         }
 

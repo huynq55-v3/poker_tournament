@@ -17,7 +17,7 @@ use crate::neural_network::MLP;
 use crate::deep_cfr::policy::DeepCFRPolicy;
 use crate::poker_core::card::Card;
 use crate::poker_core::deck::Deck;
-use crate::poker_core::evaluator::{evaluate_7_cards, HandRank};
+use crate::poker_core::evaluator::{evaluate_7_cards, HandCategory, HandRank};
 use rand::distributions::WeightedIndex;
 use rand::prelude::Distribution;
 use rand::{thread_rng, Rng};
@@ -26,6 +26,7 @@ use std::time::Instant;
 /// Lý do kích hoạt tìm kiếm theo độ sâu
 #[derive(Clone, Debug, PartialEq)]
 pub enum SearchTrigger {
+    HeadsUpDuel,
     UnusualOverbet { bet_pot_ratio: f32 },
     HighStakesPot { pot_bb: f32 },
     CrucialPostflopStreet { street: Street },
@@ -37,6 +38,7 @@ pub enum SearchTrigger {
 impl std::fmt::Display for SearchTrigger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            SearchTrigger::HeadsUpDuel => write!(f, "⚔️ Chung kết 1-vs-1 Heads-Up (Chỉ còn 2 người trong tour)"),
             SearchTrigger::UnusualOverbet { bet_pot_ratio } => {
                 write!(f, "Đối thủ Overbet dị ({:.1}% pot)", bet_pot_ratio * 100.0)
             }
@@ -90,6 +92,73 @@ pub struct SubgameResult {
     pub duration_ms: f64,
 }
 
+/// Đánh giá độ hợp lý thực tế của tay bài đối thủ kết hợp CẢ BÀI TẨY VÀ BÀI CHUNG (Postflop Made Hand & Board Texture):
+/// Khắc phục triệt để nhược điểm của việc chỉ lọc theo Chen Score thuần:
+/// 1. "Có khi đối thủ cầm bài rác preflop mà trúng bài chung thì vẫn win!":
+///    - Nếu bài rác trúng bài chung (One Pair, Two Pair, Trips, Straight, Flush): HOÀN TOÀN HỢP LỆ VÀ GIỮ LẠI 100%!
+/// 2. Có Draw (Flush Draw 4 lá cùng chất trên mặt bài, Straight Draw): Giữ lại 100%.
+/// 3. Cầm Overcards / Bài tẩy mạnh preflop (Chen >= 0.25 như AK, AQ, AJ dù chưa trúng board): Giữ lại 100%.
+/// 4. Pure Air hoàn toàn không trúng gì: Vẫn giữ lại ~25% số lần để mô phỏng tần suất Bluff / C-bet tự nhiên của đối thủ!
+pub fn is_plausible_opponent_hand<R: Rng>(
+    c0: Card,
+    c1: Card,
+    community_cards: &[Card],
+    rng: &mut R,
+) -> bool {
+    if community_cards.len() >= 3 {
+        // 1. Tự cầm Pocket Pair (22, 33, ... AA): luôn hợp lệ!
+        if c0.rank_val() == c1.rank_val() {
+            return true;
+        }
+
+        // 2. Dù là bài rác preflop (như 83o, 74o, 62o), nếu TRÚNG BÀI CHUNG (One Pair, Two Pair, Trips):
+        //    -> "Có khi đối thủ cầm bài rác mà win đấy!" -> HOÀN TOÀN HỢP LỆ, KHÔNG ĐƯỢC LOẠI BỎ!
+        let hits_board = community_cards
+            .iter()
+            .any(|b| b.rank_val() == c0.rank_val() || b.rank_val() == c1.rank_val());
+        if hits_board {
+            return true;
+        }
+
+        // 3. Đánh giá Made Hand đầy đủ (Straight, Flush, Full House, ...) bằng evaluate_7_cards
+        let mut cards = Vec::with_capacity(community_cards.len() + 2);
+        cards.extend_from_slice(community_cards);
+        cards.push(c0);
+        cards.push(c1);
+        let rank = evaluate_7_cards(&cards);
+        if rank.category() >= HandCategory::OnePair {
+            return true;
+        }
+
+        // 4. Kiểm tra Flush Draw (4 lá cùng chất trên mặt bài)
+        let s0 = c0.suit_val();
+        let s1 = c1.suit_val();
+        let s0_count = 1 + community_cards.iter().filter(|b| b.suit_val() == s0).count();
+        let s1_count = 1 + community_cards.iter().filter(|b| b.suit_val() == s1).count();
+        if s0_count >= 4 || s1_count >= 4 {
+            return true;
+        }
+
+        // 5. Cầm bài tẩy chất lượng cao chưa trúng board (Overcards như AK, AQ, AJ - Chen >= 0.25):
+        if crate::environment::state::chen_score(c0, c1) >= 0.25 {
+            return true;
+        }
+
+        // 6. Nếu là bài hoàn toàn không trúng (Pure Air):
+        //    Vẫn cho phép xuất hiện ~25% số lần để mô phỏng tần suất Bluff / C-bet tự nhiên của đối thủ!
+        rng.gen_bool(0.25)
+    } else {
+        // Ở Preflop (chưa có bài chung):
+        // Bài có tiềm năng (Chen >= 0.20) luôn hợp lệ.
+        // Bài rác (Chen < 0.20) vẫn cho phép xuất hiện ~20% (mô phỏng Steal blind / Limp-call / Bluff).
+        if crate::environment::state::chen_score(c0, c1) >= 0.20 {
+            true
+        } else {
+            rng.gen_bool(0.20)
+        }
+    }
+}
+
 pub struct SubgameSolver {
     pub config: SubgameSolverConfig,
 }
@@ -114,6 +183,15 @@ impl SubgameSolver {
     ) -> SearchTrigger {
         if force_search {
             return SearchTrigger::ManualForced;
+        }
+
+        // 0. TRUE HEADS-UP TOURNAMENT DUEL TRIGGER:
+        // CHỈ tự động giải Solver cho mọi vòng cược khi giải đấu THỰC SỰ chỉ còn <= 2 người sống sót (True Heads-Up)!
+        // Nếu bàn vẫn còn đông người (num_alive >= 3) nhưng 6 người fold:
+        // ĐÂY LÀ VÁN BÀI MULTIWAY TOURNAMENT -> Phải tuân thủ áp lực ICM Bubble & Top 4 của Blueprint Net!
+        let num_alive = env.state.players.iter().filter(|p| p.stack > 0 || p.is_all_in).count();
+        if num_alive <= 2 {
+            return SearchTrigger::HeadsUpDuel;
         }
 
         let bb = env.state.bb_size.max(1) as f32;
@@ -654,11 +732,13 @@ impl SubgameSolver {
             .map(|idx| Card(idx as u8))
             .collect();
 
+        let num_alive = env.state.players.iter().filter(|p| p.stack > 0 || p.is_all_in).count();
+
         for _ in 0..iters {
             let mut branch = env.clone();
 
             // 🟢 MONTE CARLO CARD SAMPLING:
-            // Xáo trộn các lá bài chưa biết và chia ngẫu nhiên cho các đối thủ còn trong ván
+            // Xáo trộn các lá bài chưa biết và chia cho các đối thủ còn trong ván
             for i in (1..alive_cards.len()).rev() {
                 let j = rng.gen_range(0..=i);
                 alive_cards.swap(i, j);
@@ -667,14 +747,32 @@ impl SubgameSolver {
             let mut deal_idx = 0;
             for (idx, p) in branch.state.players.iter_mut().enumerate() {
                 if idx != hero_seat && p.is_in_hand() {
-                    // Nếu đối thủ chưa có bài tẩy (None), chia 2 lá ngẫu nhiên từ cọc bài
+                    // Nếu đối thủ chưa có bài tẩy (None), chia 2 lá từ cọc bài
                     if p.hole_cards[0].is_none() || p.hole_cards[1].is_none() {
                         if deal_idx + 2 <= alive_cards.len() {
-                            p.hole_cards = [
-                                Some(alive_cards[deal_idx]),
-                                Some(alive_cards[deal_idx + 1]),
-                            ];
+                            let mut c0 = alive_cards[deal_idx];
+                            let mut c1 = alive_cards[deal_idx + 1];
                             deal_idx += 2;
+
+                            // 🛡️ LỌC RANGE THỰC TẾ KẾT HỢP CẢ BÀI TẨY VÀ BÀI CHUNG (BOARD TEXTURE):
+                            // Khắc phục triệt để nhược điểm của Chen Score thuần:
+                            // "Có khi đối thủ cầm bài rác preflop mà trúng bài chung thì vẫn win!"
+                            // -> Nếu bài rác trúng bài chung (One Pair, Two Pair, Trips, Straight, Flush): GIỮ LẠI 100%!
+                            // -> Đồng thời vẫn giữ ~25% tần suất Bluff tự nhiên của đối thủ!
+                            if num_alive > 2 && (p.current_bet > env.state.bb_size || p.total_contributed > env.state.bb_size) {
+                                let mut attempts = 0;
+                                while !is_plausible_opponent_hand(c0, c1, &env.state.community_cards, &mut rng)
+                                    && deal_idx + 2 <= alive_cards.len()
+                                    && attempts < 5
+                                {
+                                    c0 = alive_cards[deal_idx];
+                                    c1 = alive_cards[deal_idx + 1];
+                                    deal_idx += 2;
+                                    attempts += 1;
+                                }
+                            }
+
+                            p.hole_cards = [Some(c0), Some(c1)];
                         }
                     }
                 }
@@ -959,5 +1057,72 @@ mod tests {
         println!("Fold EV: {}, Bet75 EV: {}, AllIn EV: {}", fold_ev, bet75_ev, allin_ev);
         assert!(fold_ev >= bet75_ev || result.best_action != Action::BetPot75, "T2o không được phép coi BetPot75 là tối ưu áp đảo!");
         assert_ne!(result.best_action, Action::AllIn, "T2o không được All-In!");
+    }
+
+    #[test]
+    fn test_subgame_solver_heads_up_duel_auto_trigger() {
+        let n = 2;
+        let stacks = vec![3000, 1000]; // Hero chipleader 3000 vs Opponent 1000
+        let mut env = Environment::new(n, &stacks, 40, 20, 0);
+        env.state.street = Street::Preflop;
+        env.state.pot = 60;
+        env.state.current_player_idx = 0; // Hero on Button (SB)
+
+        let solver = SubgameSolver::with_default_config();
+        // Dù force_search = false, Solver vẫn PHẢI tự động kích hoạt HeadsUpDuel!
+        let trigger = solver.should_trigger_search(&env, 0, false);
+        assert_eq!(trigger, SearchTrigger::HeadsUpDuel);
+    }
+
+    #[test]
+    fn test_subgame_solver_multiway_folded_to_two_does_not_trigger_heads_up_duel() {
+        let n = 8;
+        let stacks = vec![1000; 8];
+        let mut env = Environment::new(n, &stacks, 40, 20, 0);
+        env.state.street = Street::Preflop;
+        env.state.pot = 60; // Pot nhỏ 1.5 BB
+        // 6 người fold preflop
+        for i in 2..8 {
+            env.state.players[i].is_folded = true;
+        }
+        env.state.current_player_idx = 0;
+
+        let solver = SubgameSolver::with_default_config();
+        // Bàn 8 người còn sống trong tour, dù chỉ 2 người chưa fold trong ván này: KHÔNG được kích hoạt HeadsUpDuel!
+        let trigger = solver.should_trigger_search(&env, 0, false);
+        assert_eq!(trigger, SearchTrigger::FastPolicyFallback);
+    }
+
+    #[test]
+    fn test_is_plausible_opponent_hand_preserves_trash_that_hits_board() {
+        let mut rng = thread_rng();
+        // 1. Bài rác 8c 3d (Chen cực thấp < 0.10)
+        let c0 = Card::from_str_repr("8c").unwrap();
+        let c1 = Card::from_str_repr("3d").unwrap();
+
+        // Flop ra 8h 3s 2d -> Đối thủ trúng Two Pair từ bài rác!
+        let board_hit = vec![
+            Card::from_str_repr("8h").unwrap(),
+            Card::from_str_repr("3s").unwrap(),
+            Card::from_str_repr("2d").unwrap(),
+        ];
+        // Bắt buộc phải GIỮ LẠI 100% (true)!
+        assert!(
+            is_plausible_opponent_hand(c0, c1, &board_hit, &mut rng),
+            "Bài rác 83o trúng Two Pair trên board 8-3-2 phải được giữ lại 100%!"
+        );
+
+        // 2. Bài rác 7c 2d trúng Trips trên 7h 7s Kd
+        let c_72_0 = Card::from_str_repr("7c").unwrap();
+        let c_72_1 = Card::from_str_repr("2d").unwrap();
+        let board_trips = vec![
+            Card::from_str_repr("7h").unwrap(),
+            Card::from_str_repr("7s").unwrap(),
+            Card::from_str_repr("Kd").unwrap(),
+        ];
+        assert!(
+            is_plausible_opponent_hand(c_72_0, c_72_1, &board_trips, &mut rng),
+            "Bài rác 72o trúng Trips trên board 7-7-K phải được giữ lại 100%!"
+        );
     }
 }

@@ -1,6 +1,6 @@
 use crate::benchmark::{
-    BountyHunter, IcmSniper, LagShark, NashPushBot, NitTrap, StickyFish, ThreeBetAggro,
-    TightAggressive,
+    trash_chen_threshold, BountyHunter, IcmSniper, LagShark, NashPushBot, NitTrap, StickyFish,
+    ThreeBetAggro, TightAggressive,
 };
 use crate::environment::action::Action;
 use crate::environment::engine::Environment;
@@ -11,8 +11,6 @@ use rayon::prelude::*;
 
 const F_STREET_PREFLOP: usize = 123;
 const F_HAND_STRENGTH: usize = 167;
-/// Bài rác preflop thực sự (72o, 83o, 93o, J2o...): điểm Chen chuẩn hóa dưới 0.22
-const TRASH_CHEN: f32 = 0.22;
 const ARENA_PLAYERS: usize = 8;
 
 #[derive(Default, Clone)]
@@ -83,7 +81,8 @@ fn play_arena_team_hand<R: Rng>(
             if a == Action::AllIn {
                 acc.challenger_shoves += 1;
             }
-            if feats[F_STREET_PREFLOP] > 0.5 && feats[F_HAND_STRENGTH] < TRASH_CHEN {
+            let in_hand_cnt = env.state.players.iter().filter(|p| p.is_in_hand()).count();
+            if feats[F_STREET_PREFLOP] > 0.5 && feats[F_HAND_STRENGTH] < trash_chen_threshold(in_hand_cnt) {
                 acc.challenger_trash += 1;
                 if a == Action::AllIn {
                     acc.challenger_trash_shoves += 1;
@@ -235,7 +234,8 @@ fn play_arena_cash_hand<R: Rng>(
             if a == Action::AllIn {
                 acc.challenger_shoves += 1;
             }
-            if feats[F_STREET_PREFLOP] > 0.5 && feats[F_HAND_STRENGTH] < TRASH_CHEN {
+            let in_hand_cnt = env.state.players.iter().filter(|p| p.is_in_hand()).count();
+            if feats[F_STREET_PREFLOP] > 0.5 && feats[F_HAND_STRENGTH] < trash_chen_threshold(in_hand_cnt) {
                 acc.challenger_trash += 1;
                 if a == Action::AllIn {
                     acc.challenger_trash_shoves += 1;
@@ -328,7 +328,8 @@ fn play_arena_final_table_hand<R: Rng>(
             if a == Action::AllIn {
                 acc.challenger_shoves += 1;
             }
-            if feats[F_STREET_PREFLOP] > 0.5 && feats[F_HAND_STRENGTH] < TRASH_CHEN {
+            let in_hand_cnt = env.state.players.iter().filter(|p| p.is_in_hand()).count();
+            if feats[F_STREET_PREFLOP] > 0.5 && feats[F_HAND_STRENGTH] < trash_chen_threshold(in_hand_cnt) {
                 acc.challenger_trash += 1;
                 if a == Action::AllIn {
                     acc.challenger_trash_shoves += 1;
@@ -574,7 +575,8 @@ fn play_single_full_tournament<R: Rng>(
                 if a == Action::AllIn {
                     acc.challenger_shoves += 1;
                 }
-                if feats[F_STREET_PREFLOP] > 0.5 && feats[F_HAND_STRENGTH] < TRASH_CHEN {
+                let in_hand_cnt = env.state.players.iter().filter(|p| p.is_in_hand()).count();
+                if feats[F_STREET_PREFLOP] > 0.5 && feats[F_HAND_STRENGTH] < trash_chen_threshold(in_hand_cnt) {
                     acc.challenger_trash += 1;
                     if a == Action::AllIn {
                         acc.challenger_trash_shoves += 1;
