@@ -5,12 +5,12 @@ use crate::equity;
 use crate::poker_core::evaluator::evaluate_7_cards;
 use std::cell::RefCell;
 
-pub const FEATURE_DIM: usize = 176;
+pub const FEATURE_DIM: usize = 177;
 pub const MAX_PLAYERS: usize = 8;
 
-// Bộ nhớ đệm Thread-Local siêu tốc cho Equity & Draw Features (tránh tính lại Monte Carlo trên cùng 1 Street)
+// Bộ nhớ đệm Thread-Local siêu tốc cho Equity, Current Hand Strength & Draw Features (tránh tính lại Monte Carlo trên cùng 1 Street)
 thread_local! {
-    static EQUITY_CACHE: RefCell<(u64, f32, [f32; 5])> = const { RefCell::new((0, 0.0, [0.0; 5])) };
+    static EQUITY_CACHE: RefCell<(u64, f32, f32, [f32; 5])> = const { RefCell::new((0, 0.0, 0.0, [0.0; 5])) };
 }
 
 #[inline(always)]
@@ -151,24 +151,25 @@ impl GameState {
         }
     }
 
-    fn equity_features(&self, player_idx: usize, to_call: u32) -> [f32; 8] {
+    fn equity_features(&self, player_idx: usize, to_call: u32) -> ([f32; 8], f32) {
         let me = &self.players[player_idx];
         let (Some(c0), Some(c1)) = (me.hole_cards[0], me.hole_cards[1]) else {
-            return [0.0; 8];
+            return ([0.0; 8], 0.0);
         };
         let in_hand = self.players.iter().filter(|p| p.is_in_hand()).count().max(1);
         let num_opp = in_hand.saturating_sub(1);
 
         let key = compute_cache_key(c0, c1, &self.community_cards, num_opp);
-        let (eq, d) = EQUITY_CACHE.with(|cache| {
+        let (eq, hs, d) = EQUITY_CACHE.with(|cache| {
             let mut c = cache.borrow_mut();
             if c.0 == key {
-                (c.1, c.2)
+                (c.1, c.2, c.3)
             } else {
                 let eq_val = equity::equity_vs_random([c0, c1], &self.community_cards, num_opp);
+                let hs_val = equity::current_hand_strength_vs_random([c0, c1], &self.community_cards);
                 let draw_val = equity::board_and_draw_features([c0, c1], &self.community_cards);
-                *c = (key, eq_val, draw_val);
-                (eq_val, draw_val)
+                *c = (key, eq_val, hs_val, draw_val);
+                (eq_val, hs_val, draw_val)
             }
         });
 
@@ -213,16 +214,19 @@ impl GameState {
             0.0
         };
 
-        [
-            eq,                                 // f[168]: Equity thô khách quan (0..1)
-            (eq - pot_odds).clamp(-1.0, 1.0),   // f[169]: Chênh lệch Equity so với Pot Odds
-            aggressor_street_barrels,           // f[170]: Số vòng cược mà Last Aggressor đã barrel (0.25 = 1 vòng, 0.5 = 2 vòng, 0.75 = 3 vòng, 1.0 = 4 vòng)
-            d[0],                               // f[171]: Flush draw
-            d[1],                               // f[172]: Straight draw
-            d[2],                               // f[173]: Paired board
-            d[3],                               // f[174]: Max suit on board / 5
-            d[4],                               // f[175]: Board high card / 12
-        ]
+        (
+            [
+                eq,                                 // f[168]: Equity thô khách quan (0..1)
+                (eq - pot_odds).clamp(-1.0, 1.0),   // f[169]: Chênh lệch Equity so với Pot Odds
+                aggressor_street_barrels,           // f[170]: Số vòng cược mà Last Aggressor đã barrel (0.25 = 1 vòng, 0.5 = 2 vòng, 0.75 = 3 vòng, 1.0 = 4 vòng)
+                d[0],                               // f[171]: Flush draw
+                d[1],                               // f[172]: Straight draw
+                d[2],                               // f[173]: Paired board
+                d[3],                               // f[174]: Max suit on board / 5
+                d[4],                               // f[175]: Board high card / 12
+            ],
+            hs,
+        )
     }
 
     pub fn effective_stack_bb(&self, player_idx: usize) -> f32 {
@@ -423,7 +427,7 @@ impl GameState {
         let in_hand = self.players.iter().filter(|p| p.is_in_hand()).count();
         f.push(in_hand as f32 / MAX_PLAYERS as f32); // index 160: F_IN_HAND
 
-        // 8. Ngữ cảnh push/fold & sức mạnh bài (7) -> index 161..167
+        // 8. Ngữ cảnh push/fold & sức mạnh bài -> index 161..165
         let eff_bb = self.effective_stack_bb(player_idx);
         if self.is_cash_game {
             f.push((eff_bb / 150.0).min(2.0)); // index 161: dải mượt 0..300 BB
@@ -431,18 +435,47 @@ impl GameState {
             f.push((eff_bb / 50.0).min(1.5));  // index 161: Tournament cũ
         }
         f.push(if eff_bb < 12.0 { 1.0 } else { 0.0 }); // index 162: F_PUSHFOLD
-        f.push(if to_call > 0 { 1.0 } else { 0.0 }); // index 163: F_FACING_BET
         let my_stack = me.stack as f32;
-        f.push(if my_stack > 0.0 { (to_call as f32 / my_stack).min(1.0) } else { 1.0 }); // index 164
-        // index 165: Tỷ lệ Pot-Commitment của bản thân (đã bỏ bao nhiêu % tổng tài sản vào pot này)
+        f.push(if my_stack > 0.0 { (to_call as f32 / my_stack).min(1.0) } else { 1.0 }); // index 163: F_TO_CALL_RATIO_STACK
+        // index 164: Tỷ lệ Pot-Commitment của bản thân (đã bỏ bao nhiêu % tổng tài sản vào pot này)
         let my_total_wealth = (me.stack + me.total_contributed).max(1) as f32;
-        f.push((me.total_contributed as f32 / my_total_wealth).clamp(0.0, 1.0));
-        let (cat, strength) = self.hand_strength(player_idx);
-        f.push(cat);      // index 166
-        f.push(strength); // index 167: F_HAND_STRENGTH
+        f.push((me.total_contributed as f32 / my_total_wealth).clamp(0.0, 1.0)); // index 164: F_POT_COMMITMENT
+        let (cat, _) = self.hand_strength(player_idx);
+        f.push(cat);      // index 165: F_HAND_CAT
 
-        // 9. Equity & draw & board texture (8) -> index 168..175
-        f.extend_from_slice(&self.equity_features(player_idx, to_call));
+        // 9. Equity, Hand Strength & Board Texture -> index 166..174
+        let (eq_feats, hs) = self.equity_features(player_idx, to_call);
+        f.push(hs);       // index 166: F_HAND_STRENGTH (Preflop: Chen score, Postflop: Monte Carlo current hand strength!)
+        f.extend_from_slice(&eq_feats); // index 167..174: 8 chiều equity thô và board features
+
+        // 10. Tín hiệu cược nâng cao -> index 175..176
+        // index 175: facing_raise (đối mặt cú raise/check-raise trên vòng hiện tại)
+        let street_bets_and_raises = self.action_history.iter().filter(|r| {
+            r.street == self.street && matches!(
+                r.action,
+                Action::BetSmall | Action::BetPot33 | Action::BetPot75 | Action::AllIn
+            )
+        }).count();
+        let hero_bet_this_street = self.action_history.iter().any(|r| {
+            r.player_idx == player_idx && r.street == self.street && matches!(
+                r.action,
+                Action::BetSmall | Action::BetPot33 | Action::BetPot75 | Action::AllIn
+            )
+        });
+        let facing_raise = if to_call > 0 && (street_bets_and_raises >= 2 || hero_bet_this_street) {
+            1.0f32
+        } else {
+            0.0f32
+        };
+        f.push(facing_raise);
+
+        // index 176: relative_bet_size (to_call / pot)
+        let rel_bet = if self.pot > 0 {
+            (to_call as f32 / self.pot as f32).min(3.0)
+        } else {
+            0.0f32
+        };
+        f.push(rel_bet);
 
         debug_assert_eq!(f.len(), FEATURE_DIM, "encode_features length mismatch");
         f

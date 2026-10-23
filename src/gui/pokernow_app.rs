@@ -433,7 +433,7 @@ impl PokerNowApp {
         let eff_stack_bb = self.env.state.effective_stack_bb(actor);
 
         // Preflop Anti-Trash Shove Guard
-        let chen_strength = features[167];
+        let chen_strength = features[166];
         if self.env.state.street == Street::Preflop {
             let min_shove_chen = if eff_stack_bb < 8.0 { 0.20 } else if eff_stack_bb < 15.0 { 0.26 } else { 0.32 };
             if chen_strength < min_shove_chen && mask.is_valid(Action::AllIn) {
@@ -443,9 +443,9 @@ impl PokerNowApp {
             }
         } else {
             // Postflop Anti-Suicide Guard
-            let hand_cat = features[166];
-            let has_flush_draw = features[171] >= 0.5;
-            let has_straight_draw = features[172] >= 0.5;
+            let hand_cat = features[165];
+            let has_flush_draw = features[170] >= 0.5;
+            let has_straight_draw = features[171] >= 0.5;
             let is_pure_air = hand_cat < 0.15 && !has_flush_draw && !has_straight_draw;
 
             if to_call > 0 && is_pure_air {
@@ -464,7 +464,7 @@ impl PokerNowApp {
 
             // River Anti-Suicide
             if self.env.state.street == Street::River {
-                let is_weak_river = hand_cat < 0.15 || (hand_cat < 0.25 && features[167] < 0.20);
+                let is_weak_river = hand_cat < 0.15 || (hand_cat < 0.25 && features[166] < 0.20);
                 if is_weak_river && mask.is_valid(Action::AllIn) {
                     if mask.is_valid(Action::Fold) || mask.is_valid(Action::CheckCall) {
                         mask.0 &= !(1 << Action::AllIn.to_index());

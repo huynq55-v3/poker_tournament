@@ -691,7 +691,7 @@ pub fn run_gto_evaluation(
     // 🛡️ CHỐT CHẶN ALL-IN AN TOÀN CASH GAME (TIER 1: EQUITY & SỨC MẠNH BÀI TẨY)
     // Trong PokerStars cash game (đặc biệt bàn 100 BB), All-in rủi ro toàn bộ tiền thật.
     // Chỉ cho phép nút All-In nếu bài có Equity mạnh hoặc Monster Value / Combo Draw thực thụ:
-    let chen_strength = features[167];
+    let chen_strength = features[166];
     let eff_stack_bb = env.state.effective_stack_bb(hero_seat);
     let eff_chips = (eff_stack_bb * state.bb_size as f32).round() as u32;
 
@@ -701,7 +701,7 @@ pub fn run_gto_evaluation(
             if state.street == Street::Preflop {
                 chen_strength >= 0.28
             } else {
-                features[168] >= 0.40 || features[166] >= 0.22
+                features[167] >= 0.40 || features[165] >= 0.22
             }
         } else {
             // Stack sâu (>= 15 BB, 50-100+ BB): Tiêu chuẩn All-in cực kỳ khắt khe!
@@ -720,11 +720,11 @@ pub fn run_gto_evaluation(
                     // Postflop Deep-Stack:
                     // 1. Monster Made Hand: Two Pair trở lên (cat >= 0.30) hoặc Overpair Kicker khủng (cat >= 0.22 && str >= 0.75)
                     // 2. HOẶC Monster Combo Draw: Flush Draw + Straight Draw, hoặc raw equity >= 0.50
-                    let hand_cat = features[166];
-                    let hand_str = features[167];
-                    let raw_eq = features[168];
-                    let has_flush_draw = features[171] >= 0.5;
-                    let has_straight_draw = features[172] >= 0.5;
+                    let hand_cat = features[165];
+                    let hand_str = features[166];
+                    let raw_eq = features[167];
+                    let has_flush_draw = features[170] >= 0.5;
+                    let has_straight_draw = features[171] >= 0.5;
 
                     let is_monster_made = hand_cat >= 0.30 || (hand_cat >= 0.22 && hand_str >= 0.75);
                     let is_monster_draw = (has_flush_draw && has_straight_draw) || raw_eq >= 0.50;

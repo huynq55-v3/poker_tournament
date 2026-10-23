@@ -20,7 +20,6 @@ use rayon::prelude::*;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-const HIDDEN_DIMS: [usize; 3] = [256, 256, 128];
 const REPLAY_CAPACITY: usize = 2_500_000;
 
 fn arg<T: std::str::FromStr>(args: &[String], flag: &str, default: T) -> T {
@@ -207,7 +206,18 @@ fn main() {
     let _ = poker_tournament::equity::preflop_table();
 
     let mut rng = thread_rng();
-    let mut trainer = DeepCFRTrainer::new(FEATURE_DIM, &HIDDEN_DIMS, REPLAY_CAPACITY, use_icm);
+    let (input_dim, hidden_dims) = if let Ok(m) = MLP::load_from_file(&from_adv) {
+        let dims = m.layer_dims();
+        if dims.len() >= 3 {
+            (dims[0], dims[1..dims.len() - 1].to_vec())
+        } else {
+            (FEATURE_DIM, vec![256, 256, 256])
+        }
+    } else {
+        (FEATURE_DIM, vec![256, 256, 256])
+    };
+
+    let mut trainer = DeepCFRTrainer::new(input_dim, &hidden_dims, REPLAY_CAPACITY, use_icm);
     trainer.max_players = max_players;
     trainer.fixed_players = None; // Cho phép giải đấu loại dần từ max_players về 2 người
     trainer.use_icm = use_icm;

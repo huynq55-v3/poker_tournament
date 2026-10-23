@@ -252,6 +252,79 @@ pub fn equity_vs_random(hole: [Card; 2], board: &[Card], num_opp: usize) -> f32 
     monte_carlo_equity(hole, board, num_opp, POSTFLOP_SAMPLES, &mut rng)
 }
 
+/// Sức mạnh hiện tại (Current Hand Strength - HS 0..1) so với 1 đối thủ ngẫu nhiên trên mặt board hiện tại.
+/// Đánh giá xác suất bài của Hero thắng một tay bài ngẫu nhiên NGAY TRÊN MẶT BÀI HIỆN TẠI (không rollout tới river).
+pub fn current_hand_strength_vs_random(hole: [Card; 2], board: &[Card]) -> f32 {
+    if board.len() < 3 {
+        return crate::environment::state::chen_score(hole[0], hole[1]);
+    }
+    let mut rng = XorShift::new(seed_for(hole, board, 1) ^ 0xFEED_FACE_CAFE_BEEF);
+    current_hand_strength(hole, board, 40, &mut rng)
+}
+
+/// Đánh giá Current Hand Strength (HS) bằng Monte Carlo trên mặt bài hiện tại
+pub fn current_hand_strength(
+    hole: [Card; 2],
+    board: &[Card],
+    samples: usize,
+    rng: &mut XorShift,
+) -> f32 {
+    if board.len() < 3 {
+        return crate::environment::state::chen_score(hole[0], hole[1]);
+    }
+
+    let board_len = board.len().min(5);
+    let mut hero_cards = [Card(0); 7];
+    for (i, c) in board.iter().take(board_len).enumerate() {
+        hero_cards[i] = *c;
+    }
+    hero_cards[board_len] = hole[0];
+    hero_cards[board_len + 1] = hole[1];
+    let my_rank = evaluate_7_cards(&hero_cards[..board_len + 2]);
+
+    let mut dead = [false; 52];
+    for c in hole.iter().chain(board.iter().take(board_len)) {
+        dead[c.0 as usize] = true;
+    }
+    let mut pool = [0u8; 52];
+    let mut m = 0usize;
+    for i in 0..52u8 {
+        if !dead[i as usize] {
+            pool[m] = i;
+            m += 1;
+        }
+    }
+
+    if m < 2 || samples == 0 {
+        return 0.5;
+    }
+
+    let mut opp_cards = [Card(0); 7];
+    for (i, c) in board.iter().take(board_len).enumerate() {
+        opp_cards[i] = *c;
+    }
+
+    let mut wins = 0.0f32;
+    for _ in 0..samples {
+        let idx0 = rng.below(m);
+        let mut idx1 = rng.below(m - 1);
+        if idx1 >= idx0 {
+            idx1 += 1;
+        }
+        opp_cards[board_len] = Card(pool[idx0]);
+        opp_cards[board_len + 1] = Card(pool[idx1]);
+        let opp_rank = evaluate_7_cards(&opp_cards[..board_len + 2]);
+
+        if my_rank > opp_rank {
+            wins += 1.0;
+        } else if my_rank == opp_rank {
+            wins += 0.5;
+        }
+    }
+
+    wins / samples as f32
+}
+
 /// 5 đặc trưng: [flush draw, straight draw, board có đôi, max cùng chất trên board / 5, lá cao nhất board / 12]
 pub fn board_and_draw_features(hole: [Card; 2], board: &[Card]) -> [f32; 5] {
     let mut all_mask = 0u16;

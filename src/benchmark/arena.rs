@@ -10,7 +10,7 @@ use rand::{thread_rng, Rng};
 use rayon::prelude::*;
 
 const F_STREET_PREFLOP: usize = 123;
-const F_HAND_STRENGTH: usize = 167;
+const F_HAND_STRENGTH: usize = 166;
 const ARENA_PLAYERS: usize = 8;
 
 #[derive(Default, Clone)]

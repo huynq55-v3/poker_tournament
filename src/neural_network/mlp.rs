@@ -207,10 +207,16 @@ impl MLP {
         self.layers.first().map(|l| l.in_features).unwrap_or(0)
     }
 
-    /// High-speed inference for a single sample
+    /// High-speed inference for a single sample (hỗ trợ tương thích ngược nếu input lớn hơn input_dim của model cũ)
     #[inline(always)]
     pub fn forward(&self, input: &[f32]) -> Vec<f32> {
-        let mut current = input.to_vec();
+        let in_dim = self.input_dim();
+        let input_slice = if in_dim > 0 && input.len() >= in_dim {
+            &input[..in_dim]
+        } else {
+            input
+        };
+        let mut current = input_slice.to_vec();
         let num_layers = self.layers.len();
 
         for (l_idx, layer) in self.layers.iter().enumerate() {
@@ -231,10 +237,16 @@ impl MLP {
     }
 
     fn forward_pass_with_cache(&self, input: &[f32]) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        let in_dim = self.input_dim();
+        let input_slice = if in_dim > 0 && input.len() >= in_dim {
+            &input[..in_dim]
+        } else {
+            input
+        };
         let mut pre_activations = Vec::with_capacity(self.layers.len());
         let mut post_activations = Vec::with_capacity(self.layers.len() + 1);
 
-        post_activations.push(input.to_vec());
+        post_activations.push(input_slice.to_vec());
         let num_layers = self.layers.len();
 
         for (l_idx, layer) in self.layers.iter().enumerate() {

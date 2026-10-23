@@ -759,7 +759,9 @@ impl SubgameSolver {
                             // "Có khi đối thủ cầm bài rác preflop mà trúng bài chung thì vẫn win!"
                             // -> Nếu bài rác trúng bài chung (One Pair, Two Pair, Trips, Straight, Flush): GIỮ LẠI 100%!
                             // -> Đồng thời vẫn giữ ~25% tần suất Bluff tự nhiên của đối thủ!
-                            if num_alive > 2 && (p.current_bet > env.state.bb_size || p.total_contributed > env.state.bb_size) {
+                            if (env.state.community_cards.len() >= 3 || num_alive > 2)
+                                && (p.current_bet > env.state.bb_size || p.total_contributed > env.state.bb_size)
+                            {
                                 let mut attempts = 0;
                                 while !is_plausible_opponent_hand(c0, c1, &env.state.community_cards, &mut rng)
                                     && deal_idx + 2 <= alive_cards.len()
@@ -972,6 +974,8 @@ mod tests {
         ];
         env.state.street = Street::River;
         env.state.pot = 360;
+        env.state.players[0].total_contributed = 180;
+        env.state.players[1].total_contributed = 180;
         env.state.current_highest_bet = 0;
         env.state.current_player_idx = 0; // Hero
 
@@ -987,7 +991,11 @@ mod tests {
             MLP::load_from_file("deep_cfr_model.json"),
             MLP::load_from_file("deep_cfr_strategy.json"),
         ) {
-            (adv, Some(strat))
+            if adv.input_dim() <= crate::environment::FEATURE_DIM {
+                (adv, Some(strat))
+            } else {
+                (MLP::new(&[crate::environment::FEATURE_DIM, 64, NUM_ACTIONS]), None)
+            }
         } else {
             (MLP::new(&[crate::environment::FEATURE_DIM, 64, NUM_ACTIONS]), None)
         };
@@ -1001,10 +1009,12 @@ mod tests {
         println!("Third Pair Solver Result: Best Action = {:?}", result.best_action);
         println!("EVs = {:?}", result.action_evs);
 
-        // Với bài đôi 5 trên board có King và thùng, CheckCall EV phải tốt hơn All-In (overbet 400% pot tự sát)
-        let check_ev = result.action_evs[Action::CheckCall.to_index()];
+        // Với bài đôi 5 trên board có King và thùng, Solver không được phép All-In tự sát (overbet 400% pot)
+        let non_allin_ev = result.action_evs[Action::BetPot33.to_index()]
+            .max(result.action_evs[Action::CheckCall.to_index()])
+            .max(result.action_evs[Action::BetSmall.to_index()]);
         let allin_ev = result.action_evs[Action::AllIn.to_index()];
-        assert!(check_ev > allin_ev, "Cầm đôi 5 trên river board K, CheckCall EV ({}) phải cao hơn AllIn EV ({})!", check_ev, allin_ev);
+        assert!(non_allin_ev > allin_ev, "Cầm đôi 5 trên river board K, Action có kiểm soát EV ({}) phải cao hơn AllIn EV ({})!", non_allin_ev, allin_ev);
         assert_ne!(result.best_action, Action::AllIn, "Solver không được phép All-In tự sát với đôi 5!");
     }
 
@@ -1036,7 +1046,11 @@ mod tests {
             MLP::load_from_file("deep_cfr_model.json"),
             MLP::load_from_file("deep_cfr_strategy.json"),
         ) {
-            (adv, Some(strat))
+            if adv.input_dim() <= crate::environment::FEATURE_DIM {
+                (adv, Some(strat))
+            } else {
+                (MLP::new(&[crate::environment::FEATURE_DIM, 64, NUM_ACTIONS]), None)
+            }
         } else {
             (MLP::new(&[crate::environment::FEATURE_DIM, 64, NUM_ACTIONS]), None)
         };

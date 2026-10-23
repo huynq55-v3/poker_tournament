@@ -896,7 +896,7 @@ pub fn run_gto_evaluation(
 
     // 🛡️ CHỐT CHẶN CHỐNG ALL-IN BÀI RÁC Ở PREFLOP (ANTI-TRASH SHOVE GUARD):
     // Nếu đang ở Preflop và bài tẩy quá yếu, khóa cứng nút All-In để bot tuyệt đối không bao giờ đẩy All-in bài rác!
-    let chen_strength = features[167]; // F_HAND_STRENGTH (0..1)
+    let chen_strength = features[166]; // F_HAND_STRENGTH (0..1)
     let eff_stack_bb = env.state.effective_stack_bb(hero_seat);
     if state.street == Street::Preflop {
         // Dưới 8 BB thì bài rác < 0.20 mới khóa, còn từ 8 BB trở lên nếu Chen < 0.28 (như 3-6, 4-7, 2-8) thì cấm All-In!
@@ -916,9 +916,9 @@ pub fn run_gto_evaluation(
         // 1. Nếu đối thủ Bet/Raise (to_call > 0) và Hero chỉ có High Card (pure air: cat < 0.15)
         //    và KHÔNG có Flush Draw (d[0] < 0.5) cũng KHÔNG có Straight Draw (d[1] < 0.5):
         //    Khóa toàn bộ BetSmall, BetPot33, BetPot75, AllIn! Không được bluff-raise tự sát với bài rác!
-        let hand_cat = features[166];
-        let has_flush_draw = features[171] >= 0.5;
-        let has_straight_draw = features[172] >= 0.5;
+        let hand_cat = features[165];
+        let has_flush_draw = features[170] >= 0.5;
+        let has_straight_draw = features[171] >= 0.5;
         let is_pure_air = hand_cat < 0.15 && !has_flush_draw && !has_straight_draw;
 
         if to_call > 0 && is_pure_air {
@@ -945,7 +945,7 @@ pub fn run_gto_evaluation(
 
         // 3. Chống đẩy All-In tự sát ở River với bài yếu (Air hoặc Bottom Pair):
         if state.street == Street::River {
-            let is_weak_river = hand_cat < 0.15 || (hand_cat < 0.25 && features[167] < 0.20);
+            let is_weak_river = hand_cat < 0.15 || (hand_cat < 0.25 && features[166] < 0.20);
             if is_weak_river && mask.is_valid(Action::AllIn) {
                 if mask.is_valid(Action::Fold) || mask.is_valid(Action::CheckCall) {
                     println!(

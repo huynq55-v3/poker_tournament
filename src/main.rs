@@ -140,11 +140,11 @@ fn main() {
 
     println!("\n[1] 🏋️ Deep CFR training with {}-Max Tournament Gating (50 BB Stack -> End of Tour)...", max_players);
     
-    // Kiến trúc mạng nơ-ron: 3 tầng ẩn đủ sâu cho 176 features
-    let hidden_dims = [256, 256, 128];
+    // Kiến trúc mạng nơ-ron: 3 tầng ẩn đủ sâu cho 177 features
+    let hidden_dims = [256, 256, 256];
     
-    // Capacity 2.5M mẫu vừa vặn bộ nhớ RAM
-    let mut trainer = DeepCFRTrainer::new(FEATURE_DIM, &hidden_dims, 2_500_000, use_icm);
+    // Capacity 5M mẫu vừa vặn bộ nhớ RAM
+    let mut trainer = DeepCFRTrainer::new(FEATURE_DIM, &hidden_dims, 5_000_000, use_icm);
     trainer.max_players = max_players;   // 🟢 Bàn max 8 người (có phủ Heads-up, 3-max, Bubble 5-max)
     trainer.fixed_players = None;        // Phủ đều mọi giai đoạn giải đấu
     trainer.use_icm = use_icm;           // 🟢 Bật Tournament ICM (Malmuth-Harville)
