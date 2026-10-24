@@ -20,7 +20,7 @@ const BENCH_CSV: &str = "benchmark_log.csv";
 
 /// Phân tích tham số dòng lệnh linh hoạt:
 /// - Mặc định: Bàn 8-Max, Tournament ICM, 50 BB khởi điểm, giả lập đến khi hết tour
-fn parse_args() -> (usize, bool) {
+fn parse_args() -> (usize, bool, bool) {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -117,11 +117,13 @@ fn parse_args() -> (usize, bool) {
         max_players = if max_players <= 6 { 6 } else { 8 };
     }
 
-    (max_players, use_icm)
+    let fresh = args.iter().any(|a| a == "--fresh" || a == "--new" || a == "--from-scratch");
+
+    (max_players, use_icm, fresh)
 }
 
 fn main() {
-    let (max_players, use_icm) = parse_args();
+    let (max_players, use_icm, fresh) = parse_args();
     let initial_bb = 50u32; // 🟢 Mỗi người chơi ban đầu có 50 BB (tổng 400 BB cả giải)
     let mode_desc = if use_icm { "TOURNAMENT ICM (FULL RUN TO WINNER)" } else { "CHIP-EV THUẦN" };
 
@@ -165,7 +167,7 @@ fn main() {
 
     let _ = std::fs::remove_file(BENCH_CSV);
 
-    if std::path::Path::new(BEST_ADV).exists() {
+    if !fresh && std::path::Path::new(BEST_ADV).exists() {
         println!("📥 Đang nạp checkpoint Champion có sẵn: {}", BEST_ADV);
         match trainer.load_models(BEST_ADV, BEST_STRAT) {
             Ok(true) => println!("   ✅ Đã nạp thành công Advantage Net và Strategy Net!"),
@@ -173,7 +175,7 @@ fn main() {
             Err(e) => println!("   ⚠️  Không thể nạp checkpoint ({}), tiếp tục khởi tạo mới.", e),
         }
     } else {
-        println!("🌱 Khởi tạo mạng mới hoàn toàn cho Tournament 8-Max.");
+        println!("🌱 Khởi tạo mạng mới hoàn toàn cho Tournament 8-Max (Train Fresh, 100% Self-Play).");
         let _ = trainer.save_models(BEST_ADV, BEST_STRAT);
     }
 
@@ -192,8 +194,17 @@ fn main() {
 
         if iter % bench_every == 0 {
             let bt = Instant::now();
-            let challenger_policy = DeepCFRPolicy::new(Arc::clone(&trainer.advantage_net), false);
-            let champion_policy = DeepCFRPolicy::new(Arc::new(RwLock::new(current_champion_net.clone())), false);
+            let challenger_policy = trainer.get_policy(false);
+            let champion_strat = if std::path::Path::new(BEST_STRAT).exists() {
+                MLP::load_from_file(BEST_STRAT).ok()
+            } else {
+                None
+            };
+            let champion_policy = DeepCFRPolicy::with_strategy(
+                Arc::new(RwLock::new(current_champion_net.clone())),
+                champion_strat,
+                false,
+            );
 
             if use_icm {
                 println!("\n   ⚔️  ĐẤU TRƯỜNG TOURNAMENT {}-MAX (50 BB Khởi Điểm - Đánh Đến Khi Hết Tour): Challenger (Iter {}) vs Champion...", max_players, iter);
@@ -227,7 +238,7 @@ fn main() {
                     current_champion_net = trainer.advantage_net.read().unwrap().clone();
                     let _ = trainer.save_models(BEST_ADV, BEST_STRAT);
                 } else {
-                    println!("   🛡️  Champion giữ vững ngôi vương. Chưa đủ cách biệt thống kê (hoặc TrashShove > 5%).");
+                    println!("   🛡️  Champion giữ vững ngôi vương. Chưa đủ cách biệt thống kê để soán ngôi.");
                 }
             } else {
                 println!("\n   ⚔️  ĐẤU TRƯỜNG {}-MAX (50 BB): Challenger (Iter {}) vs Champion...", max_players, iter);
@@ -256,7 +267,7 @@ fn main() {
                     current_champion_net = trainer.advantage_net.read().unwrap().clone();
                     let _ = trainer.save_models(BEST_ADV, BEST_STRAT);
                 } else {
-                    println!("   🛡️  Champion giữ vững ngôi vương. Chưa đủ cách biệt thống kê (hoặc TrashShove > 5%).");
+                    println!("   🛡️  Champion giữ vững ngôi vương. Chưa đủ cách biệt thống kê để soán ngôi.");
                 }
             }
 
@@ -285,11 +296,12 @@ fn main() {
 
     println!("\n[2] 🏁 Final benchmark on BEST checkpoint...");
     let adv = MLP::load_from_file(BEST_ADV).unwrap_or_else(|_| trainer.advantage_net.read().unwrap().clone());
-    let best_policy = Arc::new(DeepCFRPolicy::new(Arc::new(RwLock::new(adv)), false));
+    let strat = MLP::load_from_file(BEST_STRAT).ok();
+    let best_policy = Arc::new(DeepCFRPolicy::with_strategy(Arc::new(RwLock::new(adv)), strat.clone(), false));
 
     if use_icm {
         println!("   🏆 Đang kiểm tra 500 giải đấu Tournament 8-max (50 BB khởi điểm, đánh đến khi hết tour)...");
-        let dummy_champ = DeepCFRPolicy::new(Arc::new(RwLock::new(current_champion_net.clone())), false);
+        let dummy_champ = DeepCFRPolicy::with_strategy(Arc::new(RwLock::new(current_champion_net.clone())), strat, false);
         let final_tour = evaluate_against_champion_tournament(
             best_policy.as_ref(),
             &dummy_champ,

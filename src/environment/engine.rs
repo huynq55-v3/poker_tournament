@@ -173,7 +173,6 @@ impl Environment {
         }
 
         let to_call = self.state.current_highest_bet.saturating_sub(player.current_bet);
-        let eff_stack_bb = self.state.effective_stack_bb(p_idx);
 
         if to_call > 0 {
             mask.enable(Action::Fold);
@@ -190,11 +189,6 @@ impl Environment {
 
         if can_raise {
             mask.enable(Action::AllIn);
-        }
-
-        // PUSH / FOLD MODE: effective stack < 12 BB -> chỉ [Fold, CheckCall, AllIn]
-        if eff_stack_bb < 12.0 {
-            return mask;
         }
 
         if can_raise {
@@ -628,16 +622,14 @@ mod tests {
     use rand::rngs::mock::StepRng;
 
     #[test]
-    fn test_push_fold_activation_under_12bb() {
+    fn test_sized_bets_allowed_under_12bb() {
         let mut rng = StepRng::new(42, 1);
         let stacks = vec![1000, 1000]; // 10 BB (BB = 100)
         let mut env = Environment::new(2, &stacks, 100, 50, 0);
         env.reset_hand(&mut rng, 0);
 
         let mask = env.get_action_mask();
-        assert!(!mask.is_valid(Action::BetSmall));
-        assert!(!mask.is_valid(Action::BetPot33));
-        assert!(!mask.is_valid(Action::BetPot75));
+        assert!(mask.is_valid(Action::BetPot33));
         assert!(mask.is_valid(Action::AllIn));
     }
 

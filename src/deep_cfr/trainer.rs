@@ -378,13 +378,13 @@ impl DeepCFRTrainer {
                     let mut env = Environment::new(n, &stacks, bb_size, sb_size, button);
                     env.state.is_cash_game = false;
 
-                    let sparring_enabled = trng.gen_bool(0.60); // 60% bàn Tournament có Quân Xanh rèn giũa toàn diện
+                    let sparring_enabled = false; // Thuần 100% Self-Play Deep CFR (Không dùng Quân Xanh)
                     let mut ctx = Ctx {
                         net: &snapshot,
                         adv_out: Vec::new(),
                         strat_out: Vec::new(),
                         weight: iter_weight,
-                        sparring_tag: sparring_enabled,
+                        sparring_tag: false,
                     };
 
                     let mut hand_idx = 0;
@@ -535,7 +535,7 @@ impl DeepCFRTrainer {
                         adv_out: Vec::new(),
                         strat_out: Vec::new(),
                         weight: iter_weight,
-                        sparring_tag: trng.gen_bool(0.70), // 70% Booster Hands có Quân Xanh trừng phạt toàn diện
+                        sparring_tag: false, // Thuần 100% Self-Play Deep CFR
                     };
 
                     for t in 0..n {
@@ -599,7 +599,7 @@ impl DeepCFRTrainer {
                         adv_out: Vec::new(),
                         strat_out: Vec::new(),
                         weight: iter_weight,
-                        sparring_tag: trng.gen_bool(0.50),
+                        sparring_tag: false,
                     };
                     for t in 0..n {
                         let mut env = Environment::new(n, &stacks, bb_size, sb_size, button);

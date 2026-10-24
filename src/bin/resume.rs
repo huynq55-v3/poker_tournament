@@ -283,8 +283,17 @@ fn main() {
 
         if !warm && (k % bench_every == 0 || global % bench_every == 0) {
             let bt = Instant::now();
-            let challenger_policy = DeepCFRPolicy::new(Arc::clone(&trainer.advantage_net), false);
-            let champion_policy = DeepCFRPolicy::new(Arc::new(RwLock::new(current_champion_net.clone())), false);
+            let challenger_policy = trainer.get_policy(false);
+            let champion_strat = if std::path::Path::new(&best_strat_path).exists() {
+                MLP::load_from_file(&best_strat_path).ok()
+            } else {
+                None
+            };
+            let champion_policy = DeepCFRPolicy::with_strategy(
+                Arc::new(RwLock::new(current_champion_net.clone())),
+                champion_strat,
+                false,
+            );
 
             if use_icm {
                 println!(
@@ -323,7 +332,7 @@ fn main() {
                         println!("   🌟 Đã lưu Champion vào {} & {}", best_path, best_strat_path);
                     }
                 } else {
-                    println!("   🛡️  Champion giữ vững ngôi vương. Challenger chưa đủ vượt trội (hoặc TrashShove > 5%).");
+                    println!("   🛡️  Champion giữ vững ngôi vương. Challenger chưa đủ cách biệt thống kê để soán ngôi.");
                 }
             } else {
                 println!(
@@ -354,7 +363,7 @@ fn main() {
                     );
                     let _ = trainer.save_models(&best_path, &best_strat_path);
                 } else {
-                    println!("   🛡️  Champion giữ vững ngôi vương. Challenger chưa đủ vượt trội (hoặc TrashShove > 5%).");
+                    println!("   🛡️  Champion giữ vững ngôi vương. Challenger chưa đủ cách biệt thống kê để soán ngôi.");
                 }
             }
 

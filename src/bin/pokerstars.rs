@@ -1025,8 +1025,6 @@ pub fn run_gto_evaluation(
         } else {
             if act == Action::Fold && to_call == 0 {
                 " (Khóa: Check miễn phí)"
-            } else if eff_stack_bb < 12.0 && act != Action::Fold && act != Action::CheckCall && act != Action::AllIn {
-                " (Khóa do Effective Stack < 12BB - Push/Fold Mode)"
             } else if act == Action::BetSmall && is_small_same_as_33 {
                 " (Khóa: Trùng size với Bet 33%)"
             } else {

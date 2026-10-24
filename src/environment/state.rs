@@ -8,9 +8,13 @@ use std::cell::RefCell;
 pub const FEATURE_DIM: usize = 177;
 pub const MAX_PLAYERS: usize = 8;
 
-// Bộ nhớ đệm Thread-Local siêu tốc cho Equity, Current Hand Strength & Draw Features (tránh tính lại Monte Carlo trên cùng 1 Street)
+const EQUITY_CACHE_SIZE: usize = 512;
+const EQUITY_CACHE_MASK: usize = EQUITY_CACHE_SIZE - 1;
+
+// Bộ nhớ đệm Thread-Local Direct-Mapped 512 slots siêu tốc cho Equity, Hand Strength & Draw Features (tránh tính lại Monte Carlo / Exact HS)
 thread_local! {
-    static EQUITY_CACHE: RefCell<(u64, f32, f32, [f32; 5])> = const { RefCell::new((0, 0.0, 0.0, [0.0; 5])) };
+    static EQUITY_CACHE: RefCell<[(u64, f32, f32, [f32; 5]); EQUITY_CACHE_SIZE]> =
+        const { RefCell::new([(0, 0.0, 0.0, [0.0; 5]); EQUITY_CACHE_SIZE]) };
 }
 
 #[inline(always)]
@@ -160,15 +164,16 @@ impl GameState {
         let num_opp = in_hand.saturating_sub(1);
 
         let key = compute_cache_key(c0, c1, &self.community_cards, num_opp);
+        let idx = (key as usize) & EQUITY_CACHE_MASK;
         let (eq, hs, d) = EQUITY_CACHE.with(|cache| {
             let mut c = cache.borrow_mut();
-            if c.0 == key {
-                (c.1, c.2, c.3)
+            if c[idx].0 == key {
+                (c[idx].1, c[idx].2, c[idx].3)
             } else {
                 let eq_val = equity::equity_vs_random([c0, c1], &self.community_cards, num_opp);
                 let hs_val = equity::current_hand_strength_vs_random([c0, c1], &self.community_cards);
                 let draw_val = equity::board_and_draw_features([c0, c1], &self.community_cards);
-                *c = (key, eq_val, hs_val, draw_val);
+                c[idx] = (key, eq_val, hs_val, draw_val);
                 (eq_val, hs_val, draw_val)
             }
         });
@@ -216,14 +221,14 @@ impl GameState {
 
         (
             [
-                eq,                                 // f[168]: Equity thô khách quan (0..1)
-                (eq - pot_odds).clamp(-1.0, 1.0),   // f[169]: Chênh lệch Equity so với Pot Odds
-                aggressor_street_barrels,           // f[170]: Số vòng cược mà Last Aggressor đã barrel (0.25 = 1 vòng, 0.5 = 2 vòng, 0.75 = 3 vòng, 1.0 = 4 vòng)
-                d[0],                               // f[171]: Flush draw
-                d[1],                               // f[172]: Straight draw
-                d[2],                               // f[173]: Paired board
-                d[3],                               // f[174]: Max suit on board / 5
-                d[4],                               // f[175]: Board high card / 12
+                eq,                                 // f[167]: Equity thô khách quan (0..1)
+                (eq - pot_odds).clamp(-1.0, 1.0),   // f[168]: Chênh lệch Equity so với Pot Odds
+                aggressor_street_barrels,           // f[169]: Số vòng cược mà Last Aggressor đã barrel
+                d[0],                               // f[170]: Flush draw
+                d[1],                               // f[171]: Straight draw
+                d[2],                               // f[172]: Paired board
+                d[3],                               // f[173]: Max suit on board / 5
+                d[4],                               // f[174]: Board high card / 12
             ],
             hs,
         )

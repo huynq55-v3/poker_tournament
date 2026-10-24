@@ -964,6 +964,7 @@ pub fn run_gto_evaluation(
             &policy.advantage_net.read().unwrap(),
             policy.strategy_net.read().unwrap().as_ref(),
             trigger,
+            Some(mask),
         );
         (res.action_evs, res.action_probs, Some(res))
     } else {
@@ -1336,11 +1337,8 @@ pub fn run_gto_evaluation(
         let status = if is_valid { 
             "" 
         } else { 
-            let eff_stack_bb = env.state.effective_stack_bb(hero_seat);
             if act == Action::Fold && to_call == 0 {
                 " (Khóa: Check miễn phí)"
-            } else if eff_stack_bb < 12.0 && act != Action::Fold && act != Action::CheckCall && act != Action::AllIn {
-                " (Khóa do Effective Stack < 12BB - Push/Fold Mode)"
             } else if act == Action::BetSmall {
                 " (Khóa: Trùng size với Bet 33%)"
             } else {

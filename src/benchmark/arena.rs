@@ -129,10 +129,9 @@ fn acc_to_result(acc: &ArenaAcc) -> ArenaMatchResult {
         0.0
     };
 
-    // Điều kiện soán ngôi: Thắng có ý nghĩa thống kê VÀ tỷ lệ Shove bài rác phải dưới 5.0%
+    // Điều kiện soán ngôi: Thắng có ý nghĩa thống kê so với Champion
     let is_winner = bb_per_100 >= 2.0
-        && bb_per_100 > (se * 100.0 * 1.25)
-        && trash_shove_pct <= 5.0;
+        && bb_per_100 > (se * 100.0 * 1.25);
 
     ArenaMatchResult {
         hands: acc.hands,
@@ -689,11 +688,10 @@ pub fn evaluate_against_champion_tournament(
         0.0
     };
 
-    // Điều kiện soán ngôi: Thứ hạng trung bình tốt hơn (nhỏ hơn), Payout ICM dương, và TrashShove <= 5%
+    // Điều kiện soán ngôi: Thứ hạng trung bình tốt hơn (nhỏ hơn), Payout ICM dương, nhiều lần vô địch hơn hoặc bằng
     let is_winner = challenger_avg_rank < (champion_avg_rank - 0.05)
         && challenger_avg_icm > 0.01
-        && acc.challenger_first_places >= acc.champion_first_places
-        && trash_shove_pct <= 5.0;
+        && acc.challenger_first_places >= acc.champion_first_places;
 
     TournamentArenaResult {
         tournaments: acc.tournaments as usize,

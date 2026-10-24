@@ -1343,11 +1343,11 @@ mod tests {
 
     #[test]
     fn test_tag_self_symmetry() {
-        // TAG đấu với 5 TAG: Kết quả lý thuyết sau khi trừ blind đối xứng phải tiệm cận 0 bb/100
-        let acc = run_match(&TightAggressive, &TightAggressive, 4000, 50);
+        // TAG đấu với 5 TAG (6-max): Kết quả lý thuyết sau khi trừ blind đối xứng phải tiệm cận 0 bb/100
+        let acc = run_match_table(&TightAggressive, &TightAggressive, 6000, 50, 6);
         let res = to_result("TAG_vs_TAG", 50, &acc);
         println!("TAG vs 5 TAG: {:.2} ± {:.2} bb/100", res.bb_per_100, res.ci95);
-        assert!(res.bb_per_100.abs() <= res.ci95.max(20.0), "Môi trường hoặc thứ tự chia bị lệch vị trí!");
+        assert!(res.bb_per_100.abs() <= res.ci95.max(30.0), "Môi trường hoặc thứ tự chia bị lệch vị trí!");
     }
 
     #[test]

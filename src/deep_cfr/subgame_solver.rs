@@ -525,6 +525,7 @@ impl SubgameSolver {
         hero_start_icm: f32,
         adv_net: &MLP,
         strat_net: Option<&MLP>,
+        root_mask: ActionMask,
         root_action_values: &mut [f32; NUM_ACTIONS],
         root_regrets: &mut [f32; NUM_ACTIONS],
         root_policy_sum: &mut [f32; NUM_ACTIONS],
@@ -546,7 +547,7 @@ impl SubgameSolver {
         }
 
         let cur = env.state.current_player_idx;
-        let mask = env.get_action_mask();
+        let mask = if depth == 0 { root_mask } else { env.get_action_mask() };
         if mask.0 == 0 {
             return self.evaluate_leaf(env, hero_seat, initial_hero_stack, hero_start_icm, adv_net);
         }
@@ -576,6 +577,7 @@ impl SubgameSolver {
                             hero_start_icm,
                             adv_net,
                             strat_net,
+                            root_mask,
                             root_action_values,
                             root_regrets,
                             root_policy_sum,
@@ -616,6 +618,7 @@ impl SubgameSolver {
                         hero_start_icm,
                         adv_net,
                         strat_net,
+                        root_mask,
                         root_action_values,
                         root_regrets,
                         root_policy_sum,
@@ -649,6 +652,7 @@ impl SubgameSolver {
                     hero_start_icm,
                     adv_net,
                     strat_net,
+                    root_mask,
                     root_action_values,
                     root_regrets,
                     root_policy_sum,
@@ -666,9 +670,10 @@ impl SubgameSolver {
         adv_net: &MLP,
         strat_net: Option<&MLP>,
         trigger: SearchTrigger,
+        root_mask_override: Option<ActionMask>,
     ) -> SubgameResult {
         let start_time = Instant::now();
-        let mask = env.get_action_mask();
+        let mask = root_mask_override.unwrap_or_else(|| env.get_action_mask());
         let valid_actions = mask.valid_actions();
 
         // Trường hợp đặc biệt: Chỉ có 1 action duy nhất (ví dụ chỉ có thể Check)
@@ -791,6 +796,7 @@ impl SubgameSolver {
                 hero_start_icm,
                 adv_net,
                 strat_net,
+                mask,
                 &mut root_action_values,
                 &mut root_regrets,
                 &mut root_policy_sum,
@@ -893,7 +899,7 @@ mod tests {
         let solver = SubgameSolver::with_default_config();
 
         let trigger = SearchTrigger::HighStakesPot { pot_bb: 20.0 };
-        let result = solver.resolve(&env, 0, &adv_mlp, None, trigger);
+        let result = solver.resolve(&env, 0, &adv_mlp, None, trigger, None);
 
         println!("Nuts Solver Result: Best Action = {:?}", result.best_action);
         println!("EVs = {:?}", result.action_evs);
@@ -947,7 +953,7 @@ mod tests {
         let solver = SubgameSolver::with_default_config();
 
         let trigger = SearchTrigger::UnusualOverbet { bet_pot_ratio: 2.0 };
-        let result = solver.resolve(&env, 0, &adv_mlp, None, trigger);
+        let result = solver.resolve(&env, 0, &adv_mlp, None, trigger, None);
 
         println!("Air Solver Result: Best Action = {:?}", result.best_action);
         println!("EVs = {:?}", result.action_evs);
@@ -1004,7 +1010,7 @@ mod tests {
         let solver = SubgameSolver::new(config);
 
         let trigger = SearchTrigger::ManualForced;
-        let result = solver.resolve(&env, 0, &adv_mlp, strat_mlp.as_ref(), trigger);
+        let result = solver.resolve(&env, 0, &adv_mlp, strat_mlp.as_ref(), trigger, None);
 
         println!("Third Pair Solver Result: Best Action = {:?}", result.best_action);
         println!("EVs = {:?}", result.action_evs);
@@ -1059,7 +1065,7 @@ mod tests {
         let solver = SubgameSolver::new(config);
 
         let trigger = SearchTrigger::ManualForced;
-        let result = solver.resolve(&env, 1, &adv_mlp, strat_mlp.as_ref(), trigger);
+        let result = solver.resolve(&env, 1, &adv_mlp, strat_mlp.as_ref(), trigger, None);
 
         println!("Preflop Trash Solver Result: Best Action = {:?}", result.best_action);
         println!("EVs = {:?}", result.action_evs);
