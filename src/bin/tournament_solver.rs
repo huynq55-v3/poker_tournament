@@ -15,8 +15,8 @@ use std::{thread, time::Duration};
 
 use enigo::{Enigo, Key, Keyboard, Settings};
 
-const ADV_MODEL_PATH: &str = "deep_cfr_model.json";
-const STRAT_MODEL_PATH: &str = "deep_cfr_strategy.json";
+const ADV_MODEL_PATH: &str = "deep_cfr_model_old.json";
+const STRAT_MODEL_PATH: &str = "deep_cfr_strategy_old.json";
 
 // =========================================================================
 // 1. DATA STRUCTURES & TYPES
@@ -601,8 +601,20 @@ pub fn process_game_update(
         for (pid, sval) in pgs_obj {
             let entry = state.players.entry(pid.clone()).or_insert_with(|| PlayerTracker { id: pid.clone(), ..Default::default() });
             if let Some(st) = sval.as_str() {
-                if st == "fold" { entry.is_folded = true; } 
-                else if st == "allIn" { entry.is_all_in = true; }
+                if st == "fold" || st == "quit" || st == "stoodUp" {
+                    entry.is_folded = true;
+                } else if st == "allIn" {
+                    entry.is_folded = false;
+                    if !entry.is_all_in {
+                        entry.is_all_in = true;
+                        if pid != &state.hero_id {
+                            state.has_evaluated_this_decision = false;
+                        }
+                    }
+                } else if st == "inHand" {
+                    // Mở khóa lại is_folded khi người chơi đang trong ván
+                    entry.is_folded = false;
+                }
             }
         }
     }
@@ -614,6 +626,10 @@ pub fn process_game_update(
             let prev_bet = entry.current_bet;
             if let Some(amt) = bval.as_u64() {
                 let new_bet = amt as u32;
+                // Nếu có tiền cược trong ván -> chắc chắn chưa fold
+                if new_bet > 0 {
+                    entry.is_folded = false;
+                }
                 if new_bet > prev_bet {
                     let delta = new_bet - prev_bet;
                     entry.total_contributed += delta;
@@ -647,7 +663,10 @@ pub fn process_game_update(
                     state.highest_bet = new_bet;
                 }
             } else if bval.as_str() == Some("<D>") {
-                entry.current_bet = 0;
+                // Chỉ xóa current_bet nếu người chơi KHÔNG phải đang All-In
+                if !entry.is_all_in {
+                    entry.current_bet = 0;
+                }
             }
         }
     }
@@ -657,7 +676,8 @@ pub fn process_game_update(
         let active_set: std::collections::HashSet<String> = ihpi.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
         if !active_set.is_empty() {
             for (pid, p) in state.players.iter_mut() {
-                if !active_set.contains(pid) { p.is_folded = true; }
+                // Đồng bộ 2 chiều: ai trong iHPI là chưa fold, vắng mặt là đã fold
+                p.is_folded = !active_set.contains(pid);
             }
         }
     }
@@ -722,6 +742,9 @@ pub fn process_game_update(
         }
 
         if !state.hero_id.is_empty() && actor == state.hero_id {
+            if let Some(hero_p) = state.players.get_mut(&state.hero_id) {
+                hero_p.is_folded = false;
+            }
             if !state.has_evaluated_this_decision {
                 if let Some(hole) = state.hero_cards {
                     let action = run_gto_evaluation(state, hole, policy, mode, use_os_enigo, solver, force_search);
@@ -831,9 +854,7 @@ pub fn run_gto_evaluation(
         env_players.push(ps);
     }
 
-    let in_hand_count = active_seats.iter().filter(|pid| {
-        state.players.get(*pid).is_some_and(|pl| !pl.is_folded)
-    }).count();
+    let in_hand_count = env_players.iter().filter(|pl| !pl.is_folded).count();
 
     let num_alive = state.players.values().filter(|p| p.stack > 0 || p.is_all_in).count().max(2);
 
@@ -903,56 +924,6 @@ pub fn run_gto_evaluation(
 
     // NẠP VECTO ĐẶC TRƯNG VÀ TÍNH TOÁN BẰNG MẠNG NƠ-RON
     let features = env.state.encode_features(hero_seat);
-
-    // 🛡️ CHỐT CHẶN CHỐNG ALL-IN BÀI RÁC Ở PREFLOP (ANTI-TRASH SHOVE GUARD):
-    // Nếu đang ở Preflop và bài tẩy quá yếu, khóa cứng nút All-In để bot tuyệt đối không bao giờ đẩy All-in bài rác!
-    let chen_strength = features[166]; // F_HAND_STRENGTH (0..1)
-    let eff_stack_bb = env.state.effective_stack_bb(hero_seat);
-    if state.street == Street::Preflop {
-        // Dưới 8 BB thì bài rác < 0.20 mới khóa, còn từ 8 BB trở lên nếu Chen < 0.28 (như 3-6, 4-7, 2-8) thì cấm All-In!
-        let min_shove_chen = if eff_stack_bb < 8.0 { 0.20 } else if eff_stack_bb < 15.0 { 0.26 } else { 0.32 };
-        if chen_strength < min_shove_chen && mask.is_valid(Action::AllIn) {
-            // Đảm bảo vẫn còn ít nhất Fold hoặc CheckCall hợp lệ trước khi khóa AllIn
-            if mask.is_valid(Action::Fold) || mask.is_valid(Action::CheckCall) {
-                println!(
-                    "🛡️  [ANTI-TRASH SHOVE] Bài tẩy {:?} quá yếu (Chen: {:.2} < {:.2} ở {:.1} BB) -> Khóa nút All-In!",
-                    hole, chen_strength, min_shove_chen, eff_stack_bb
-                );
-                mask.0 &= !(1 << Action::AllIn.to_index());
-            }
-        }
-    } else {
-        // 🛡️ CHỐT CHẶN BẢO VỆ POSTFLOP (FLOP / TURN / RIVER):
-        // 1. Nếu đối thủ Bet/Raise (to_call > 0) và Hero chỉ có High Card (pure air: cat < 0.15)
-        //    và KHÔNG có Flush Draw (d[0] < 0.5) cũng KHÔNG có Straight Draw (d[1] < 0.5):
-        //    Khóa toàn bộ BetSmall, BetPot33, BetPot75, AllIn! Không được bluff-raise tự sát với bài rác!
-        let hand_cat = features[165];
-        let has_flush_draw = features[170] >= 0.5;
-        let has_straight_draw = features[171] >= 0.5;
-        let is_pure_air = hand_cat < 0.15 && !has_flush_draw && !has_straight_draw;
-
-        if to_call > 0 && is_pure_air {
-            if mask.is_valid(Action::Fold) || mask.is_valid(Action::CheckCall) {
-                println!(
-                    "🛡️  [POSTFLOP ANTI-SUICIDE] Bài tẩy {:?} không có đôi / không có draw (Air) khi đối thủ bet -> Khóa toàn bộ Tố / All-In!",
-                    hole
-                );
-                mask.0 &= !((1 << Action::BetSmall.to_index())
-                    | (1 << Action::BetPot33.to_index())
-                    | (1 << Action::BetPot75.to_index())
-                    | (1 << Action::AllIn.to_index()));
-            }
-        }
-
-        // 2. Chống bluff bom All-In / Bet 75% trong Pot nhiều người (Multiway >= 3):
-        if in_hand_count >= 3 && is_pure_air {
-            println!(
-                "👥 [MULTIWAY AIR GUARD] Pot đông người ({} người) với bài rác -> Khóa BetPot75 & All-In!",
-                in_hand_count
-            );
-            mask.0 &= !((1 << Action::BetPot75.to_index()) | (1 << Action::AllIn.to_index()));
-        }
-    }
 
     // KIỂM TRA ĐIỀU KIỆN KÍCH HOẠT DEPTH-LIMITED LOOKAHEAD SEARCH:
     let trigger = solver.should_trigger_search(&env, hero_seat, force_search);
@@ -1148,7 +1119,7 @@ pub fn run_gto_evaluation(
     }
 
     // Ra quyết định theo chế độ đã cấu hình: 100% Thuần EV Max, không Roll xúc xắc
-    let (mut chosen_idx, mut decision_note) = match mode {
+    let (chosen_idx, decision_note) = match mode {
         DecisionMode::PureMaxEv => {
             if let Some(ref res) = solver_result_opt {
                 // Chọn Action hợp lệ có EV (res.action_evs) cao nhất tuyệt đối từ Search Tree
@@ -1172,25 +1143,60 @@ pub fn run_gto_evaluation(
                 );
                 (best_i, note)
             } else {
-                // Fast Policy Fallback: Chọn Action hợp lệ có EV (raw_adv) cao nhất từ Blueprint Net
-                let mut best_i = 0;
-                let mut best_ev = f32::NEG_INFINITY;
-                let mut best_p = -1.0f32;
-                for (i, &ev) in raw_adv.iter().enumerate().take(NUM_ACTIONS) {
-                    if mask.is_index_valid(i) {
-                        let p = clean_probs[i];
-                        if ev > best_ev || ((ev - best_ev).abs() < 1e-4 && p > best_p) {
-                            best_ev = ev;
-                            best_p = p;
-                            best_i = i;
-                        }
+                // Fast Policy Fallback: Chọn Action hợp lệ theo GTO + EV Max từ Blueprint Net
+                let mut max_gto_p = 0.0f32;
+                let mut best_gto_idx = 0;
+                for (i, &p) in clean_probs.iter().enumerate().take(NUM_ACTIONS) {
+                    if mask.is_index_valid(i) && p > max_gto_p {
+                        max_gto_p = p;
+                        best_gto_idx = i;
                     }
                 }
+
+                // Lọc các action có tần suất GTO đáng tin cậy:
+                // - Phải đạt tần suất GTO tối thiểu >= 8% (loại bỏ hoàn toàn các cú all-in/bluff rác do nhiễu neural net)
+                // - Và tần suất GTO >= max_gto_p * 0.70 (đảm bảo là nhánh chiến thuật ngang hàng với nhánh chủ đạo)
+                // Trong các ứng viên hợp lệ về GTO này, chọn action có EV (raw_adv) cao nhất!
+                let min_gto_threshold = 0.08f32;
+                let mut candidates = Vec::new();
+                for (i, &ev) in raw_adv.iter().enumerate().take(NUM_ACTIONS) {
+                    if !mask.is_index_valid(i) { continue; }
+                    let p = clean_probs[i];
+                    if p >= min_gto_threshold && p >= max_gto_p * 0.70 {
+                        candidates.push((i, ev, p));
+                    }
+                }
+
+                // Fallback an toàn: nếu không có action nào đạt ngưỡng, lấy action có max_gto_p
+                if candidates.is_empty() {
+                    let ev = raw_adv.get(best_gto_idx).copied().unwrap_or(0.0);
+                    candidates.push((best_gto_idx, ev, max_gto_p));
+                }
+
+                // Chọn ứng viên có EV cao nhất trong danh sách GTO hợp lệ
+                let mut best_i = candidates[0].0;
+                let mut best_ev = candidates[0].1;
+                let mut best_p = candidates[0].2;
+                for &(idx, ev, p) in &candidates[1..] {
+                    if ev > best_ev {
+                        best_i = idx;
+                        best_ev = ev;
+                        best_p = p;
+                    }
+                }
+
                 let best_act = Action::from_index(best_i).unwrap();
-                let note = format!(
-                    "⚡ [THUẦN EV MAX] Nước đi có EV cao nhất từ Blueprint Net: {:?} (EV: {:>+6.2}, GTO: {:.1}%) 🚀",
-                    best_act, best_ev, best_p * 100.0
-                );
+                let note = if best_i == best_gto_idx {
+                    format!(
+                        "⚡ [GTO + EV MAX] Tuyến cược GTO chủ đạo từ Blueprint Net: {:?} (Tần suất GTO: {:.1}%, EV: {:>+6.2}) 🚀",
+                        best_act, best_p * 100.0, best_ev
+                    )
+                } else {
+                    format!(
+                        "⚡ [GTO + EV MAX] Chọn nhánh EV cao hơn trong các tuyến GTO khả thi: {:?} (EV: {:>+6.2}, GTO: {:.1}%) 🚀",
+                        best_act, best_ev, best_p * 100.0
+                    )
+                };
                 (best_i, note)
             }
         }
@@ -1258,44 +1264,6 @@ pub fn run_gto_evaluation(
             (best_ev_idx, note)
         }
     };
-
-    // 🛡️ CHỐT CHẶN BẢO VỆ SINH TỒN VÀO TOP 4 (ICM TOP 4 SURVIVAL GUARD):
-    // Khi giải đấu còn đông người (num_alive > 4 - tức là còn 5-8 người, chưa vào Top 4) và Hero có stack tốt (eff_bb >= 10.0 BB):
-    // Nếu nước đi được chọn là All-In, kiểm tra xem EV của All-In có thực sự vượt trội phương án an toàn
-    // (Check hoặc Fold) ít nhất 0.12 ICM hay không.
-    // Nếu biên lợi nhuận mỏng (< +0.12 ICM), TUYỆT ĐỐI KHÔNG ĐÁNH ĐỔI MẠNG SỐNG GIẢI ĐẤU mà chọn nước đi an toàn!
-    if Action::from_index(chosen_idx) == Some(Action::AllIn) && num_alive > 4 && eff_bb >= 10.0 {
-        let (safe_act, safe_idx) = if to_call == 0 && mask.is_valid(Action::CheckCall) {
-            (Action::CheckCall, Action::CheckCall.to_index())
-        } else if mask.is_valid(Action::Fold) {
-            (Action::Fold, Action::Fold.to_index())
-        } else if mask.is_valid(Action::CheckCall) {
-            (Action::CheckCall, Action::CheckCall.to_index())
-        } else {
-            (Action::AllIn, Action::AllIn.to_index())
-        };
-
-        if safe_act != Action::AllIn {
-            let (ev_allin, ev_safe) = if let Some(ref res) = solver_result_opt {
-                (res.action_evs[Action::AllIn.to_index()], res.action_evs[safe_idx])
-            } else {
-                (raw_adv[Action::AllIn.to_index()], raw_adv[safe_idx])
-            };
-
-            let edge = ev_allin - ev_safe;
-            if edge < 0.12 {
-                println!(
-                    "🛡️  [ICM TOP 4 SURVIVAL GUARD] Bàn còn {} người (>4). Biên EV All-In ({:+.2}) so với {} ({:+.2}) quá mỏng ({:+.2} < +0.12 ICM) -> Chuyển sang {} để bảo toàn mạng sống vào Top 4! 🏆",
-                    num_alive, ev_allin, safe_act.name(), ev_safe, edge, safe_act.name()
-                );
-                chosen_idx = safe_idx;
-                decision_note = format!(
-                    "🛡️ [TOP 4 SURVIVAL GUARD] Chọn {} thay vì All-In mạo hiểm ({:+.2} vs {:+.2})",
-                    safe_act.name(), ev_safe, ev_allin
-                );
-            }
-        }
-    }
 
     let get_action_desc = |act: Action| -> String {
         match act {

@@ -598,8 +598,20 @@ pub fn process_game_update(
         for (pid, sval) in pgs_obj {
             let entry = state.players.entry(pid.clone()).or_insert_with(|| PlayerTracker { id: pid.clone(), ..Default::default() });
             if let Some(st) = sval.as_str() {
-                if st == "fold" { entry.is_folded = true; } 
-                else if st == "allIn" { entry.is_all_in = true; }
+                if st == "fold" || st == "quit" || st == "stoodUp" {
+                    entry.is_folded = true;
+                } else if st == "allIn" {
+                    entry.is_folded = false;
+                    if !entry.is_all_in {
+                        entry.is_all_in = true;
+                        if pid != &state.hero_id {
+                            state.has_evaluated_this_decision = false;
+                        }
+                    }
+                } else if st == "inHand" {
+                    // Mở khóa lại is_folded khi người chơi đang trong ván
+                    entry.is_folded = false;
+                }
             }
         }
     }
@@ -611,6 +623,10 @@ pub fn process_game_update(
             let prev_bet = entry.current_bet;
             if let Some(amt) = bval.as_u64() {
                 let new_bet = amt as u32;
+                // Nếu có tiền cược trong ván -> chắc chắn chưa fold
+                if new_bet > 0 {
+                    entry.is_folded = false;
+                }
                 if new_bet > prev_bet {
                     let delta = new_bet - prev_bet;
                     entry.total_contributed += delta;
@@ -644,7 +660,10 @@ pub fn process_game_update(
                     state.highest_bet = new_bet;
                 }
             } else if bval.as_str() == Some("<D>") {
-                entry.current_bet = 0;
+                // Chỉ xóa current_bet nếu người chơi KHÔNG phải đang All-In
+                if !entry.is_all_in {
+                    entry.current_bet = 0;
+                }
             }
         }
     }
@@ -654,7 +673,8 @@ pub fn process_game_update(
         let active_set: std::collections::HashSet<String> = ihpi.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
         if !active_set.is_empty() {
             for (pid, p) in state.players.iter_mut() {
-                if !active_set.contains(pid) { p.is_folded = true; }
+                // Đồng bộ 2 chiều: ai trong iHPI là chưa fold, vắng mặt là đã fold
+                p.is_folded = !active_set.contains(pid);
             }
         }
     }
@@ -719,6 +739,9 @@ pub fn process_game_update(
         }
 
         if !state.hero_id.is_empty() && actor == state.hero_id {
+            if let Some(hero_p) = state.players.get_mut(&state.hero_id) {
+                hero_p.is_folded = false;
+            }
             if !state.has_evaluated_this_decision {
                 if let Some(hole) = state.hero_cards {
                     let action = run_gto_evaluation(state, hole, policy, mode, use_os_enigo);
@@ -826,9 +849,7 @@ pub fn run_gto_evaluation(
         env_players.push(ps);
     }
 
-    let in_hand_count = active_seats.iter().filter(|pid| {
-        state.players.get(*pid).is_some_and(|pl| !pl.is_folded)
-    }).count();
+    let in_hand_count = env_players.iter().filter(|pl| !pl.is_folded).count();
 
     // Xác định Button Index với cơ chế fallback nếu dealer_id chưa tới
     let button_idx = if let Some(ref did) = state.dealer_id { 
@@ -896,56 +917,6 @@ pub fn run_gto_evaluation(
 
     // NẠP VECTO ĐẶC TRƯNG VÀ TÍNH TOÁN BẰNG MẠNG NƠ-RON
     let features = env.state.encode_features(hero_seat);
-
-    // 🛡️ CHỐT CHẶN CHỐNG ALL-IN BÀI RÁC Ở PREFLOP (ANTI-TRASH SHOVE GUARD):
-    // Nếu đang ở Preflop và bài tẩy quá yếu, khóa cứng nút All-In để bot tuyệt đối không bao giờ đẩy All-in bài rác!
-    let chen_strength = features[166]; // F_HAND_STRENGTH (0..1)
-    let eff_stack_bb = env.state.effective_stack_bb(hero_seat);
-    if state.street == Street::Preflop {
-        // Dưới 8 BB thì bài rác < 0.20 mới khóa, còn từ 8 BB trở lên nếu Chen < 0.28 (như 3-6, 4-7, 2-8) thì cấm All-In!
-        let min_shove_chen = if eff_stack_bb < 8.0 { 0.20 } else if eff_stack_bb < 15.0 { 0.26 } else { 0.32 };
-        if chen_strength < min_shove_chen && mask.is_valid(Action::AllIn) {
-            // Đảm bảo vẫn còn ít nhất Fold hoặc CheckCall hợp lệ trước khi khóa AllIn
-            if mask.is_valid(Action::Fold) || mask.is_valid(Action::CheckCall) {
-                println!(
-                    "🛡️  [ANTI-TRASH SHOVE] Bài tẩy {:?} quá yếu (Chen: {:.2} < {:.2} ở {:.1} BB) -> Khóa nút All-In!",
-                    hole, chen_strength, min_shove_chen, eff_stack_bb
-                );
-                mask.0 &= !(1 << Action::AllIn.to_index());
-            }
-        }
-    } else {
-        // 🛡️ CHỐT CHẶN BẢO VỆ POSTFLOP (FLOP / TURN / RIVER):
-        // 1. Nếu đối thủ Bet/Raise (to_call > 0) và Hero chỉ có High Card (pure air: cat < 0.15)
-        //    và KHÔNG có Flush Draw (d[0] < 0.5) cũng KHÔNG có Straight Draw (d[1] < 0.5):
-        //    Khóa toàn bộ BetSmall, BetPot33, BetPot75, AllIn! Không được bluff-raise tự sát với bài rác!
-        let hand_cat = features[165];
-        let has_flush_draw = features[170] >= 0.5;
-        let has_straight_draw = features[171] >= 0.5;
-        let is_pure_air = hand_cat < 0.15 && !has_flush_draw && !has_straight_draw;
-
-        if to_call > 0 && is_pure_air {
-            if mask.is_valid(Action::Fold) || mask.is_valid(Action::CheckCall) {
-                println!(
-                    "🛡️  [POSTFLOP ANTI-SUICIDE] Bài tẩy {:?} không có đôi / không có draw (Air) khi đối thủ bet -> Khóa toàn bộ Tố / All-In!",
-                    hole
-                );
-                mask.0 &= !((1 << Action::BetSmall.to_index())
-                    | (1 << Action::BetPot33.to_index())
-                    | (1 << Action::BetPot75.to_index())
-                    | (1 << Action::AllIn.to_index()));
-            }
-        }
-
-        // 2. Chống bluff bom All-In / Bet 75% trong Pot nhiều người (Multiway >= 3):
-        if in_hand_count >= 3 && is_pure_air {
-            println!(
-                "👥 [MULTIWAY AIR GUARD] Pot đông người ({} người) với bài rác -> Khóa BetPot75 & All-In!",
-                in_hand_count
-            );
-            mask.0 &= !((1 << Action::BetPot75.to_index()) | (1 << Action::AllIn.to_index()));
-        }
-    }
 
     let mut probs = policy.get_action_probs(&features, &mask);
     let raw_adv = policy.advantage_net.read().unwrap().forward(&features);
@@ -1115,7 +1086,7 @@ pub fn run_gto_evaluation(
             for (i, &ev) in raw_adv.iter().enumerate().take(NUM_ACTIONS) {
                 if !mask.is_index_valid(i) { continue; }
                 let p = clean_probs[i];
-                if p >= min_gto_threshold && p >= max_gto_p * 0.30 {
+                if p >= min_gto_threshold && p >= max_gto_p * 0.70 {
                     candidates.push((i, ev, p));
                 }
             }
@@ -1572,7 +1543,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_postflop_anti_suicide_guard_blocks_air_raise() {
+    fn test_evaluation_produces_action() {
         let adv_mlp = MLP::load_from_file(ADV_MODEL_PATH).expect("Cannot load model");
         let strat_mlp = MLP::load_from_file(STRAT_MODEL_PATH).ok();
         let policy = DeepCFRPolicy::with_strategy(Arc::new(RwLock::new(adv_mlp)), strat_mlp, true);
@@ -1609,15 +1580,10 @@ mod tests {
         state.players.insert(opp.id.clone(), opp);
         state.seats_order = vec!["hero1".to_string(), "opp1".to_string()];
 
-        // Hero holds pure trash: 7c 2s on A-K-J board (High Card, no draws, facing a bet of 60)
         let hole = [robust_parse_card("7c").unwrap(), robust_parse_card("2s").unwrap()];
 
         let action = run_gto_evaluation(&state, hole, &policy, DecisionMode::PureMaxEv, false);
-        assert!(action.is_some(), "Should produce an action");
-        let act = action.unwrap();
-        println!("Action produced for pure air facing bet: {:?}", act);
-        // It must NOT raise or all-in with pure air facing a bet!
-        assert!(act.action == "fold" || act.action == "call", "Hero must Fold or Call, never Raise/All-In with pure air! Got: {}", act.action);
+        assert!(action.is_some(), "Should produce a valid decision from the neural policy");
     }
 }
 

@@ -2,3 +2,5 @@ target/
 *.log
 pokernow_packets.json
 checkpoints/
+.repo-to-text-settings.yaml
+repo-to-text*
