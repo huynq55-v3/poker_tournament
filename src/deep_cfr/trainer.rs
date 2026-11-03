@@ -14,6 +14,7 @@ use crate::sampler::TournamentStackSampler;
 use crate::self_play::Policy;
 use rand::distributions::WeightedIndex;
 use rand::prelude::Distribution;
+use rand::seq::SliceRandom;
 use rand::Rng;
 use rayon::prelude::*;
 use std::sync::{Arc, RwLock};
@@ -119,7 +120,39 @@ struct Ctx<'a> {
     adv_out: Vec<AdvantageSample>,
     strat_out: Vec<StrategySample>,
     weight: f32,
-    sparring_tag: bool, // 🟢 Cờ kích hoạt Quân xanh TAG trên bàn đấu tập
+    sparring_tag: bool, // 🟢 Cờ kích hoạt Quân xanh trên bàn đấu tập
+    bot_assignments: [usize; 8], // 🟢 Trường phái của từng ghế (bốc ngẫu nhiên linh hoạt)
+}
+
+/// Bốc ngẫu nhiên trường phái bot cho từng ghế:
+/// - 50% Hoán vị ngẫu nhiên (Shuffle) 8 trường phái khác nhau cho 8 ghế (không ai trùng ai, xóa bỏ hoàn toàn correlation vị trí ghế)
+/// - 50% Bốc độc lập ngẫu nhiên (Independent) từng ghế từ 0..8 (mô phỏng bàn đa dạng: nhiều Fish, nhiều LAG hoặc nhiều Nit)
+fn sample_bot_assignments<R: Rng>(rng: &mut R) -> [usize; 8] {
+    let mut assignments = [0usize; 8];
+    if rng.gen_bool(0.50) {
+        let mut pool = [0, 1, 2, 3, 4, 5, 6, 7];
+        pool.shuffle(rng);
+        assignments = pool;
+    } else {
+        for a in &mut assignments {
+            *a = rng.gen_range(0..8);
+        }
+    }
+    assignments
+}
+
+/// Chọn hành động theo 1 trong 8 trường phái baseline
+fn select_sparring_action(bot_kind: usize, features: &[f32], mask: &ActionMask) -> Action {
+    match bot_kind {
+        0 => TightAggressive.select_action(features, mask),
+        1 => LagShark.select_action(features, mask),
+        2 => NashPushBot.select_action(features, mask),
+        3 => IcmSniper.select_action(features, mask),
+        4 => NitTrap.select_action(features, mask),
+        5 => StickyFish.select_action(features, mask),
+        6 => ThreeBetAggro.select_action(features, mask),
+        _ => BountyHunter.select_action(features, mask),
+    }
 }
 
 fn sample_action<R: Rng>(probs: &[f32; NUM_ACTIONS], mask: &ActionMask, rng: &mut R) -> Action {
@@ -199,20 +232,10 @@ fn traverse<R: Rng>(env: &mut Environment, ctx: &mut Ctx, pay: &Payoff, rng: &mu
         expected
     } else {
         // 🟢 TRƯỜNG HỢP 1: Bàn có Quân Xanh: Toàn bộ đối thủ (curr != traverser)
-        // đều sử dụng 1 trong 8 trường phái chuẩn mực (TAG, LagShark, NashPushBot, IcmSniper, NitTrap, StickyFish, ThreeBetAggro, BountyHunter)
-        // cố định theo số ghế (curr % 8) để bắt chết các hành vi Shove láo, không bỏ sót ghế nào!
+        // sử dụng 1 trong 8 trường phái baseline theo phân bổ ngẫu nhiên động của bàn (ctx.bot_assignments)
         if ctx.sparring_tag {
-            let bot_kind = curr % 8;
-            let a = match bot_kind {
-                0 => TightAggressive.select_action(&features, &mask),
-                1 => LagShark.select_action(&features, &mask),
-                2 => NashPushBot.select_action(&features, &mask),
-                3 => IcmSniper.select_action(&features, &mask),
-                4 => NitTrap.select_action(&features, &mask),
-                5 => StickyFish.select_action(&features, &mask),
-                6 => ThreeBetAggro.select_action(&features, &mask),
-                _ => BountyHunter.select_action(&features, &mask),
-            };
+            let bot_kind = ctx.bot_assignments[curr % 8];
+            let a = select_sparring_action(bot_kind, &features, &mask);
             return step_and_continue(env, a, ctx, pay, rng, depth);
         }
 
@@ -378,13 +401,14 @@ impl DeepCFRTrainer {
                     let mut env = Environment::new(n, &stacks, bb_size, sb_size, button);
                     env.state.is_cash_game = false;
 
-                    let sparring_enabled = false; // Thuần 100% Self-Play Deep CFR (Không dùng Quân Xanh)
+                    let sparring_enabled = trng.gen_bool(0.50); // 🟢 50% thời gian đấu tập với Quân Xanh, 50% Self-Play
                     let mut ctx = Ctx {
                         net: &snapshot,
                         adv_out: Vec::new(),
                         strat_out: Vec::new(),
                         weight: iter_weight,
-                        sparring_tag: false,
+                        sparring_tag: sparring_enabled,
+                        bot_assignments: sample_bot_assignments(&mut trng),
                     };
 
                     let mut hand_idx = 0;
@@ -392,6 +416,11 @@ impl DeepCFRTrainer {
                         let alive: Vec<usize> = (0..n).filter(|&i| env.state.players[i].stack > 0).collect();
                         if alive.len() <= 1 {
                             break;
+                        }
+
+                        // Đảo ngẫu nhiên trường phái đối thủ mỗi ván để xóa bỏ hoàn toàn correlation vị trí ghế
+                        if sparring_enabled {
+                            ctx.bot_assignments = sample_bot_assignments(&mut trng);
                         }
 
                         // Tăng Blind Level định kỳ theo tiến trình giải đấu
@@ -430,17 +459,8 @@ impl DeepCFRTrainer {
                                 }
                                 let feats = env.state.encode_features(cur);
                                 let action = if sparring_enabled && (cur != traverser) {
-                                    let bot_kind = cur % 8;
-                                    match bot_kind {
-                                        0 => TightAggressive.select_action(&feats, &mask),
-                                        1 => LagShark.select_action(&feats, &mask),
-                                        2 => NashPushBot.select_action(&feats, &mask),
-                                        3 => IcmSniper.select_action(&feats, &mask),
-                                        4 => NitTrap.select_action(&feats, &mask),
-                                        5 => StickyFish.select_action(&feats, &mask),
-                                        6 => ThreeBetAggro.select_action(&feats, &mask),
-                                        _ => BountyHunter.select_action(&feats, &mask),
-                                    }
+                                    let bot_kind = ctx.bot_assignments[cur % 8];
+                                    select_sparring_action(bot_kind, &feats, &mask)
                                 } else {
                                     let raw = snapshot.forward(&feats);
                                     let probs = DeepCFRPolicy::compute_regret_matching_probs(&raw, &mask);
@@ -530,12 +550,14 @@ impl DeepCFRTrainer {
                     };
                     let start: Vec<f32> = stacks.iter().map(|&s| s as f32).collect();
 
+                    let sparring_enabled = trng.gen_bool(0.50); // 🟢 50% thời gian đấu tập với Quân Xanh cho Multi-Depth Booster
                     let mut ctx = Ctx {
                         net: &snapshot,
                         adv_out: Vec::new(),
                         strat_out: Vec::new(),
                         weight: iter_weight,
-                        sparring_tag: false, // Thuần 100% Self-Play Deep CFR
+                        sparring_tag: sparring_enabled,
+                        bot_assignments: sample_bot_assignments(&mut trng),
                     };
 
                     for t in 0..n {
@@ -594,12 +616,14 @@ impl DeepCFRTrainer {
                     };
                     let start: Vec<f32> = stacks.iter().map(|&s| s as f32).collect();
 
+                    let sparring_enabled = trng.gen_bool(0.50); // 🟢 50% thời gian đấu tập với Quân Xanh
                     let mut ctx = Ctx {
                         net: &snapshot,
                         adv_out: Vec::new(),
                         strat_out: Vec::new(),
                         weight: iter_weight,
-                        sparring_tag: false,
+                        sparring_tag: sparring_enabled,
+                        bot_assignments: sample_bot_assignments(&mut trng),
                     };
                     for t in 0..n {
                         let mut env = Environment::new(n, &stacks, bb_size, sb_size, button);
