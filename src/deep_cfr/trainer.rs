@@ -14,7 +14,6 @@ use crate::sampler::TournamentStackSampler;
 use crate::self_play::Policy;
 use rand::distributions::WeightedIndex;
 use rand::prelude::Distribution;
-use rand::seq::SliceRandom;
 use rand::Rng;
 use rayon::prelude::*;
 use std::sync::{Arc, RwLock};
@@ -121,22 +120,14 @@ struct Ctx<'a> {
     strat_out: Vec<StrategySample>,
     weight: f32,
     sparring_tag: bool, // 🟢 Cờ kích hoạt Quân xanh trên bàn đấu tập
-    bot_assignments: [usize; 8], // 🟢 Trường phái của từng ghế (bốc ngẫu nhiên linh hoạt)
+    bot_assignments: [usize; 10], // 🟢 Trường phái của từng ghế (bốc ngẫu nhiên linh hoạt, bàn tối đa 10 ghế)
 }
 
-/// Bốc ngẫu nhiên trường phái bot cho từng ghế:
-/// - 50% Hoán vị ngẫu nhiên (Shuffle) 8 trường phái khác nhau cho 8 ghế (không ai trùng ai, xóa bỏ hoàn toàn correlation vị trí ghế)
-/// - 50% Bốc độc lập ngẫu nhiên (Independent) từng ghế từ 0..8 (mô phỏng bàn đa dạng: nhiều Fish, nhiều LAG hoặc nhiều Nit)
-fn sample_bot_assignments<R: Rng>(rng: &mut R) -> [usize; 8] {
-    let mut assignments = [0usize; 8];
-    if rng.gen_bool(0.50) {
-        let mut pool = [0, 1, 2, 3, 4, 5, 6, 7];
-        pool.shuffle(rng);
-        assignments = pool;
-    } else {
-        for a in &mut assignments {
-            *a = rng.gen_range(0..8);
-        }
+/// Bốc ngẫu nhiên trường phái bot cho từng ghế (tối đa 10 ghế):
+fn sample_bot_assignments<R: Rng>(rng: &mut R) -> [usize; 10] {
+    let mut assignments = [0usize; 10];
+    for a in &mut assignments {
+        *a = rng.gen_range(0..8);
     }
     assignments
 }
@@ -234,7 +225,7 @@ fn traverse<R: Rng>(env: &mut Environment, ctx: &mut Ctx, pay: &Payoff, rng: &mu
         // 🟢 TRƯỜNG HỢP 1: Bàn có Quân Xanh: Toàn bộ đối thủ (curr != traverser)
         // sử dụng 1 trong 8 trường phái baseline theo phân bổ ngẫu nhiên động của bàn (ctx.bot_assignments)
         if ctx.sparring_tag {
-            let bot_kind = ctx.bot_assignments[curr % 8];
+            let bot_kind = ctx.bot_assignments[curr % 10];
             let a = select_sparring_action(bot_kind, &features, &mask);
             return step_and_continue(env, a, ctx, pay, rng, depth);
         }
@@ -397,7 +388,7 @@ impl DeepCFRTrainer {
                 .into_par_iter()
                 .map(|_| {
                     let mut trng = rand::thread_rng();
-                    let n = fixed.unwrap_or(max_p).clamp(2, 8);
+                    let n = fixed.unwrap_or(max_p).clamp(2, 10);
                     let stacks = vec![initial_bb * bb_size; n];
                     let mut button = trng.gen_range(0..n);
 
@@ -462,7 +453,7 @@ impl DeepCFRTrainer {
                                 }
                                 let feats = env.state.encode_features(cur);
                                 let action = if sparring_enabled && (cur != traverser) {
-                                    let bot_kind = ctx.bot_assignments[cur % 8];
+                                    let bot_kind = ctx.bot_assignments[cur % 10];
                                     select_sparring_action(bot_kind, &feats, &mask)
                                 } else {
                                     let raw = snapshot.forward(&feats);
@@ -603,7 +594,7 @@ impl DeepCFRTrainer {
                             if trng.gen_bool(0.35) {
                                 2
                             } else if trng.gen_bool(0.45) {
-                                trng.gen_range(7..=8)
+                                trng.gen_range(7..=max_p.min(10))
                             } else {
                                 trng.gen_range(3..=6)
                             }

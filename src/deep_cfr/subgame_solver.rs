@@ -997,7 +997,7 @@ mod tests {
             MLP::load_from_file("deep_cfr_model.json"),
             MLP::load_from_file("deep_cfr_strategy.json"),
         ) {
-            if adv.input_dim() <= crate::environment::FEATURE_DIM {
+            if adv.input_dim() == crate::environment::FEATURE_DIM {
                 (adv, Some(strat))
             } else {
                 (MLP::new(&[crate::environment::FEATURE_DIM, 64, NUM_ACTIONS]), None)
@@ -1052,7 +1052,7 @@ mod tests {
             MLP::load_from_file("deep_cfr_model.json"),
             MLP::load_from_file("deep_cfr_strategy.json"),
         ) {
-            if adv.input_dim() <= crate::environment::FEATURE_DIM {
+            if adv.input_dim() == crate::environment::FEATURE_DIM {
                 (adv, Some(strat))
             } else {
                 (MLP::new(&[crate::environment::FEATURE_DIM, 64, NUM_ACTIONS]), None)

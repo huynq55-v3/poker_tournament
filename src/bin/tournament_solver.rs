@@ -15,7 +15,7 @@ use std::{thread, time::Duration};
 
 use enigo::{Enigo, Key, Keyboard, Settings};
 
-const ADV_MODEL_PATH: &str = "deep_cfr_model_old.json";
+const ADV_MODEL_PATH: &str = "deep_cfr_model.json";
 const STRAT_MODEL_PATH: &str = "deep_cfr_strategy_old.json";
 
 // =========================================================================
@@ -1622,8 +1622,13 @@ mod tests {
 
     #[test]
     fn test_postflop_anti_suicide_guard_blocks_air_raise() {
-        let adv_mlp = MLP::load_from_file(ADV_MODEL_PATH).expect("Cannot load model");
-        let strat_mlp = MLP::load_from_file(STRAT_MODEL_PATH).ok();
+        let adv_mlp = MLP::load_from_file(ADV_MODEL_PATH)
+            .ok()
+            .filter(|m| m.input_dim() == poker_tournament::environment::FEATURE_DIM)
+            .unwrap_or_else(|| MLP::new(&[poker_tournament::environment::FEATURE_DIM, 64, NUM_ACTIONS]));
+        let strat_mlp = MLP::load_from_file(STRAT_MODEL_PATH)
+            .ok()
+            .filter(|m| m.input_dim() == poker_tournament::environment::FEATURE_DIM);
         let policy = DeepCFRPolicy::with_strategy(Arc::new(RwLock::new(adv_mlp)), strat_mlp, true);
 
         let mut state = HandState::new();
@@ -1672,8 +1677,13 @@ mod tests {
 
     #[test]
     fn test_subgame_solver_triggered_on_overbet() {
-        let adv_mlp = MLP::load_from_file(ADV_MODEL_PATH).expect("Cannot load model");
-        let strat_mlp = MLP::load_from_file(STRAT_MODEL_PATH).ok();
+        let adv_mlp = MLP::load_from_file(ADV_MODEL_PATH)
+            .ok()
+            .filter(|m| m.input_dim() == poker_tournament::environment::FEATURE_DIM)
+            .unwrap_or_else(|| MLP::new(&[poker_tournament::environment::FEATURE_DIM, 64, NUM_ACTIONS]));
+        let strat_mlp = MLP::load_from_file(STRAT_MODEL_PATH)
+            .ok()
+            .filter(|m| m.input_dim() == poker_tournament::environment::FEATURE_DIM);
         let policy = DeepCFRPolicy::with_strategy(Arc::new(RwLock::new(adv_mlp)), strat_mlp, true);
 
         let mut state = HandState::new();

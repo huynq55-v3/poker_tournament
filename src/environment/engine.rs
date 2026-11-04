@@ -20,7 +20,7 @@ pub struct Environment {
 
 impl Environment {
     pub fn new(num_players: usize, initial_stacks: &[u32], bb_size: u32, sb_size: u32, button_idx: usize) -> Self {
-        assert!(num_players >= 2 && num_players <= 8);
+        assert!(num_players >= 2 && num_players <= 10);
         assert_eq!(initial_stacks.len(), num_players);
 
         let players: Vec<PlayerState> = initial_stacks

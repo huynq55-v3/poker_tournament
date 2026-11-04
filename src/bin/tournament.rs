@@ -1544,8 +1544,13 @@ mod tests {
 
     #[test]
     fn test_evaluation_produces_action() {
-        let adv_mlp = MLP::load_from_file(ADV_MODEL_PATH).expect("Cannot load model");
-        let strat_mlp = MLP::load_from_file(STRAT_MODEL_PATH).ok();
+        let adv_mlp = MLP::load_from_file(ADV_MODEL_PATH)
+            .ok()
+            .filter(|m| m.input_dim() == poker_tournament::environment::FEATURE_DIM)
+            .unwrap_or_else(|| MLP::new(&[poker_tournament::environment::FEATURE_DIM, 64, NUM_ACTIONS]));
+        let strat_mlp = MLP::load_from_file(STRAT_MODEL_PATH)
+            .ok()
+            .filter(|m| m.input_dim() == poker_tournament::environment::FEATURE_DIM);
         let policy = DeepCFRPolicy::with_strategy(Arc::new(RwLock::new(adv_mlp)), strat_mlp, true);
 
         let mut state = HandState::new();

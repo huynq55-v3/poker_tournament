@@ -10,8 +10,10 @@ pub const SNG_PAYOUTS_5MAX: [f32; 5] = [0.48, 0.20, 0.0, -0.20, -0.48];
 pub const SNG_PAYOUTS_6MAX: [f32; 6] = [0.48, 0.24, 0.12, -0.12, -0.24, -0.48];
 pub const SNG_PAYOUTS_7MAX: [f32; 7] = [0.48, 0.24, 0.14, 0.0, -0.14, -0.24, -0.48];
 pub const SNG_PAYOUTS_8MAX: [f32; 8] = [0.48, 0.24, 0.16, 0.12, -0.12, -0.16, -0.24, -0.48];
+pub const SNG_PAYOUTS_9MAX: [f32; 9] = [0.48, 0.26, 0.18, 0.12, 0.0, -0.12, -0.18, -0.26, -0.48];
+pub const SNG_PAYOUTS_10MAX: [f32; 10] = [0.48, 0.26, 0.18, 0.12, 0.06, -0.06, -0.12, -0.18, -0.26, -0.48];
 
-/// Lấy mảng payout Zero-Sum chuẩn hóa cho bàn `n` người (n <= 8).
+/// Lấy mảng payout Zero-Sum chuẩn hóa cho bàn `n` người (n <= 10).
 /// Zero allocation: Trả về slice tĩnh không cấp phát heap.
 #[inline]
 pub fn get_sng_payouts(n: usize) -> &'static [f32] {
@@ -23,7 +25,9 @@ pub fn get_sng_payouts(n: usize) -> &'static [f32] {
         5 => &SNG_PAYOUTS_5MAX,
         6 => &SNG_PAYOUTS_6MAX,
         7 => &SNG_PAYOUTS_7MAX,
-        _ => &SNG_PAYOUTS_8MAX,
+        8 => &SNG_PAYOUTS_8MAX,
+        9 => &SNG_PAYOUTS_9MAX,
+        _ => &SNG_PAYOUTS_10MAX,
     }
 }
 
@@ -106,14 +110,14 @@ fn calculate_icm_all_alive(stacks: &[f32], payouts: &[f32]) -> Vec<f32> {
     let max_mask = 1 << n;
     let mut ev = vec![0.0f32; n];
 
-    // 🚀 ZERO-ALLOCATION FAST PATH: Với giải đấu SNG 8-max (n <= 8),
-    // max_mask tối đa 256, toàn bộ mảng DP và sum_remaining được đặt trên Stack (1 KB bộ nhớ),
+    // 🚀 ZERO-ALLOCATION FAST PATH: Với giải đấu SNG lên đến 10-max (n <= 10),
+    // max_mask tối đa 1024, toàn bộ mảng DP và sum_remaining được đặt trên Stack (4 KB bộ nhớ),
     // triệt tiêu hoàn toàn chi phí malloc/free heap trong các luồng Rayon!
-    if n <= 8 {
-        let mut dp = [0.0f32; 256];
+    if n <= 10 {
+        let mut dp = [0.0f32; 1024];
         dp[0] = 1.0;
 
-        let mut sum_remaining = [0.0f32; 256];
+        let mut sum_remaining = [0.0f32; 1024];
         for (mask, slot) in sum_remaining[..max_mask].iter_mut().enumerate() {
             let mut s = 0.0f32;
             for (i, &st) in stacks.iter().enumerate() {

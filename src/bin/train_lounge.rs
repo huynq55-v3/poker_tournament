@@ -42,7 +42,7 @@ fn print_help() {
     println!("Cú pháp: cargo run --release --bin train_lounge -- [TÙY CHỌN]");
     println!();
     println!("Tùy chọn huấn luyện:");
-    println!("  --players <N>         Quy mô bàn tối đa: 2 đến 8 người (mặc định: 8)");
+    println!("  --players <N>         Quy mô bàn tối đa: 2 đến 10 người (mặc định: 10)");
     println!("  --iters <N>           Số iteration (mặc định: 10,000)");
     println!("  --traversals <N>      Số ván duyệt cây mỗi iter (mặc định: 250)");
     println!("  --train-steps <N>     Số bước SGD train mạng mỗi iter (mặc định: 400)");
@@ -70,7 +70,7 @@ fn main() {
         return;
     }
 
-    let max_players: usize = arg(&args, "--players", arg(&args, "--max-players", 8usize)).clamp(2, 8);
+    let max_players: usize = arg(&args, "--players", arg(&args, "--max-players", 10usize)).clamp(2, 10);
     let iters: usize = arg(&args, "--iters", 10_000usize);
     let traversals: usize = arg(&args, "--traversals", 250usize);
     let train_steps: usize = arg(&args, "--train-steps", 400usize);

@@ -77,6 +77,9 @@ fn parse_args() -> (usize, bool, bool, bool) {
         } else if a == "--8max" || a == "-8" || a == "8max" || a == "8-max" {
             max_players = 8;
             custom_players = true;
+        } else if a == "--10max" || a == "-10" || a == "10max" || a == "10-max" {
+            max_players = 10;
+            custom_players = true;
         }
     }
 
@@ -103,7 +106,7 @@ fn parse_args() -> (usize, bool, bool, bool) {
 
     if !custom_players && !positional.is_empty() {
         if let Ok(p) = positional[0].parse::<usize>() {
-            if p == 6 || p == 8 {
+            if p == 6 || p == 8 || p == 10 {
                 max_players = p;
             }
         }
@@ -118,9 +121,9 @@ fn parse_args() -> (usize, bool, bool, bool) {
         }
     }
 
-    if max_players != 6 && max_players != 8 {
-        println!("⚠️  Cảnh báo: Chỉ hỗ trợ bàn 6-max hoặc 8-max. Tự động áp dụng bàn {}-max.", if max_players <= 6 { 6 } else { 8 });
-        max_players = if max_players <= 6 { 6 } else { 8 };
+    if max_players != 6 && max_players != 8 && max_players != 10 {
+        println!("⚠️  Cảnh báo: Chỉ hỗ trợ bàn 6-max, 8-max hoặc 10-max. Tự động áp dụng bàn {}-max.", if max_players <= 6 { 6 } else if max_players <= 8 { 8 } else { 10 });
+        max_players = if max_players <= 6 { 6 } else if max_players <= 8 { 8 } else { 10 };
     }
 
     let fresh = args.iter().any(|a| a == "--fresh" || a == "--new" || a == "--from-scratch");

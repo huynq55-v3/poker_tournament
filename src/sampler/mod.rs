@@ -22,6 +22,7 @@ impl TournamentStackSampler {
         num_players: usize,
         bb_size: u32,
     ) -> Vec<u32> {
+        assert!(num_players >= 2 && num_players <= 10);
         (0..num_players)
             .map(|_| {
                 let roll: f32 = rng.gen();
@@ -48,6 +49,7 @@ impl TournamentStackSampler {
         num_players: usize,
         bb_size: u32,
     ) -> Vec<u32> {
+        assert!(num_players >= 2 && num_players <= 10);
         (0..num_players)
             .map(|_| {
                 let roll: f32 = rng.gen();
@@ -72,7 +74,7 @@ impl TournamentStackSampler {
         num_players: usize,
         bb_size: u32,
     ) -> Vec<u32> {
-        assert!(num_players >= 2 && num_players <= 8);
+        assert!(num_players >= 2 && num_players <= 10);
 
         let alpha: f64 = rng.gen_range(0.5..1.8);
         let gamma = Gamma::new(alpha, 1.0).unwrap();
@@ -116,7 +118,7 @@ impl TournamentStackSampler {
         total_initial_players: usize,
         bb_size: u32,
     ) -> Vec<u32> {
-        let n = num_players.clamp(2, 8);
+        let n = num_players.clamp(2, 10);
         let total_chips = (total_initial_players as f64) * (initial_bb_per_player as f64) * (bb_size as f64);
 
         if n == total_initial_players && rng.gen_bool(0.40) {
@@ -155,7 +157,7 @@ impl TournamentStackSampler {
         num_players: usize,
         bb_size: u32,
     ) -> Vec<u32> {
-        assert!(num_players >= 2 && num_players <= 8);
+        assert!(num_players >= 2 && num_players <= 10);
         let log_normal = LogNormal::new(3.4, 0.75).unwrap();
 
         (0..num_players)

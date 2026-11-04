@@ -5,8 +5,8 @@ use crate::equity;
 use crate::poker_core::evaluator::evaluate_7_cards;
 use std::cell::RefCell;
 
-pub const FEATURE_DIM: usize = 177;
-pub const MAX_PLAYERS: usize = 8;
+pub const FEATURE_DIM: usize = 187;
+pub const MAX_PLAYERS: usize = 10;
 
 const EQUITY_CACHE_SIZE: usize = 512;
 const EQUITY_CACHE_MASK: usize = EQUITY_CACHE_SIZE - 1;
@@ -44,7 +44,9 @@ pub enum Position {
     BB,
     UTG,
     UTG1,
-    MP,
+    UTG2,
+    MP1,
+    MP2,
     HJ,
     CO,
 }
@@ -64,9 +66,11 @@ impl Position {
                 1 => Position::SB,
                 2 => Position::BB,
                 3 => Position::UTG,
-                4 => if num_alive > 5 { Position::UTG1 } else { Position::CO },
-                5 => if num_alive > 6 { Position::MP } else { Position::CO },
-                6 => Position::HJ,
+                4 => if num_alive > 7 { Position::UTG1 } else if num_alive > 5 { Position::MP1 } else { Position::CO },
+                5 => if num_alive > 8 { Position::UTG2 } else if num_alive > 6 { Position::MP2 } else { Position::CO },
+                6 => if num_alive > 7 { Position::MP1 } else { Position::HJ },
+                7 => if num_alive > 8 { Position::MP2 } else { Position::HJ },
+                8 => Position::HJ,
                 _ => Position::CO,
             }
         }
@@ -296,17 +300,17 @@ impl GameState {
         let my_pos = alive.iter().position(|&s| s == player_idx).unwrap_or(0);
         let rel_pos = (my_pos + num_alive - btn_pos) % num_alive;
 
-        let mut pos_vec = [0.0f32; 8];
+        let mut pos_vec = [0.0f32; 10];
         if num_alive == 2 {
             // Heads-Up: BTN (rel_pos == 0) vừa là BTN vừa là SB -> pos_vec[0] = 1.0 (BTN).
-            // Người còn lại (rel_pos == 1) là Big Blind -> pos_vec[2] = 1.0 (BB), tránh nhầm với SB của 8-max.
+            // Người còn lại (rel_pos == 1) là Big Blind -> pos_vec[2] = 1.0 (BB), tránh nhầm với SB của 10-max.
             if rel_pos == 0 {
                 pos_vec[0] = 1.0;
             } else {
                 pos_vec[2] = 1.0;
             }
         } else {
-            pos_vec[rel_pos.min(7)] = 1.0;
+            pos_vec[rel_pos.min(9)] = 1.0;
         }
         f.extend_from_slice(&pos_vec);
         f.push(num_alive as f32 / MAX_PLAYERS as f32);
@@ -365,7 +369,7 @@ impl GameState {
             }
         }
 
-        // 6. 7 đối thủ theo thứ tự xoay tròn (7 * 4 = 28) -> index 131..158
+        // 6. 9 đối thủ theo thứ tự xoay tròn (9 * 4 = 36)
         let mut opp_count = 0;
         let mut step = 1;
         while opp_count < (MAX_PLAYERS - 1) && step < self.num_players {
