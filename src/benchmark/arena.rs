@@ -205,7 +205,7 @@ fn play_arena_cash_hand<R: Rng>(
     let bb = 100u32;
     let sb = 50u32;
     let n = num_players.clamp(2, 8);
-    let stacks = crate::sampler::TournamentStackSampler::sample_cash_game_stacks(rng, n, bb);
+    let stacks = crate::sampler::TournamentStackSampler::sample_lounge_stacks(rng, n, bb);
     let button = rng.gen_range(0..n);
 
     let mut env = Environment::new(n, &stacks, bb, sb, button);

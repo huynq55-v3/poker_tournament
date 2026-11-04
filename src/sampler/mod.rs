@@ -12,6 +12,33 @@ impl TournamentStackSampler {
         vec![d * bb_size; num_players]
     }
 
+    /// Mô phỏng phân phối Stack thực tế bàn Lounge / Real Coin Cash Game (2 đến 8 người):
+    /// - Buy-in min 12 BB, max 100 BB, stack thắng tích lũy sâu tới 300+ BB:
+    ///   • 20% Short-stack buy-in min: 12 - 39 BB
+    ///   • 45% Standard buy-in: 40 - 100 BB
+    ///   • 35% Deep-stack thắng trận tích lũy tiền: 101 - 300 BB (hỗ trợ tới 350 BB)
+    pub fn sample_lounge_stacks<R: Rng>(
+        rng: &mut R,
+        num_players: usize,
+        bb_size: u32,
+    ) -> Vec<u32> {
+        (0..num_players)
+            .map(|_| {
+                let roll: f32 = rng.gen();
+                let bb_val: f32 = if roll < 0.20 {
+                    rng.gen_range(12.0..=39.0)
+                } else if roll < 0.65 {
+                    rng.gen_range(40.0..=100.0)
+                } else {
+                    rng.gen_range(101.0..=300.0)
+                };
+                let chip_unit = (bb_size / 2).max(1);
+                let chips = (bb_val * bb_size as f32).round() as u32;
+                (chips / chip_unit) * chip_unit
+            })
+            .collect()
+    }
+
     /// Mô phỏng phân phối Stack thực tế bàn Cash Game PokerStars 6-Max (Max 100 BB):
     /// - 20% Short/Mid-stack (40 - 70 BB): Người chơi thận trọng / buy-in min
     /// - 50% Standard 100 BB Buy-in (80 - 110 BB): Người chơi mới vào / auto-rebuy

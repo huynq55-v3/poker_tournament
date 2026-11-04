@@ -611,7 +611,7 @@ impl DeepCFRTrainer {
                     });
                     let button = trng.gen_range(0..n);
                     let stacks = if is_cash {
-                        TournamentStackSampler::sample_cash_game_stacks(&mut trng, n, bb_size)
+                        TournamentStackSampler::sample_lounge_stacks(&mut trng, n, bb_size)
                     } else if trng.gen_bool(0.25) {
                         TournamentStackSampler::sample_equal_stacks(&mut trng, n, bb_size)
                     } else {
