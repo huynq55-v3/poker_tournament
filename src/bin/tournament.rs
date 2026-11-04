@@ -17,6 +17,8 @@ use rand::Rng;
 const ADV_MODEL_PATH: &str = "deep_cfr_model.json";
 const STRAT_MODEL_PATH: &str = "deep_cfr_strategy.json";
 
+static IS_CASH_GAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 // =========================================================================
 // 1. DATA STRUCTURES & TYPES
 // =========================================================================
@@ -861,6 +863,7 @@ pub fn run_gto_evaluation(
     };
 
     let mut env = Environment::new(num_players, &initial_stacks, state.bb_size, state.sb_size, button_idx);
+    env.state.is_cash_game = IS_CASH_GAME.load(std::sync::atomic::Ordering::Relaxed);
 
     let true_table_pot = (state.pn_total_pot + sum_current_bets).max(state.bb_size + state.sb_size);
     let safe_min_raise = state.min_raise.max(state.bb_size);
@@ -1403,12 +1406,28 @@ fn main() {
     let mut target_url = default_game.to_string();
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
+    let mut is_lounge = false;
+    let mut custom_model: Option<String> = None;
+    let mut custom_strat: Option<String> = None;
+
     while i < args.len() {
         if (args[i] == "--game-url" || args[i] == "--game-id" || args[i] == "-g") && i + 1 < args.len() {
             target_url = args[i + 1].clone();
             i += 1;
+        } else if args[i] == "--lounge" || args[i] == "--cash" {
+            is_lounge = true;
+        } else if (args[i] == "--model" || args[i] == "--adv") && i + 1 < args.len() {
+            custom_model = Some(args[i + 1].clone());
+            i += 1;
+        } else if (args[i] == "--strategy" || args[i] == "--strat") && i + 1 < args.len() {
+            custom_strat = Some(args[i + 1].clone());
+            i += 1;
         }
         i += 1;
+    }
+    if is_lounge {
+        IS_CASH_GAME.store(true, std::sync::atomic::Ordering::Relaxed);
+        println!("🎰 Chế độ: LOUNGE / REAL CHIP CASH GAME (Chuẩn hóa Deep-Stack 12-300+ BB)");
     }
     set_target_game(&target_url);
     println!("🎮 Target Game URL: {}", target_url);
@@ -1421,11 +1440,24 @@ fn main() {
     let _ = poker_tournament::equity::preflop_table();
     println!("✅ Xong!");
 
-    print!("🧠 Nạp mô hình AI... ");
+    let default_adv = if is_lounge && std::path::Path::new("deep_cfr_lounge_model.json").exists() {
+        "deep_cfr_lounge_model.json"
+    } else {
+        ADV_MODEL_PATH
+    };
+    let default_strat = if is_lounge && std::path::Path::new("deep_cfr_lounge_strategy.json").exists() {
+        "deep_cfr_lounge_strategy.json"
+    } else {
+        STRAT_MODEL_PATH
+    };
+    let adv_path = custom_model.as_deref().unwrap_or(default_adv);
+    let strat_path = custom_strat.as_deref().unwrap_or(default_strat);
+
+    print!("🧠 Nạp mô hình AI từ [{}]... ", adv_path);
     std::io::stdout().flush().unwrap();
-    let adv_mlp = MLP::load_from_file(ADV_MODEL_PATH).expect("Lỗi nạp deep_cfr_model_tour.json");
-    let strat_mlp = MLP::load_from_file(STRAT_MODEL_PATH).ok();
-    println!("✅ Xong! (Strategy Net: {})", if strat_mlp.is_some() { "Có" } else { "Không" });
+    let adv_mlp = MLP::load_from_file(adv_path).unwrap_or_else(|e| panic!("Lỗi nạp model {}: {:?}", adv_path, e));
+    let strat_mlp = MLP::load_from_file(strat_path).ok();
+    println!("✅ Xong! (Strategy Net: {})", if strat_mlp.is_some() { strat_path } else { "Không dùng" });
 
     let policy = DeepCFRPolicy::with_strategy(Arc::new(RwLock::new(adv_mlp)), strat_mlp, true);
     let decision_mode = if std::env::args().any(|a| a == "--roll") {
