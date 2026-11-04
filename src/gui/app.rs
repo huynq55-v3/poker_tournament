@@ -98,7 +98,7 @@ impl PokerGuiApp {
     pub fn new(num_seats: usize) -> Self {
         let _ = crate::equity::preflop_table(); // Build/load trước để không giật ở frame đầu
 
-        let num_seats = num_seats.clamp(2, 8);
+        let num_seats = num_seats.clamp(2, crate::environment::MAX_PLAYERS);
         let schedule = TournamentBlindSchedule::new(num_seats);
         let current_blind = schedule.current_level();
 
@@ -173,7 +173,7 @@ impl PokerGuiApp {
 
     /// Reset và bắt đầu giải đấu hoàn toàn mới
     pub fn start_new_tournament(&mut self, seats: usize) {
-        self.num_seats = seats.clamp(2, 8);
+        self.num_seats = seats.clamp(2, crate::environment::MAX_PLAYERS);
         self.selected_num_seats = self.num_seats;
         self.blind_schedule = TournamentBlindSchedule::new(self.num_seats);
         let current_blind = self.blind_schedule.current_level();

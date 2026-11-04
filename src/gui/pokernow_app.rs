@@ -86,7 +86,7 @@ pub struct PokerNowApp {
 
 impl PokerNowApp {
     pub fn new(num_seats: usize) -> Self {
-        let seats = num_seats.clamp(2, 8);
+        let seats = num_seats.clamp(2, crate::environment::MAX_PLAYERS);
         let schedule = TournamentBlindSchedule::new(seats);
         let bl = schedule.current_level();
 
@@ -163,7 +163,7 @@ impl PokerNowApp {
     }
 
     pub fn start_new_tournament(&mut self, seats: usize) {
-        self.num_seats = seats.clamp(2, 8);
+        self.num_seats = seats.clamp(2, crate::environment::MAX_PLAYERS);
         self.selected_num_seats = self.num_seats;
         self.blind_schedule = TournamentBlindSchedule::new(self.num_seats);
         let current_blind = self.blind_schedule.current_level();

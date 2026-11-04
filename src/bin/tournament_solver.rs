@@ -808,7 +808,14 @@ pub fn run_gto_evaluation(
 
     if active_seats.is_empty() { return None; }
 
-    let num_players = active_seats.len().clamp(2, 8);
+    // Đảm bảo bàn hỗ trợ đầy đủ quy mô từ 2 đến MAX_PLAYERS (10-Max)
+    let num_players = active_seats.len().clamp(2, poker_tournament::environment::MAX_PLAYERS);
+    if let Some(h_pos) = active_seats.iter().position(|id| id == &state.hero_id) {
+        if h_pos >= num_players {
+            active_seats.swap(0, h_pos);
+        }
+    }
+    active_seats.truncate(num_players);
     let hero_seat = active_seats.iter().position(|id| id == &state.hero_id).unwrap_or(0);
 
     let mut actual_highest_bet = state.highest_bet;
@@ -852,6 +859,10 @@ pub fn run_gto_evaluation(
         ps.current_bet = actual_highest_bet;
         ps.total_contributed = actual_highest_bet;
         env_players.push(ps);
+    }
+    if initial_stacks.len() > num_players {
+        initial_stacks.truncate(num_players);
+        env_players.truncate(num_players);
     }
 
     let in_hand_count = env_players.iter().filter(|pl| !pl.is_folded).count();

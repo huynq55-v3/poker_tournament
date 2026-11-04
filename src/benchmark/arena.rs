@@ -56,7 +56,7 @@ fn play_arena_team_hand<R: Rng>(
 ) {
     let bb = 100u32;
     let sb = 50u32;
-    let n = num_players.clamp(2, 8);
+    let n = num_players.clamp(2, crate::environment::MAX_PLAYERS);
     let stacks = vec![stack_bb * bb; n];
     let button = rng.gen_range(0..n);
 
@@ -204,7 +204,7 @@ fn play_arena_cash_hand<R: Rng>(
 ) {
     let bb = 100u32;
     let sb = 50u32;
-    let n = num_players.clamp(2, 8);
+    let n = num_players.clamp(2, crate::environment::MAX_PLAYERS);
     let stacks = crate::sampler::TournamentStackSampler::sample_lounge_stacks(rng, n, bb);
     let button = rng.gen_range(0..n);
 
@@ -294,7 +294,7 @@ fn play_arena_final_table_hand<R: Rng>(
 ) {
     let bb = 100u32;
     let sb = 50u32;
-    let n = num_players.clamp(2, 8);
+    let n = num_players.clamp(2, crate::environment::MAX_PLAYERS);
     let stacks = if rng.gen_bool(0.75) {
         crate::sampler::TournamentStackSampler::sample_dirichlet_stacks(rng, n, bb)
     } else {
@@ -517,7 +517,7 @@ fn play_single_full_tournament<R: Rng>(
     rng: &mut R,
     acc: &mut TournamentAcc,
 ) {
-    let n = num_players.clamp(2, 8);
+    let n = num_players.clamp(2, crate::environment::MAX_PLAYERS);
     let base_bb = 100u32;
     let base_sb = 50u32;
     let stacks = vec![initial_bb * base_bb; n];
@@ -716,7 +716,7 @@ pub fn simulate_demo_tournament<R: Rng>(
     initial_bb: u32,
     rng: &mut R,
 ) -> (usize, usize) {
-    let n = num_players.clamp(2, 8);
+    let n = num_players.clamp(2, crate::environment::MAX_PLAYERS);
     let base_bb = 100u32;
     let base_sb = 50u32;
     let stacks = vec![initial_bb * base_bb; n];
@@ -821,7 +821,7 @@ pub fn simulate_hero_tournament<R: Rng>(
     initial_bb: u32,
     rng: &mut R,
 ) -> (usize, usize) {
-    let n = num_players.clamp(2, 8);
+    let n = num_players.clamp(2, crate::environment::MAX_PLAYERS);
     let base_bb = 100u32;
     let base_sb = 50u32;
     let stacks = vec![initial_bb * base_bb; n];
