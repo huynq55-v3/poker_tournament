@@ -20,7 +20,7 @@ const BENCH_CSV: &str = "benchmark_log.csv";
 
 /// Phân tích tham số dòng lệnh linh hoạt:
 /// - Mặc định: Bàn 8-Max, Tournament ICM, 50 BB khởi điểm, giả lập đến khi hết tour
-fn parse_args() -> (usize, bool, bool) {
+fn parse_args() -> (usize, bool, bool, bool) {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
@@ -28,7 +28,7 @@ fn parse_args() -> (usize, bool, bool) {
         println!("🚀 POKER AI DEEP CFR - TOURNAMENT 8-MAX (50 BB / HẾT TOUR) 🚀");
         println!("============================================================");
         println!("Cú pháp: cargo run --release -- [SỐ_NGƯỜI: 6|8] [CHẾ_ĐỘ: icm|ev]");
-        println!("Hoặc:   cargo run --release -- [--players 6|8] [--icm|--ev]");
+        println!("Hoặc:   cargo run --release -- [--players 6|8] [--icm|--ev] [--sparring]");
         println!();
         println!("Tham số 1: Quy mô bàn");
         println!("  8 hoặc --players 8 hoặc --8max : Bàn 8-Max (Mặc định cho giải đấu)");
@@ -38,16 +38,22 @@ fn parse_args() -> (usize, bool, bool) {
         println!("  icm hoặc --icm                 : Bật Tournament ICM (Sit & Go, Payout Zero-Sum)");
         println!("  ev hoặc --ev hoặc --chip-ev    : Dùng Chip-EV thuần (Cash Game / EV Max)");
         println!();
+        println!("Tham số 3: Huấn luyện đối kháng (Sparring / Quân Xanh)");
+        println!("  --sparring                     : Bật đấu tập với 8 trường phái Quân Xanh (mặc định: TẮT)");
+        println!("  --no-sparring                  : Tắt đấu tập Quân Xanh, 100% Self-Play (mặc định)");
+        println!();
         println!("Độ sâu stack & Cơ chế giải đấu:");
         println!("  🟢 Mỗi người chơi ban đầu có 50 BB (Tổng bàn 8-Max là 400 BB).");
         println!("  🏆 Giả lập giải đấu toàn diện từ 8 người rụng dần đến khi chỉ còn 1 người vô địch (Hết tour).");
         println!();
         println!("Ví dụ thực chiến:");
-        println!("  1. Bàn 8-max Tournament ICM (Khuyên dùng):");
+        println!("  1. Bàn 8-max Tournament ICM (Khuyên dùng, thuần Self-Play):");
         println!("     cargo run --release");
-        println!("  2. Bàn 6-max, dùng Tournament ICM:");
+        println!("  2. Bàn 8-max Tournament ICM, BẬT đấu tập Quân Xanh:");
+        println!("     cargo run --release -- --sparring");
+        println!("  3. Bàn 6-max, dùng Tournament ICM:");
         println!("     cargo run --release -- 6 icm");
-        println!("  3. Bàn 8-max, dùng EV thuần:");
+        println!("  4. Bàn 8-max, dùng EV thuần:");
         println!("     cargo run --release -- 8 ev");
         println!("============================================================");
         std::process::exit(0);
@@ -118,18 +124,21 @@ fn parse_args() -> (usize, bool, bool) {
     }
 
     let fresh = args.iter().any(|a| a == "--fresh" || a == "--new" || a == "--from-scratch");
+    let enable_sparring = args.iter().any(|a| a == "--sparring" || a == "--spar" || a == "--with-sparring");
 
-    (max_players, use_icm, fresh)
+    (max_players, use_icm, fresh, enable_sparring)
 }
 
 fn main() {
-    let (max_players, use_icm, fresh) = parse_args();
+    let (max_players, use_icm, fresh, enable_sparring) = parse_args();
     let initial_bb = 50u32; // 🟢 Mỗi người chơi ban đầu có 50 BB (tổng 400 BB cả giải)
     let mode_desc = if use_icm { "TOURNAMENT ICM (FULL RUN TO WINNER)" } else { "CHIP-EV THUẦN" };
+    let sparring_desc = if enable_sparring { "BẬT (50% Đấu Tập Quân Xanh / 50% Self-Play)" } else { "TẮT (100% Thuần Self-Play)" };
 
     println!("============================================================");
     println!("🚀 POKER AI DEEP CFR ({}-MAX TOURNAMENT / 50 BB KHỞI ĐIỂM) 🚀", max_players);
     println!("⚙️  CẤU HÌNH: Bàn {}-Max | Chế độ: {} | Stack: {} BB/người", max_players, mode_desc, initial_bb);
+    println!("🥊 QUÂN XANH (SPARRING): {}", sparring_desc);
     println!("🏆 MỤC TIÊU: Giả lập giải đấu toàn diện từ {} người rụng dần đến khi hết tour!", max_players);
     println!("============================================================");
 
@@ -152,6 +161,7 @@ fn main() {
     trainer.use_icm = use_icm;           // 🟢 Bật Tournament ICM (Malmuth-Harville)
     trainer.stack_bb = initial_bb;       // 🟢 Mỗi người ban đầu 50 BB (tổng chip toàn giải bảo toàn 400 BB)
     trainer.is_cash_game = false;        // Giải đấu Tournament (No rake)
+    trainer.enable_sparring = enable_sparring; // 🟢 Cờ bật/tắt Quân xanh (Mặc định: TẮT)
     trainer.lr = 0.0005;
 
     let total_iterations = 10_000;       // Chạy liên tục 10,000 iterations

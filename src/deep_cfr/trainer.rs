@@ -283,6 +283,7 @@ pub struct DeepCFRTrainer {
     pub use_icm: bool,
     pub stack_bb: u32,
     pub is_cash_game: bool,
+    pub enable_sparring: bool,
 }
 
 impl DeepCFRTrainer {
@@ -331,6 +332,7 @@ impl DeepCFRTrainer {
             use_icm,
             stack_bb: 100,
             is_cash_game: false,
+            enable_sparring: false,
         }
     }
 
@@ -377,6 +379,7 @@ impl DeepCFRTrainer {
         let stack_depth = self.stack_bb;
         let is_cash = self.is_cash_game;
         let use_icm = self.use_icm;
+        let enable_sparring = self.enable_sparring;
 
         // Lịch trình giảm Learning Rate mượt mà (Smooth Inverse Decay)
         let effective_lr = (self.lr / (1.0 + 0.004 * self.iteration as f32)).max(0.00008);
@@ -401,7 +404,7 @@ impl DeepCFRTrainer {
                     let mut env = Environment::new(n, &stacks, bb_size, sb_size, button);
                     env.state.is_cash_game = false;
 
-                    let sparring_enabled = trng.gen_bool(0.50); // 🟢 50% thời gian đấu tập với Quân Xanh, 50% Self-Play
+                    let sparring_enabled = enable_sparring && trng.gen_bool(0.50); // 🟢 50% thời gian đấu tập với Quân Xanh nếu được bật, 50% Self-Play
                     let mut ctx = Ctx {
                         net: &snapshot,
                         adv_out: Vec::new(),
@@ -550,7 +553,7 @@ impl DeepCFRTrainer {
                     };
                     let start: Vec<f32> = stacks.iter().map(|&s| s as f32).collect();
 
-                    let sparring_enabled = trng.gen_bool(0.50); // 🟢 50% thời gian đấu tập với Quân Xanh cho Multi-Depth Booster
+                    let sparring_enabled = enable_sparring && trng.gen_bool(0.50); // 🟢 50% thời gian đấu tập với Quân Xanh cho Multi-Depth Booster (nếu được bật)
                     let mut ctx = Ctx {
                         net: &snapshot,
                         adv_out: Vec::new(),
@@ -616,7 +619,7 @@ impl DeepCFRTrainer {
                     };
                     let start: Vec<f32> = stacks.iter().map(|&s| s as f32).collect();
 
-                    let sparring_enabled = trng.gen_bool(0.50); // 🟢 50% thời gian đấu tập với Quân Xanh
+                    let sparring_enabled = enable_sparring && trng.gen_bool(0.50); // 🟢 50% thời gian đấu tập với Quân Xanh (nếu được bật)
                     let mut ctx = Ctx {
                         net: &snapshot,
                         adv_out: Vec::new(),

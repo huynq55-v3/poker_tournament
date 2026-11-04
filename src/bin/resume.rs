@@ -107,6 +107,8 @@ fn print_help() {
     println!("  --batch-size <N>      Kích thước batch SGD (mặc định: 512)");
     println!("  --warmup <N>          Số iter khởi động gom mẫu vào buffer trước khi train mạng (mặc định: 5)");
     println!("  --chip-ev / --no-icm  Dùng Chip-EV thuần thay vì Tournament ICM (mặc định: BẬT ICM)");
+    println!("  --sparring            Bật đấu tập với 8 trường phái Quân Xanh (mặc định: TẮT)");
+    println!("  --no-sparring         Tắt đấu tập Quân Xanh, 100% Self-Play (mặc định)");
     println!();
     println!("Tùy chọn Arena & Đánh giá:");
     println!("  --bench-every <N>     Tần suất kiểm tra Đấu trường Arena (mặc định: mỗi 10 iters)");
@@ -162,6 +164,7 @@ fn main() {
     let bench_hands: usize = arg(&args, "--bench-hands", 6000usize);
     let snapshot_every: usize = arg(&args, "--snapshot-every", 100usize);
     let use_icm: bool = !args.iter().any(|a| a == "--no-icm" || a == "--chip-ev");
+    let enable_sparring: bool = args.iter().any(|a| a == "--sparring" || a == "--spar" || a == "--with-sparring");
 
     let depths = [50u32, 25u32, 12u32, 8u32];
 
@@ -196,8 +199,10 @@ fn main() {
     } else {
         "CHIP-EV THUẦN (MAX EV)"
     };
+    let sparring_desc = if enable_sparring { "BẬT (50% Đấu Tập Quân Xanh / 50% Self-Play)" } else { "TẮT (100% Thuần Self-Play)" };
     println!("🔁 RESUME & CONTINUOUS DEEP CFR ({})", mode_desc);
     println!("⚙️  Bàn: {}-Max | Stack khởi điểm: {} BB | Chế độ: {}", max_players, initial_bb, mode_desc);
+    println!("🥊 QUÂN XANH (SPARRING): {}", sparring_desc);
     println!("📂 Checkpoint nguồn: Advantage: {} | Strategy: {}", from_adv, from_strat);
     println!("📍 Điểm xuất phát: Iteration {:05} -> Train thêm {} iters (Tổng: {})", start_iter, iters, start_iter + iters);
     println!("💾 Tiền tố lưu: [{}] (CSV: {})", out, csv_path);
@@ -224,6 +229,7 @@ fn main() {
     trainer.use_icm = use_icm;
     trainer.stack_bb = initial_bb; // Kích hoạt Tournament Multi-Depth Booster (50/25/12/8 BB + 35% Heads-Up)
     trainer.is_cash_game = false;
+    trainer.enable_sparring = enable_sparring; // 🟢 Cờ bật/tắt Quân xanh (Mặc định: TẮT)
     trainer.lr = lr;
     trainer.iteration = start_iter;
 
