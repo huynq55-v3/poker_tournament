@@ -6,7 +6,7 @@
 //! - Lọc chuẩn người chơi đang Sit-out (`away` / `sittingOut` / `stoodUp`) để không làm sai số người & vị trí bàn 10-Max.
 //! - Hỗ trợ `--advice-only` (chỉ in phân tích GTO/EV, không auto click) và tùy chỉnh `--port`, `--delay-min`, `--delay-max`.
 
-use poker_tournament::deep_cfr::DeepCFRPolicy;
+use poker_tournament::deep_cfr::{DeepCFRPolicy, SearchTrigger, SubgameResult, SubgameSolver, SubgameSolverConfig};
 use poker_tournament::environment::state::ActionRecord;
 use poker_tournament::environment::{Action, Environment, FEATURE_DIM, MAX_PLAYERS, NUM_ACTIONS, PlayerState, Street};
 use poker_tournament::neural_network::MLP;
@@ -32,13 +32,16 @@ pub enum DecisionMode {
     PureGtoRoll,   // --roll: 100% GTO Roll nguyên bản
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct LoungePlayConfig {
     pub decision_mode: DecisionMode,
     pub use_os_enigo: bool,
     pub advice_only: bool,
     pub delay_min_ms: u64,
     pub delay_max_ms: u64,
+    pub enable_solver: bool,
+    pub force_search: bool,
+    pub solver_config: SubgameSolverConfig,
 }
 
 impl Default for LoungePlayConfig {
@@ -49,6 +52,9 @@ impl Default for LoungePlayConfig {
             advice_only: false,
             delay_min_ms: 1500,
             delay_max_ms: 3000,
+            enable_solver: true,
+            force_search: false,
+            solver_config: SubgameSolverConfig::lounge_cash_default(),
         }
     }
 }
@@ -982,6 +988,48 @@ pub fn build_lounge_environment(state: &HandState, hole: [Card; 2]) -> Option<Lo
         })
         .collect();
 
+    // Khôi phục street_has_acted để SubgameSolver biết vòng cược đã hành động tới đâu (tránh cho đối thủ hành động thừa)
+    env.street_has_acted = vec![false; num_players];
+    let mut saw_current_street_action = false;
+    for rec in &env.state.action_history {
+        if rec.street == state.street && rec.player_idx < num_players {
+            saw_current_street_action = true;
+            match rec.action {
+                Action::BetSmall | Action::BetPot33 | Action::BetPot75 | Action::AllIn => {
+                    env.street_has_acted.fill(false);
+                    env.street_has_acted[rec.player_idx] = true;
+                }
+                Action::CheckCall | Action::Fold => {
+                    env.street_has_acted[rec.player_idx] = true;
+                }
+            }
+        }
+    }
+    if !saw_current_street_action {
+        if state.street != Street::Preflop && actual_highest_bet == 0 {
+            let mut cursor = (button_idx + 1) % num_players;
+            for _ in 0..num_players {
+                if cursor == hero_seat {
+                    break;
+                }
+                if env.state.players[cursor].is_active() {
+                    env.street_has_acted[cursor] = true;
+                }
+                cursor = (cursor + 1) % num_players;
+            }
+        } else if actual_highest_bet > 0 {
+            let is_preflop_bb_option = state.street == Street::Preflop && actual_highest_bet == state.bb_size;
+            if !is_preflop_bb_option {
+                for (i, pl) in env.state.players.iter().enumerate() {
+                    if i != hero_seat && pl.current_bet == actual_highest_bet {
+                        env.street_has_acted[i] = true;
+                    }
+                }
+            }
+        }
+    }
+    env.street_has_acted[hero_seat] = false;
+
     let hero_bet = state.players.get(&state.hero_id).map(|p| p.current_bet).unwrap_or(0);
     let hero_stack_behind = env.state.players[hero_seat].stack;
     let to_call = actual_highest_bet.saturating_sub(hero_bet);
@@ -1020,6 +1068,47 @@ pub fn build_lounge_environment(state: &HandState, hole: [Card; 2]) -> Option<Lo
     })
 }
 
+fn blueprint_eval(
+    policy: &DeepCFRPolicy,
+    features: &[f32],
+    mask: &poker_tournament::environment::ActionMask,
+) -> ([f32; NUM_ACTIONS], [f32; NUM_ACTIONS], Option<SubgameResult>) {
+    let mut probs = policy.get_action_probs(features, mask);
+    let raw_vec = policy.advantage_net.read().unwrap().forward(features);
+
+    let num_acts = raw_vec.len().min(probs.len());
+    if policy.strategy_net.read().unwrap().is_none() {
+        let mut max_val = f32::NEG_INFINITY;
+        for (a_idx, &adv) in raw_vec.iter().enumerate().take(num_acts) {
+            if mask.is_index_valid(a_idx) && adv > max_val {
+                max_val = adv;
+            }
+        }
+        let mut sum_exp = 0.0f32;
+        let temp = 0.15;
+        for (a_idx, &adv) in raw_vec.iter().enumerate().take(num_acts) {
+            if mask.is_index_valid(a_idx) {
+                let e = ((adv - max_val) / temp).exp();
+                probs[a_idx] = e;
+                sum_exp += e;
+            } else {
+                probs[a_idx] = 0.0;
+            }
+        }
+        if sum_exp > 0.0 {
+            for p in &mut probs {
+                *p /= sum_exp;
+            }
+        }
+    }
+
+    let mut raw_adv = [0.0f32; NUM_ACTIONS];
+    for (i, &v) in raw_vec.iter().enumerate().take(NUM_ACTIONS) {
+        raw_adv[i] = v;
+    }
+    (raw_adv, probs, None)
+}
+
 pub fn run_gto_evaluation(
     state: &HandState,
     hole: [Card; 2],
@@ -1048,34 +1137,29 @@ pub fn run_gto_evaluation(
     }
 
     let features = env.state.encode_features(hero_seat);
-    let mut probs = policy.get_action_probs(&features, &mask);
-    let raw_adv = policy.advantage_net.read().unwrap().forward(&features);
 
-    let num_acts = raw_adv.len().min(probs.len());
-    if policy.strategy_net.read().unwrap().is_none() {
-        let mut max_val = f32::NEG_INFINITY;
-        for (a_idx, &adv) in raw_adv.iter().enumerate().take(num_acts) {
-            if mask.is_index_valid(a_idx) && adv > max_val {
-                max_val = adv;
-            }
+    let mut solver_cfg = cfg.solver_config.clone();
+    solver_cfg.use_icm = false; // Lounge Cash Game luôn giải theo thuần Chip-EV (BB)
+    let solver = SubgameSolver::new(solver_cfg);
+
+    let (raw_adv, probs, solver_result_opt) = if cfg.enable_solver {
+        let trigger = solver.should_trigger_search(env, hero_seat, cfg.force_search);
+        if trigger != SearchTrigger::FastPolicyFallback {
+            let res = solver.resolve(
+                env,
+                hero_seat,
+                &policy.advantage_net.read().unwrap(),
+                policy.strategy_net.read().unwrap().as_ref(),
+                trigger,
+                Some(mask),
+            );
+            (res.action_evs, res.action_probs, Some(res))
+        } else {
+            blueprint_eval(policy, &features, &mask)
         }
-        let mut sum_exp = 0.0f32;
-        let temp = 0.15;
-        for (a_idx, &adv) in raw_adv.iter().enumerate().take(num_acts) {
-            if mask.is_index_valid(a_idx) {
-                let e = ((adv - max_val) / temp).exp();
-                probs[a_idx] = e;
-                sum_exp += e;
-            } else {
-                probs[a_idx] = 0.0;
-            }
-        }
-        if sum_exp > 0.0 {
-            for p in &mut probs {
-                *p /= sum_exp;
-            }
-        }
-    }
+    } else {
+        blueprint_eval(policy, &features, &mask)
+    };
 
     println!("\n============================================================");
     println!("🎰 [LOUNGE CASH - ĐẾN LƯỢT BẠN] - VÒNG: {:?}", state.street);
@@ -1093,6 +1177,21 @@ pub fn run_gto_evaluation(
     let eff_bb = env.state.effective_stack_bb(hero_seat);
     let eff_chips = (eff_bb * state.bb_size as f32).round() as u32;
     println!("⚡ Effective Stack : {} chip ({:.1} BB)", eff_chips, eff_bb);
+
+    if let Some(ref res) = solver_result_opt {
+        println!("\n╔══════════════════════════════════════════════════════════════╗");
+        println!("║ 🔍 [LOUNGE SUBGAME SOLVER ACTIVATED - CHIP-EV (BB)]          ║");
+        println!("╚══════════════════════════════════════════════════════════════╝");
+        println!("🚨 Lý do kích hoạt : {}", res.trigger);
+        println!(
+            "⏱️  Thời gian giải   : {:.2} ms ({} iters, max depth {})",
+            res.duration_ms, res.iterations_run, solver.config.max_depth
+        );
+    } else if cfg.enable_solver {
+        println!("⚡ [FAST POLICY INFERENCE] Tình huống chuẩn Blueprint -> Mạng Nơ-ron phản xạ tức thì");
+    } else {
+        println!("⚡ [BLUEPRINT NET ONLY] Subgame Solver đang tắt (--no-solver)");
+    }
 
     let mut clean_probs = [0.0f32; NUM_ACTIONS];
     let mut sum_clean = 0.0f32;
@@ -1119,60 +1218,84 @@ pub fn run_gto_evaluation(
 
     let (chosen_idx, decision_note) = match cfg.decision_mode {
         DecisionMode::PureMaxEv => {
-            let mut max_gto_p = 0.0f32;
-            let mut best_gto_idx = 0;
-            for (i, &p) in clean_probs.iter().enumerate().take(NUM_ACTIONS) {
-                if mask.is_index_valid(i) && p > max_gto_p {
-                    max_gto_p = p;
-                    best_gto_idx = i;
+            if let Some(ref res) = solver_result_opt {
+                let mut best_i = 0;
+                let mut best_ev = f32::NEG_INFINITY;
+                let mut best_p = -1.0f32;
+                for (i, &ev) in res.action_evs.iter().enumerate().take(NUM_ACTIONS) {
+                    if mask.is_index_valid(i) {
+                        let p = res.action_probs[i];
+                        if ev > best_ev || ((ev - best_ev).abs() < 1e-4 && p > best_p) {
+                            best_ev = ev;
+                            best_p = p;
+                            best_i = i;
+                        }
+                    }
                 }
-            }
-
-            let min_gto_threshold = 0.08f32;
-            let mut candidates = Vec::new();
-            for (i, &ev) in raw_adv.iter().enumerate().take(NUM_ACTIONS) {
-                if !mask.is_index_valid(i) {
-                    continue;
-                }
-                let p = clean_probs[i];
-                if p >= min_gto_threshold && p >= max_gto_p * 0.70 {
-                    candidates.push((i, ev, p));
-                }
-            }
-
-            if candidates.is_empty() {
-                let ev = raw_adv.get(best_gto_idx).copied().unwrap_or(0.0);
-                candidates.push((best_gto_idx, ev, max_gto_p));
-            }
-
-            let mut best_i = candidates[0].0;
-            let mut best_ev = candidates[0].1;
-            let mut best_p = candidates[0].2;
-            for &(idx, ev, p) in &candidates[1..] {
-                if ev > best_ev {
-                    best_i = idx;
-                    best_ev = ev;
-                    best_p = p;
-                }
-            }
-
-            let best_act = Action::from_index(best_i).unwrap();
-            let note = if best_i == best_gto_idx {
-                format!(
-                    "⚡ [GTO + EV MAX] Tuyến cược GTO chủ đạo: {:?} (Tần suất GTO: {:.1}%, EV: {:>+6.2})",
-                    best_act,
-                    best_p * 100.0,
-                    best_ev
-                )
-            } else {
-                format!(
-                    "⚡ [GTO + EV MAX] Chọn nhánh EV cao hơn trong các tuyến GTO khả thi: {:?} (EV: {:>+6.2}, GTO: {:.1}%)",
+                let best_act = Action::from_index(best_i).unwrap();
+                let note = format!(
+                    "⚡ [SOLVER EV MAX] Nhánh EV cao nhất từ Search Tree: {:?} (EV: {:>+6.2} BB, GTO: {:.1}%)",
                     best_act,
                     best_ev,
                     best_p * 100.0
-                )
-            };
-            (best_i, note)
+                );
+                (best_i, note)
+            } else {
+                let mut max_gto_p = 0.0f32;
+                let mut best_gto_idx = 0;
+                for (i, &p) in clean_probs.iter().enumerate().take(NUM_ACTIONS) {
+                    if mask.is_index_valid(i) && p > max_gto_p {
+                        max_gto_p = p;
+                        best_gto_idx = i;
+                    }
+                }
+
+                let min_gto_threshold = 0.08f32;
+                let mut candidates = Vec::new();
+                for (i, &ev) in raw_adv.iter().enumerate().take(NUM_ACTIONS) {
+                    if !mask.is_index_valid(i) {
+                        continue;
+                    }
+                    let p = clean_probs[i];
+                    if p >= min_gto_threshold && p >= max_gto_p * 0.70 {
+                        candidates.push((i, ev, p));
+                    }
+                }
+
+                if candidates.is_empty() {
+                    let ev = raw_adv.get(best_gto_idx).copied().unwrap_or(0.0);
+                    candidates.push((best_gto_idx, ev, max_gto_p));
+                }
+
+                let mut best_i = candidates[0].0;
+                let mut best_ev = candidates[0].1;
+                let mut best_p = candidates[0].2;
+                for &(idx, ev, p) in &candidates[1..] {
+                    if ev > best_ev {
+                        best_i = idx;
+                        best_ev = ev;
+                        best_p = p;
+                    }
+                }
+
+                let best_act = Action::from_index(best_i).unwrap();
+                let note = if best_i == best_gto_idx {
+                    format!(
+                        "⚡ [GTO + EV MAX] Tuyến cược GTO chủ đạo: {:?} (Tần suất GTO: {:.1}%, EV: {:>+6.2})",
+                        best_act,
+                        best_p * 100.0,
+                        best_ev
+                    )
+                } else {
+                    format!(
+                        "⚡ [GTO + EV MAX] Chọn nhánh EV cao hơn trong các tuyến GTO khả thi: {:?} (EV: {:>+6.2}, GTO: {:.1}%)",
+                        best_act,
+                        best_ev,
+                        best_p * 100.0
+                    )
+                };
+                (best_i, note)
+            }
         }
         DecisionMode::PureGtoRoll => {
             let mut rng = rand::thread_rng();
@@ -1205,8 +1328,12 @@ pub fn run_gto_evaluation(
                     best_ev_idx = i;
                 }
             }
-            let delta_general = 0.20;
-            let delta_allin = 0.08;
+            let (delta_general, delta_allin, dominance_gap) = if solver_result_opt.is_some() {
+                let pot_bb = (true_table_pot as f32 / state.bb_size.max(1) as f32).clamp(1.0, 40.0);
+                ((0.05 * pot_bb).max(0.25), (0.02 * pot_bb).max(0.10), (0.08 * pot_bb).max(0.35))
+            } else {
+                (0.20, 0.08, 0.35)
+            };
             let mut safe_candidates = Vec::new();
             let mut second_best_ev = f32::NEG_INFINITY;
 
@@ -1224,7 +1351,7 @@ pub fn run_gto_evaluation(
                 }
             }
 
-            if ev_max - second_best_ev > 0.35 || safe_candidates.len() <= 1 {
+            if ev_max - second_best_ev > dominance_gap || safe_candidates.len() <= 1 {
                 (
                     best_ev_idx,
                     format!("⚡ [ƯU THẾ ÁP ĐẢO] EV {:+.2} -> Chọn 100%", ev_max),
@@ -1284,7 +1411,12 @@ pub fn run_gto_evaluation(
         }
     };
 
-    println!("📊 BẢNG ĐÁNH GIÁ NƯỚC ĐI [LOUNGE CHIP-EV]:");
+    let table_src = if solver_result_opt.is_some() {
+        "LOUNGE CHIP-EV (BB - SOLVER)"
+    } else {
+        "LOUNGE CHIP-EV (BLUEPRINT NET)"
+    };
+    println!("📊 BẢNG ĐÁNH GIÁ NƯỚC ĐI [{}]:", table_src);
     for (i, &p) in probs.iter().enumerate() {
         let act = Action::from_index(i).unwrap();
         let is_valid = mask.is_index_valid(i);
@@ -1433,6 +1565,14 @@ fn print_help() {
     println!("  --strategy <FILE>           File Strategy Net (mặc định: {})", DEFAULT_LOUNGE_STRAT_PATH);
     println!("  --port <PORT>               Cổng HTTP lắng nghe Tampermonkey (mặc định: 3000)");
     println!();
+    println!("Tùy chọn Subgame Solver (Chip-EV Real-Time Search):");
+    println!("  --no-solver | --fast        Tắt Subgame Solver, chỉ dùng Blueprint Net");
+    println!("  --search | --force-search   Ép chạy Subgame Solver ở mọi vòng (kể cả Preflop)");
+    println!("  --depth <N> | --search-depth  Độ sâu tìm kiếm cây con (mặc định: 4, 1..=8)");
+    println!("  --iters <N> | --search-iters  Số vòng lặp MCCFR cục bộ (mặc định: 120, 10..=1000)");
+    println!("  --min-pot <BB>              Ngưỡng Pot BB tự kích hoạt Solver (mặc định: 15.0)");
+    println!("  --no-turn-river-search      Không tự kích hoạt Solver riêng theo vòng Turn/River");
+    println!();
     println!("Tùy chọn hành vi & ra quyết định:");
     println!("  --roll                      Dùng Pure GTO Roll thay vì EV Max");
     println!("  --guarded                   Dùng Guarded Mixing");
@@ -1493,6 +1633,30 @@ fn main() {
                 }
                 i += 1;
             }
+            "--depth" | "--search-depth" if i + 1 < args.len() => {
+                if let Ok(v) = args[i + 1].parse::<usize>() {
+                    cfg.solver_config.max_depth = v.clamp(1, 8);
+                }
+                i += 1;
+            }
+            "--iters" | "--search-iters" if i + 1 < args.len() => {
+                if let Ok(v) = args[i + 1].parse::<usize>() {
+                    cfg.solver_config.iterations = v.clamp(10, 1000);
+                }
+                i += 1;
+            }
+            "--min-pot" if i + 1 < args.len() => {
+                if let Ok(v) = args[i + 1].parse::<f32>() {
+                    cfg.solver_config.min_pot_bb_trigger = v.max(0.0);
+                }
+                i += 1;
+            }
+            "--no-solver" | "--fast" => cfg.enable_solver = false,
+            "--search" | "--force-search" => {
+                cfg.force_search = true;
+                cfg.enable_solver = true;
+            }
+            "--no-turn-river-search" => cfg.solver_config.search_turn_river = false,
             "--roll" => cfg.decision_mode = DecisionMode::PureGtoRoll,
             "--guarded" => cfg.decision_mode = DecisionMode::GuardedMixing,
             "--advice-only" | "--assist" => cfg.advice_only = true,
@@ -1501,6 +1665,7 @@ fn main() {
         }
         i += 1;
     }
+    cfg.solver_config.use_icm = false;
 
     set_target_game(&target_url);
     println!("🎮 Target Game URL: {}", target_url);
@@ -1567,7 +1732,25 @@ fn main() {
     let listener = TcpListener::bind(&bind_addr)
         .unwrap_or_else(|e| panic!("Không thể mở cổng {}: {:?}", bind_addr, e));
     println!("🌐 Lounge Server sẵn sàng tại http://{}", bind_addr);
-    println!("🎯 Chế độ: {:?} | Advice-Only: {} | Delay: {}-{}ms", cfg.decision_mode, cfg.advice_only, cfg.delay_min_ms, cfg.delay_max_ms);
+    let solver_banner = if !cfg.enable_solver {
+        "OFF (Fast Net Only)".to_string()
+    } else if cfg.force_search {
+        format!(
+            "FORCED (Chip-EV, depth={}, iters={})",
+            cfg.solver_config.max_depth, cfg.solver_config.iterations
+        )
+    } else {
+        format!(
+            "ON (Hybrid Chip-EV, depth={}, iters={}, min_pot={:.1} BB)",
+            cfg.solver_config.max_depth,
+            cfg.solver_config.iterations,
+            cfg.solver_config.min_pot_bb_trigger
+        )
+    };
+    println!(
+        "🎯 Chế độ: {:?} | Solver: {} | Advice-Only: {} | Delay: {}-{}ms",
+        cfg.decision_mode, solver_banner, cfg.advice_only, cfg.delay_min_ms, cfg.delay_max_ms
+    );
     println!("👀 Đang chờ gói tin PokerNow Lounge qua Tampermonkey...\n");
 
     let mut state = HandState::new();
@@ -1720,7 +1903,7 @@ mod tests {
 
         let active = {
             // Chạy process_game_update với advice_only = true trước để kiểm tra state và kết quả None
-            let mut advice_cfg = cfg;
+            let mut advice_cfg = cfg.clone();
             advice_cfg.advice_only = true;
             let res_none = process_game_update(&mut state, &payload, &policy, &advice_cfg);
             assert!(res_none.is_none(), "advice_only=true must return None");
@@ -1742,5 +1925,102 @@ mod tests {
         let cmd = act.unwrap();
         assert_eq!(cmd.delay_ms, 1500);
         assert!(["fold", "check", "call", "raise", "all_in"].contains(&cmd.action.as_str()));
+    }
+
+    #[test]
+    fn test_lounge_subgame_solver_river_street_acted_and_overbet() {
+        let adv_mlp = MLP::new(&[FEATURE_DIM, 64, NUM_ACTIONS]);
+        let policy = DeepCFRPolicy::new(Arc::new(RwLock::new(adv_mlp)), true);
+
+        let mut state = HandState::new();
+        state.hand_id = "lounge_river_overbet".to_string();
+        state.hero_id = "hero".to_string();
+        state.street = Street::River;
+        state.bb_size = 20;
+        state.sb_size = 10;
+        state.pn_total_pot = 200;
+        state.highest_bet = 500;
+        state.dealer_id = Some("hero".to_string());
+        state.community_cards = vec![
+            robust_parse_card("As").unwrap(),
+            robust_parse_card("Kd").unwrap(),
+            robust_parse_card("Qc").unwrap(),
+            robust_parse_card("4s").unwrap(),
+            robust_parse_card("5h").unwrap(),
+        ];
+        state.seats_order = vec!["hero".to_string(), "villain".to_string(), "folded_p".to_string()];
+
+        let mut hero = PlayerTracker::default();
+        hero.id = "hero".to_string();
+        hero.name = "Hero".to_string();
+        hero.seat_num = 1;
+        hero.stack = 2000;
+        hero.current_bet = 0;
+        hero.total_contributed = 100;
+
+        let mut villain = PlayerTracker::default();
+        villain.id = "villain".to_string();
+        villain.name = "Villain".to_string();
+        villain.seat_num = 2;
+        villain.stack = 2500; // còn 2000 behind sau bet 500
+        villain.current_bet = 500;
+        villain.total_contributed = 600;
+
+        let mut folded = PlayerTracker::default();
+        folded.id = "folded_p".to_string();
+        folded.name = "Folder".to_string();
+        folded.seat_num = 3;
+        folded.stack = 2000;
+        folded.is_folded = true;
+        folded.total_contributed = 20;
+
+        state.players.insert("hero".to_string(), hero);
+        state.players.insert("villain".to_string(), villain);
+        state.players.insert("folded_p".to_string(), folded);
+        state.action_history.push(HandActionRecord {
+            player_id: "villain".to_string(),
+            seat_num: 2,
+            street: Street::River,
+            action: Action::BetPot75,
+            amount: 500,
+        });
+
+        // 1. Kiểm tra street_has_acted: Villain vừa bet ở River -> sau khi Hero Call, ván bài phải kết thúc ngay (Showdown)
+        let air_hole = [robust_parse_card("7c").unwrap(), robust_parse_card("2d").unwrap()];
+        let ctx = build_lounge_environment(&state, air_hole).unwrap();
+        let villain_idx = ctx.active_seats.iter().position(|id| id == "villain").unwrap();
+        assert!(ctx.env.street_has_acted[villain_idx], "Villain bet on River must mark street_has_acted");
+        assert!(!ctx.env.street_has_acted[ctx.hero_seat], "Hero facing River bet must not have acted yet");
+        let mut sim_call = ctx.env.clone();
+        let hand_ended = sim_call.step(Action::CheckCall).unwrap();
+        assert!(hand_ended, "Calling the sole River bet must end the hand at Showdown");
+        assert_eq!(sim_call.state.street, Street::Showdown);
+
+        // 2. Khi Villain shove All-In 500 vào pot 200 ở River:
+        //    - Hero cầm bài rác 7c2d -> SubgameSolver phải FOLD
+        state.players.get_mut("villain").unwrap().stack = 500;
+        state.players.get_mut("villain").unwrap().is_all_in = true;
+        let mut cfg = LoungePlayConfig {
+            delay_min_ms: 100,
+            delay_max_ms: 100,
+            enable_solver: true,
+            force_search: false,
+            ..Default::default()
+        };
+        cfg.solver_config.iterations = 60;
+
+        let fold_cmd = run_gto_evaluation(&state, air_hole, &policy, &cfg).unwrap();
+        assert_eq!(
+            fold_cmd.action, "fold",
+            "Hero holding 72o on AKQ54 River facing 2.5x All-In overbet must fold under Chip-EV solver"
+        );
+
+        // 3. Đổi sang Hero cầm Broadway Straight Nuts (Ts Js): TUYỆT ĐỐI KHÔNG ĐƯỢC FOLD
+        state.community_cards[0] = robust_parse_card("As").unwrap();
+        state.community_cards[1] = robust_parse_card("Ks").unwrap();
+        state.community_cards[2] = robust_parse_card("Qs").unwrap();
+        let nuts_hole = [robust_parse_card("Ts").unwrap(), robust_parse_card("Jh").unwrap()];
+        let nuts_cmd = run_gto_evaluation(&state, nuts_hole, &policy, &cfg).unwrap();
+        assert_ne!(nuts_cmd.action, "fold", "Hero holding Royal Flush must never fold!");
     }
 }

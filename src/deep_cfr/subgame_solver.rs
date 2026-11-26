@@ -38,7 +38,7 @@ pub enum SearchTrigger {
 impl std::fmt::Display for SearchTrigger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SearchTrigger::HeadsUpDuel => write!(f, "⚔️ Chung kết 1-vs-1 Heads-Up (Chỉ còn 2 người trong tour)"),
+            SearchTrigger::HeadsUpDuel => write!(f, "⚔️ Đối đầu 1-vs-1 Heads-Up (Chỉ còn 2 người trên bàn)"),
             SearchTrigger::UnusualOverbet { bet_pot_ratio } => {
                 write!(f, "Đối thủ Overbet dị ({:.1}% pot)", bet_pot_ratio * 100.0)
             }
@@ -77,6 +77,20 @@ impl Default for SubgameSolverConfig {
             unusual_bet_ratio_trigger: 1.10,
             search_turn_river: true,
             use_icm: true,
+        }
+    }
+}
+
+impl SubgameSolverConfig {
+    /// Cấu hình tối ưu cho Lounge Cash Game (Chip-EV, Deep Stack 12-300+ BB, 2-10 Max)
+    pub fn lounge_cash_default() -> Self {
+        Self {
+            max_depth: 4,
+            iterations: 120,
+            min_pot_bb_trigger: 15.0,
+            unusual_bet_ratio_trigger: 1.10,
+            search_turn_river: true,
+            use_icm: false,
         }
     }
 }
@@ -120,22 +134,19 @@ pub fn is_plausible_opponent_hand<R: Rng>(
             return true;
         }
 
-        // 3. Đánh giá Made Hand đầy đủ (Straight, Flush, Full House, ...) bằng evaluate_7_cards
+        // 3. Đánh giá Made Hand độc lập (Straight, Flush, Full House, ...); tránh đôi trên board giúp rác lọt qua
         let mut cards = Vec::with_capacity(community_cards.len() + 2);
         cards.extend_from_slice(community_cards);
         cards.push(c0);
         cards.push(c1);
         let rank = evaluate_7_cards(&cards);
-        if rank.category() >= HandCategory::OnePair {
+        if rank.category() >= HandCategory::Straight {
             return true;
         }
 
-        // 4. Kiểm tra Flush Draw (4 lá cùng chất trên mặt bài)
-        let s0 = c0.suit_val();
-        let s1 = c1.suit_val();
-        let s0_count = 1 + community_cards.iter().filter(|b| b.suit_val() == s0).count();
-        let s1_count = 1 + community_cards.iter().filter(|b| b.suit_val() == s1).count();
-        if s0_count >= 4 || s1_count >= 4 {
+        // 4. Kiểm tra Flush Draw và Straight Draw chuẩn (kể cả khi 2 lá tẩy đồng chất)
+        let draw_feats = crate::equity::board_and_draw_features([c0, c1], community_cards);
+        if draw_feats[0] > 0.5 || draw_feats[1] > 0.5 {
             return true;
         }
 
@@ -202,13 +213,18 @@ impl SubgameSolver {
             return SearchTrigger::HighStakesPot { pot_bb };
         }
 
-        // 2. Đối thủ overbet dị hoặc sizing bất thường
+        // 2. Đối thủ overbet dị hoặc sizing bất thường (so với pot TRƯỚC khi đối thủ bet)
         let hero_bet = env.state.players[hero_seat].current_bet;
-        let to_call = env.state.current_highest_bet.saturating_sub(hero_bet) as f32;
-        let current_pot = env.state.pot as f32;
-        if current_pot > 0.0 && (to_call / current_pot) >= self.config.unusual_bet_ratio_trigger {
+        let to_call_u32 = env.state.current_highest_bet.saturating_sub(hero_bet);
+        let to_call = to_call_u32 as f32;
+        let pot_before_bet = env.state.pot.saturating_sub(to_call_u32) as f32;
+        if pot_before_bet > 0.0
+            && to_call > bb
+            && (env.state.street != Street::Preflop || to_call >= 4.0 * bb)
+            && (to_call / pot_before_bet) >= self.config.unusual_bet_ratio_trigger
+        {
             return SearchTrigger::UnusualOverbet {
-                bet_pot_ratio: to_call / current_pot,
+                bet_pot_ratio: to_call / pot_before_bet,
             };
         }
 
@@ -232,6 +248,113 @@ impl SubgameSolver {
         SearchTrigger::FastPolicyFallback
     }
 
+    /// Tính EV khi pot đã chia xong về stack của từng người chơi (`pot == 0`)
+    #[inline]
+    fn evaluate_resolved_stacks(
+        &self,
+        env: &Environment,
+        hero_seat: usize,
+        initial_hero_stack: u32,
+        hero_start_icm: f32,
+    ) -> f32 {
+        if self.config.use_icm {
+            let end_stacks: Vec<f32> = env.state.players.iter().map(|p| p.stack as f32).collect();
+            let payouts = get_sng_payouts(end_stacks.len());
+            let end_evs = calculate_icm_ev(&end_stacks, payouts);
+            let hero_end_icm = end_evs.get(hero_seat).copied().unwrap_or(0.0);
+            (hero_end_icm - hero_start_icm) * 10.0
+        } else {
+            let bb = env.state.bb_size.max(1) as f32;
+            let final_stack = env.state.players[hero_seat].stack as f32;
+            (final_stack - initial_hero_stack as f32) / bb
+        }
+    }
+
+    /// Chia pot (bao gồm cả side-pot chính xác khi có all-in) về stack trước khi định giá leaf/terminal
+    fn resolve_pot_into_stacks(sim: &mut Environment) {
+        if sim.state.pot == 0 {
+            return;
+        }
+        let in_hand: Vec<usize> = sim
+            .state
+            .players
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.is_in_hand())
+            .map(|(i, _)| i)
+            .collect();
+        if in_hand.is_empty() {
+            return;
+        }
+        if in_hand.len() == 1 {
+            sim.state.players[in_hand[0]].stack += sim.state.pot;
+            sim.state.pot = 0;
+            return;
+        }
+
+        while sim.state.community_cards.len() < 5 {
+            match sim.deck.deal() {
+                Some(c) => sim.state.community_cards.push(c),
+                None => break,
+            }
+        }
+
+        let all_have_hole = in_hand
+            .iter()
+            .all(|&i| sim.state.players[i].hole_cards[0].is_some() && sim.state.players[i].hole_cards[1].is_some());
+
+        if all_have_hole && sim.state.community_cards.len() == 5 {
+            let all_have_contrib = in_hand.iter().all(|&i| sim.state.players[i].total_contributed > 0);
+            if all_have_contrib {
+                sim.resolve_showdown();
+                return;
+            }
+
+            let mut best_score: Option<HandRank> = None;
+            let mut winners = Vec::new();
+            for &idx in &in_hand {
+                let p = &sim.state.players[idx];
+                let mut cards = sim.state.community_cards.clone();
+                cards.push(p.hole_cards[0].unwrap());
+                cards.push(p.hole_cards[1].unwrap());
+                let rank = evaluate_7_cards(&cards);
+                match best_score {
+                    None => {
+                        best_score = Some(rank);
+                        winners.push(idx);
+                    }
+                    Some(br) if rank > br => {
+                        best_score = Some(rank);
+                        winners.clear();
+                        winners.push(idx);
+                    }
+                    Some(br) if rank == br => {
+                        winners.push(idx);
+                    }
+                    _ => {}
+                }
+            }
+            if !winners.is_empty() {
+                let share = sim.state.pot / winners.len() as u32;
+                let rem = sim.state.pot % winners.len() as u32;
+                for (pos, &w) in winners.iter().enumerate() {
+                    let bonus = if pos < rem as usize { 1 } else { 0 };
+                    sim.state.players[w].stack += share + bonus;
+                }
+                sim.state.pot = 0;
+                return;
+            }
+        }
+
+        let share = sim.state.pot / in_hand.len() as u32;
+        let rem = sim.state.pot % in_hand.len() as u32;
+        for (pos, &idx) in in_hand.iter().enumerate() {
+            let bonus = if pos < rem as usize { 1 } else { 0 };
+            sim.state.players[idx].stack += share + bonus;
+        }
+        sim.state.pot = 0;
+    }
+
     /// Tính toán payoff tại các nút kết thúc ván bài (Showdown hoặc đối thủ đã Fold hết)
     #[inline]
     fn compute_terminal_payoff(
@@ -241,124 +364,15 @@ impl SubgameSolver {
         initial_hero_stack: u32,
         hero_start_icm: f32,
     ) -> f32 {
-        if self.config.use_icm {
-            let mut end_stacks: Vec<f32> = env.state.players.iter().map(|p| p.stack as f32).collect();
-            if env.state.pot > 0 {
-                let remaining_in_hand: Vec<usize> = env
-                    .state
-                    .players
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, p)| p.is_in_hand())
-                    .map(|(i, _)| i)
-                    .collect();
-
-                if remaining_in_hand.len() == 1 {
-                    end_stacks[remaining_in_hand[0]] += env.state.pot as f32;
-                } else if env.state.community_cards.len() == 5 {
-                    // Showdown thực tế: Đọ bài tìm người thắng cuộc
-                    let mut best_score: Option<HandRank> = None;
-                    let mut winners = Vec::new();
-                    for &idx in &remaining_in_hand {
-                        let p = &env.state.players[idx];
-                        if let (Some(c0), Some(c1)) = (p.hole_cards[0], p.hole_cards[1]) {
-                            let mut cards = env.state.community_cards.clone();
-                            cards.push(c0);
-                            cards.push(c1);
-                            let rank = evaluate_7_cards(&cards);
-                            match best_score {
-                                None => {
-                                    best_score = Some(rank);
-                                    winners.push(idx);
-                                }
-                                Some(br) if rank > br => {
-                                    best_score = Some(rank);
-                                    winners.clear();
-                                    winners.push(idx);
-                                }
-                                Some(br) if rank == br => {
-                                    winners.push(idx);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    if !winners.is_empty() {
-                        let win_share = env.state.pot as f32 / winners.len() as f32;
-                        for &w in &winners {
-                            end_stacks[w] += win_share;
-                        }
-                    } else {
-                        let share = env.state.pot as f32 / remaining_in_hand.len() as f32;
-                        for &idx in &remaining_in_hand {
-                            end_stacks[idx] += share;
-                        }
-                    }
-                } else if !remaining_in_hand.is_empty() {
-                    let share = env.state.pot as f32 / remaining_in_hand.len() as f32;
-                    for &idx in &remaining_in_hand {
-                        end_stacks[idx] += share;
-                    }
-                }
-            }
-            let payouts = get_sng_payouts(end_stacks.len());
-            let end_evs = calculate_icm_ev(&end_stacks, payouts);
-            let hero_end_icm = end_evs.get(hero_seat).copied().unwrap_or(0.0);
-            (hero_end_icm - hero_start_icm) * 10.0
-        } else {
-            let bb = env.state.bb_size.max(1) as f32;
-            let hero_player = &env.state.players[hero_seat];
-            let in_hand_count = env.state.players.iter().filter(|p| p.is_in_hand()).count();
-            let final_stack = if !hero_player.is_folded {
-                if in_hand_count <= 1 {
-                    (hero_player.stack + env.state.pot) as f32
-                } else if env.state.community_cards.len() == 5 {
-                    let mut best_score: Option<HandRank> = None;
-                    let mut winners = Vec::new();
-                    for (i, p) in env.state.players.iter().enumerate() {
-                        if p.is_in_hand() {
-                            if let (Some(c0), Some(c1)) = (p.hole_cards[0], p.hole_cards[1]) {
-                                let mut cards = env.state.community_cards.clone();
-                                cards.push(c0);
-                                cards.push(c1);
-                                let rank = evaluate_7_cards(&cards);
-                                match best_score {
-                                    None => {
-                                        best_score = Some(rank);
-                                        winners.push(i);
-                                    }
-                                    Some(br) if rank > br => {
-                                        best_score = Some(rank);
-                                        winners.clear();
-                                        winners.push(i);
-                                    }
-                                    Some(br) if rank == br => {
-                                        winners.push(i);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                    let hero_win_share = if winners.contains(&hero_seat) {
-                        env.state.pot as f32 / winners.len() as f32
-                    } else {
-                        0.0
-                    };
-                    hero_player.stack as f32 + hero_win_share
-                } else {
-                    hero_player.stack as f32
-                }
-            } else {
-                hero_player.stack as f32
-            };
-            (final_stack - initial_hero_stack as f32) / bb
+        if env.state.pot == 0 {
+            return self.evaluate_resolved_stacks(env, hero_seat, initial_hero_stack, hero_start_icm);
         }
+        let mut sim = env.clone();
+        Self::resolve_pot_into_stacks(&mut sim);
+        self.evaluate_resolved_stacks(&sim, hero_seat, initial_hero_stack, hero_start_icm)
     }
 
-    /// Định giá nút lá (Leaf Evaluation)
-    /// Khi cây con đạt độ sâu giới hạn mà chưa kết thúc ván:
-    /// Dùng Pot-Equity Share kết hợp Tournament ICM và Tactical Advantage Net
+    /// Định giá nút lá (Leaf Evaluation) dựa theo Range đối thủ đã sample & Rollout chính xác (hoặc Equity fallback)
     #[inline]
     fn evaluate_leaf(
         &self,
@@ -366,160 +380,91 @@ impl SubgameSolver {
         hero_seat: usize,
         initial_hero_stack: u32,
         hero_start_icm: f32,
-        adv_net: &MLP,
+        _adv_net: &MLP,
     ) -> f32 {
+        if env.state.pot == 0 {
+            return self.evaluate_resolved_stacks(env, hero_seat, initial_hero_stack, hero_start_icm);
+        }
+
         let hero_player = &env.state.players[hero_seat];
-        let in_hand_count = env
+        let in_hand: Vec<usize> = env
             .state
             .players
             .iter()
-            .filter(|p| !p.is_folded && (p.stack > 0 || p.current_bet > 0 || p.is_all_in))
-            .count();
+            .enumerate()
+            .filter(|(_, p)| p.is_in_hand())
+            .map(|(i, _)| i)
+            .collect();
+        let in_hand_count = in_hand.len();
 
-        let base_ev = if self.config.use_icm {
+        if hero_player.is_folded {
+            if !self.config.use_icm {
+                let bb = env.state.bb_size.max(1) as f32;
+                return (hero_player.stack as f32 - initial_hero_stack as f32) / bb;
+            }
+            let mut sim = env.clone();
+            Self::resolve_pot_into_stacks(&mut sim);
+            return self.evaluate_resolved_stacks(&sim, hero_seat, initial_hero_stack, hero_start_icm);
+        }
+
+        if in_hand_count <= 1 {
+            let mut sim = env.clone();
+            Self::resolve_pot_into_stacks(&mut sim);
+            return self.evaluate_resolved_stacks(&sim, hero_seat, initial_hero_stack, hero_start_icm);
+        }
+
+        let all_have_hole = in_hand
+            .iter()
+            .all(|&i| env.state.players[i].hole_cards[0].is_some() && env.state.players[i].hole_cards[1].is_some());
+        let can_finish_board = env.state.community_cards.len() + env.deck.remaining() >= 5;
+
+        if all_have_hole && can_finish_board {
+            let mut sim = env.clone();
+            Self::resolve_pot_into_stacks(&mut sim);
+            return self.evaluate_resolved_stacks(&sim, hero_seat, initial_hero_stack, hero_start_icm);
+        }
+
+        // Fallback khi thiếu bài sample: ước lượng theo equity vs random (không cộng bias ảo)
+        if self.config.use_icm {
             let mut end_stacks: Vec<f32> = env.state.players.iter().map(|p| p.stack as f32).collect();
             let pot = env.state.pot as f32;
-
-            if hero_player.is_folded {
-                let opp_count = in_hand_count;
-                if opp_count > 0 {
-                    let share = pot / opp_count as f32;
-                    for (i, p) in env.state.players.iter().enumerate() {
-                        if p.is_in_hand() {
-                            end_stacks[i] += share;
-                        }
-                    }
-                }
-            } else if in_hand_count <= 1 {
-                end_stacks[hero_seat] += pot;
-            } else if env.state.community_cards.len() == 5 {
-                let mut best_score: Option<HandRank> = None;
-                let mut winners = Vec::new();
-                for (i, p) in env.state.players.iter().enumerate() {
-                    if p.is_in_hand() {
-                        if let (Some(c0), Some(c1)) = (p.hole_cards[0], p.hole_cards[1]) {
-                            let mut cards = env.state.community_cards.clone();
-                            cards.push(c0);
-                            cards.push(c1);
-                            let rank = evaluate_7_cards(&cards);
-                            match best_score {
-                                None => {
-                                    best_score = Some(rank);
-                                    winners.push(i);
-                                }
-                                Some(br) if rank > br => {
-                                    best_score = Some(rank);
-                                    winners.clear();
-                                    winners.push(i);
-                                }
-                                Some(br) if rank == br => {
-                                    winners.push(i);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                if !winners.is_empty() {
-                    let win_share = pot / winners.len() as f32;
-                    for &w in &winners {
-                        end_stacks[w] += win_share;
-                    }
-                } else {
-                    let share = pot / in_hand_count.max(1) as f32;
-                    for (i, p) in env.state.players.iter().enumerate() {
-                        if p.is_in_hand() {
-                            end_stacks[i] += share;
-                        }
-                    }
-                }
+            let eq = if let (Some(c0), Some(c1)) = (hero_player.hole_cards[0], hero_player.hole_cards[1]) {
+                equity_vs_random([c0, c1], &env.state.community_cards, in_hand_count.saturating_sub(1))
             } else {
-                let eq = if let (Some(c0), Some(c1)) = (hero_player.hole_cards[0], hero_player.hole_cards[1]) {
-                    equity_vs_random([c0, c1], &env.state.community_cards, in_hand_count.saturating_sub(1))
-                } else {
-                    1.0 / in_hand_count as f32
-                };
-                end_stacks[hero_seat] += eq * pot;
-                let opp_count = in_hand_count.saturating_sub(1);
-                if opp_count > 0 {
-                    let opp_share = ((1.0 - eq) * pot) / opp_count as f32;
-                    for (i, p) in env.state.players.iter().enumerate() {
-                        if i != hero_seat && p.is_in_hand() {
-                            end_stacks[i] += opp_share;
-                        }
+                1.0 / in_hand_count.max(1) as f32
+            };
+            end_stacks[hero_seat] += eq * pot;
+            let opp_count = in_hand_count.saturating_sub(1);
+            if opp_count > 0 {
+                let opp_share = ((1.0 - eq) * pot) / opp_count as f32;
+                for &i in &in_hand {
+                    if i != hero_seat {
+                        end_stacks[i] += opp_share;
                     }
                 }
             }
-
             let payouts = get_sng_payouts(end_stacks.len());
             let end_evs = calculate_icm_ev(&end_stacks, payouts);
             let hero_end_icm = end_evs.get(hero_seat).copied().unwrap_or(0.0);
             (hero_end_icm - hero_start_icm) * 10.0
         } else {
             let bb = env.state.bb_size.max(1) as f32;
-            if hero_player.is_folded {
-                (hero_player.stack as f32 - initial_hero_stack as f32) / bb
-            } else if in_hand_count <= 1 {
-                ((hero_player.stack + env.state.pot) as f32 - initial_hero_stack as f32) / bb
-            } else if env.state.community_cards.len() == 5 {
-                let mut best_score: Option<HandRank> = None;
-                let mut winners = Vec::new();
-                for (i, p) in env.state.players.iter().enumerate() {
-                    if p.is_in_hand() {
-                        if let (Some(c0), Some(c1)) = (p.hole_cards[0], p.hole_cards[1]) {
-                            let mut cards = env.state.community_cards.clone();
-                            cards.push(c0);
-                            cards.push(c1);
-                            let rank = evaluate_7_cards(&cards);
-                            match best_score {
-                                None => {
-                                    best_score = Some(rank);
-                                    winners.push(i);
-                                }
-                                Some(br) if rank > br => {
-                                    best_score = Some(rank);
-                                    winners.clear();
-                                    winners.push(i);
-                                }
-                                Some(br) if rank == br => {
-                                    winners.push(i);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                let hero_win_share = if winners.contains(&hero_seat) {
-                    env.state.pot as f32 / winners.len() as f32
-                } else {
-                    0.0
-                };
-                let expected_chips = hero_player.stack as f32 + hero_win_share;
-                (expected_chips - initial_hero_stack as f32) / bb
+            let eq = if let (Some(c0), Some(c1)) = (hero_player.hole_cards[0], hero_player.hole_cards[1]) {
+                equity_vs_random([c0, c1], &env.state.community_cards, in_hand_count.saturating_sub(1))
             } else {
-                let eq = if let (Some(c0), Some(c1)) = (hero_player.hole_cards[0], hero_player.hole_cards[1]) {
-                    equity_vs_random([c0, c1], &env.state.community_cards, in_hand_count.saturating_sub(1))
-                } else {
-                    1.0 / in_hand_count as f32
-                };
-                let expected_chips = hero_player.stack as f32 + (eq * env.state.pot as f32);
-                (expected_chips - initial_hero_stack as f32) / bb
-            }
-        };
-
-        // Bổ sung Tactical Bonus từ Advantage Net (mạng nơ-ron cũng được train theo ICM Delta * 10.0!)
-        let features = env.state.encode_features(hero_seat);
-        let raw_adv = adv_net.forward(&features);
-        let max_tactical_adv = raw_adv.iter().fold(0.0f32, |acc, &v| acc.max(v));
-
-        base_ev + (max_tactical_adv * 0.15)
+                1.0 / in_hand_count.max(1) as f32
+            };
+            let expected_chips = hero_player.stack as f32 + (eq * env.state.pot as f32);
+            (expected_chips - initial_hero_stack as f32) / bb
+        }
     }
 
-    /// Đệ quy tìm kiếm và cập nhật Regrets / Values
+    /// Đệ quy tìm kiếm và cập nhật Regrets / Values (CFR+ & Linear CFR)
     fn traverse_subgame<R: Rng>(
         &self,
         env: &mut Environment,
         depth: usize,
+        iter_weight: f32,
         hero_seat: usize,
         initial_hero_stack: u32,
         hero_start_icm: f32,
@@ -572,6 +517,7 @@ impl SubgameSolver {
                         self.traverse_subgame(
                             &mut branch,
                             depth + 1,
+                            iter_weight,
                             hero_seat,
                             initial_hero_stack,
                             hero_start_icm,
@@ -589,20 +535,25 @@ impl SubgameSolver {
                     expected_v += strat[a_idx] * v;
                 }
 
-                // Cập nhật Regret và Chiến thuật tích lũy
+                // Cập nhật Regret (CFR+ floor >= 0) và Chiến thuật tích lũy (Linear CFR)
                 for &a in &valid_actions {
                     let a_idx = a.to_index();
-                    root_regrets[a_idx] += current_iteration_values[a_idx] - expected_v;
-                    root_policy_sum[a_idx] += strat[a_idx];
+                    root_regrets[a_idx] = (root_regrets[a_idx] + (current_iteration_values[a_idx] - expected_v)).max(0.0);
+                    root_policy_sum[a_idx] += iter_weight * strat[a_idx];
                 }
 
                 expected_v
             } else {
                 // Hero ở các tầng sâu hơn trong cây con:
-                // Sử dụng mạng Advantage Net để chọn hành động mô phỏng
+                // Ưu tiên Blueprint Strategy Net (nếu có), fallback Advantage Net
                 let features = env.state.encode_features(hero_seat);
-                let raw_adv = adv_net.forward(&features);
-                let strat = DeepCFRPolicy::compute_regret_matching_probs(&raw_adv, &mask);
+                let strat = if let Some(strat_mlp) = strat_net {
+                    let raw_strat = strat_mlp.forward(&features);
+                    DeepCFRPolicy::compute_strategy_probs(&raw_strat, &mask)
+                } else {
+                    let raw_adv = adv_net.forward(&features);
+                    DeepCFRPolicy::compute_regret_matching_probs(&raw_adv, &mask)
+                };
                 let a = sample_action_from_probs(&strat, &mask, rng);
 
                 let mut branch = env.clone();
@@ -613,6 +564,7 @@ impl SubgameSolver {
                     self.traverse_subgame(
                         &mut branch,
                         depth + 1,
+                        iter_weight,
                         hero_seat,
                         initial_hero_stack,
                         hero_start_icm,
@@ -647,6 +599,7 @@ impl SubgameSolver {
                 self.traverse_subgame(
                     &mut branch,
                     depth + 1,
+                    iter_weight,
                     hero_seat,
                     initial_hero_stack,
                     hero_start_icm,
@@ -704,16 +657,22 @@ impl SubgameSolver {
         let mut root_regrets = [0.0f32; NUM_ACTIONS];
         let mut root_policy_sum = [0.0f32; NUM_ACTIONS];
 
-        // Khởi tạo regret ban đầu từ Advantage Net để đẩy nhanh hội tụ (Warm Start)
+        // Warm-start chuẩn hóa theo phân phối Strategy/Regret (không lệch theo scale raw magnitude)
         let root_features = env.state.encode_features(hero_seat);
-        let raw_warm_adv = adv_net.forward(&root_features);
+        let warm_probs = if let Some(strat_mlp) = strat_net {
+            let raw_s = strat_mlp.forward(&root_features);
+            DeepCFRPolicy::compute_strategy_probs(&raw_s, &mask)
+        } else {
+            let raw_a = adv_net.forward(&root_features);
+            DeepCFRPolicy::compute_regret_matching_probs(&raw_a, &mask)
+        };
         for &a in &valid_actions {
             let i = a.to_index();
-            root_regrets[i] = raw_warm_adv[i].max(0.0) * 0.5;
+            root_regrets[i] = warm_probs[i] * 0.1;
         }
 
         let mut rng = thread_rng();
-        let iters = self.config.iterations;
+        let iters = self.config.iterations.max(1);
 
         // 🟢 MONTE CARLO CARD SAMPLING SETUP:
         // Đánh dấu các quân bài đã biết (Dead Cards): Bài của Hero, bài chung, và bài của đối thủ nếu đã biết
@@ -732,65 +691,80 @@ impl SubgameSolver {
             }
         }
 
-        let mut alive_cards: Vec<Card> = (0..52)
+        let alive_cards: Vec<Card> = (0..52)
             .filter(|&idx| !dead_mask[idx])
             .map(|idx| Card(idx as u8))
             .collect();
 
         let num_alive = env.state.players.iter().filter(|p| p.stack > 0 || p.is_all_in).count();
 
-        for _ in 0..iters {
+        for iter_idx in 0..iters {
             let mut branch = env.clone();
-
-            // 🟢 MONTE CARLO CARD SAMPLING:
-            // Xáo trộn các lá bài chưa biết và chia cho các đối thủ còn trong ván
-            for i in (1..alive_cards.len()).rev() {
-                let j = rng.gen_range(0..=i);
-                alive_cards.swap(i, j);
+            for p in &mut branch.state.players {
+                p.total_contributed = p.total_contributed.max(p.current_bet);
             }
 
-            let mut deal_idx = 0;
+            // 🟢 MONTE CARLO CARD SAMPLING (In-place pool, không bỏ phí bài khi reject -> an toàn cho 10-Max):
+            let mut pool = alive_cards.clone();
+            let mut assigned = 0usize;
+
             for (idx, p) in branch.state.players.iter_mut().enumerate() {
                 if idx != hero_seat && p.is_in_hand() {
-                    // Nếu đối thủ chưa có bài tẩy (None), chia 2 lá từ cọc bài
                     if p.hole_cards[0].is_none() || p.hole_cards[1].is_none() {
-                        if deal_idx + 2 <= alive_cards.len() {
-                            let mut c0 = alive_cards[deal_idx];
-                            let mut c1 = alive_cards[deal_idx + 1];
-                            deal_idx += 2;
+                        let avail = pool.len().saturating_sub(assigned);
+                        if avail >= 2 {
+                            let filter_range = (env.state.community_cards.len() >= 3 || num_alive > 2)
+                                && (p.current_bet > env.state.bb_size || p.total_contributed > env.state.bb_size);
 
-                            // 🛡️ LỌC RANGE THỰC TẾ KẾT HỢP CẢ BÀI TẨY VÀ BÀI CHUNG (BOARD TEXTURE):
-                            // Khắc phục triệt để nhược điểm của Chen Score thuần:
-                            // "Có khi đối thủ cầm bài rác preflop mà trúng bài chung thì vẫn win!"
-                            // -> Nếu bài rác trúng bài chung (One Pair, Two Pair, Trips, Straight, Flush): GIỮ LẠI 100%!
-                            // -> Đồng thời vẫn giữ ~25% tần suất Bluff tự nhiên của đối thủ!
-                            if (env.state.community_cards.len() >= 3 || num_alive > 2)
-                                && (p.current_bet > env.state.bb_size || p.total_contributed > env.state.bb_size)
-                            {
+                            let mut chosen_i0 = assigned + rng.gen_range(0..avail);
+                            let mut chosen_i1 = assigned + rng.gen_range(0..avail - 1);
+                            if chosen_i1 >= chosen_i0 {
+                                chosen_i1 += 1;
+                            }
+
+                            if filter_range {
                                 let mut attempts = 0;
-                                while !is_plausible_opponent_hand(c0, c1, &env.state.community_cards, &mut rng)
-                                    && deal_idx + 2 <= alive_cards.len()
-                                    && attempts < 5
+                                while !is_plausible_opponent_hand(
+                                    pool[chosen_i0],
+                                    pool[chosen_i1],
+                                    &env.state.community_cards,
+                                    &mut rng,
+                                ) && attempts < 8
                                 {
-                                    c0 = alive_cards[deal_idx];
-                                    c1 = alive_cards[deal_idx + 1];
-                                    deal_idx += 2;
+                                    chosen_i0 = assigned + rng.gen_range(0..avail);
+                                    chosen_i1 = assigned + rng.gen_range(0..avail - 1);
+                                    if chosen_i1 >= chosen_i0 {
+                                        chosen_i1 += 1;
+                                    }
                                     attempts += 1;
                                 }
                             }
 
-                            p.hole_cards = [Some(c0), Some(c1)];
+                            pool.swap(assigned, chosen_i0);
+                            if chosen_i1 == assigned {
+                                chosen_i1 = chosen_i0;
+                            }
+                            pool.swap(assigned + 1, chosen_i1);
+
+                            p.hole_cards = [Some(pool[assigned]), Some(pool[assigned + 1])];
+                            assigned += 2;
                         }
                     }
                 }
             }
 
-            // Nạp các lá bài còn lại vào cọc bài để chia hợp lệ nếu ván bài tiến triển qua Flop/Turn/River
-            branch.deck = Deck::from_remaining(&alive_cards[deal_idx..]);
+            // Xáo phần bài còn lại cho runout Flop/Turn/River
+            let rem_len = pool.len().saturating_sub(assigned);
+            for i in (1..rem_len).rev() {
+                let j = rng.gen_range(0..=i);
+                pool.swap(assigned + i, assigned + j);
+            }
+            branch.deck = Deck::from_remaining(&pool[assigned..]);
 
             self.traverse_subgame(
                 &mut branch,
                 0,
+                (iter_idx + 1) as f32,
                 hero_seat,
                 initial_hero_stack,
                 hero_start_icm,
@@ -1144,5 +1118,117 @@ mod tests {
             is_plausible_opponent_hand(c_72_0, c_72_1, &board_trips, &mut rng),
             "Bài rác 72o trúng Trips trên board 7-7-K phải được giữ lại 100%!"
         );
+    }
+
+    #[test]
+    fn test_subgame_solver_overbet_trigger_multiway() {
+        let stacks = vec![2000; 6];
+        let mut env = Environment::new(6, &stacks, 40, 20, 0);
+        env.state.is_cash_game = true;
+        env.state.street = Street::Flop;
+        env.state.community_cards = vec![
+            Card::from_str_repr("As").unwrap(),
+            Card::from_str_repr("8d").unwrap(),
+            Card::from_str_repr("2c").unwrap(),
+        ];
+        // Pot trước khi Villain bet = 100 (2.5 BB < 12 BB); Villain bet 150 (= 150% pot trước bet, < 35% stack)
+        env.state.pot = 250;
+        env.state.current_highest_bet = 150;
+        env.state.current_player_idx = 0;
+
+        let solver = SubgameSolver::with_default_config();
+        let trigger = solver.should_trigger_search(&env, 0, false);
+        match trigger {
+            SearchTrigger::UnusualOverbet { bet_pot_ratio } => {
+                assert!(
+                    (bet_pot_ratio - 1.5).abs() < 1e-4,
+                    "Expected bet_pot_ratio 1.5, got {}",
+                    bet_pot_ratio
+                );
+            }
+            other => panic!("Expected UnusualOverbet, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_is_plausible_opponent_hand_flush_draw_and_paired_board() {
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        let mut rng = StdRng::seed_from_u64(99);
+        // 1. Suited Nut Flush Draw (Ah 5h trên board Kh 9h 2c) phải được giữ 100%
+        let board_fd = vec![
+            Card::from_str_repr("Kh").unwrap(),
+            Card::from_str_repr("9h").unwrap(),
+            Card::from_str_repr("2c").unwrap(),
+        ];
+        let ah = Card::from_str_repr("Ah").unwrap();
+        let five_h = Card::from_str_repr("5h").unwrap();
+        for _ in 0..20 {
+            assert!(
+                is_plausible_opponent_hand(ah, five_h, &board_fd, &mut rng),
+                "Suited Flush Draw Ah5h must always be plausible"
+            );
+        }
+
+        // 2. Bài rác 9c 4s trên board có đôi Kd Kh 2s không được lọt qua 100% nhờ đôi sẵn trên board
+        let board_paired = vec![
+            Card::from_str_repr("Kd").unwrap(),
+            Card::from_str_repr("Kh").unwrap(),
+            Card::from_str_repr("2s").unwrap(),
+        ];
+        let air0 = Card::from_str_repr("9c").unwrap();
+        let air1 = Card::from_str_repr("4s").unwrap();
+        let mut accepted = 0usize;
+        for _ in 0..200 {
+            if is_plausible_opponent_hand(air0, air1, &board_paired, &mut rng) {
+                accepted += 1;
+            }
+        }
+        assert!(
+            accepted > 10 && accepted < 90,
+            "Pure air on paired board should pass ~25% bluff rate, got {}/200",
+            accepted
+        );
+    }
+
+    #[test]
+    fn test_subgame_solver_10max_cash_no_deck_exhaustion_and_chip_ev() {
+        let mut env = Environment::new(10, &[10_000; 10], 100, 50, 0);
+        env.state.is_cash_game = true;
+        env.state.street = Street::Flop;
+        env.state.community_cards = vec![
+            Card::from_str_repr("Ad").unwrap(),
+            Card::from_str_repr("Ac").unwrap(),
+            Card::from_str_repr("2s").unwrap(),
+        ];
+        env.state.pot = 3000;
+        env.state.current_highest_bet = 300;
+        env.state.current_player_idx = 0;
+
+        for p in &mut env.state.players {
+            p.stack = 9700;
+            p.current_bet = 300;
+            p.total_contributed = 300;
+            p.hole_cards = [None, None];
+        }
+        env.state.players[0].hole_cards = [
+            Some(Card::from_str_repr("As").unwrap()),
+            Some(Card::from_str_repr("Ah").unwrap()),
+        ];
+
+        let adv_mlp = MLP::new(&[crate::environment::FEATURE_DIM, 64, NUM_ACTIONS]);
+        let mut cfg = SubgameSolverConfig::lounge_cash_default();
+        cfg.iterations = 40;
+        let solver = SubgameSolver::new(cfg);
+
+        let trigger = solver.should_trigger_search(&env, 0, false);
+        assert_ne!(trigger, SearchTrigger::FastPolicyFallback);
+
+        let res = solver.resolve(&env, 0, &adv_mlp, None, trigger, None);
+        assert_ne!(res.best_action, Action::Fold, "Quad Aces must never fold in 10-Max Cash");
+        for a in env.get_action_mask().valid_actions() {
+            assert!(res.action_evs[a.to_index()].is_finite());
+        }
     }
 }

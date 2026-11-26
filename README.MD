@@ -18,13 +18,17 @@ cargo run --release --bin train_lounge -- --players 10 --iters 2000
 ```
 
 ## Play Lounge trên PokerNow (`play_lounge`)
-*(Yêu cầu đã train xong `deep_cfr_lounge_model.json`)*
+*(Yêu cầu đã train xong `deep_cfr_lounge_model.json`. Mặc định bật Hybrid Chip-EV Subgame Solver: `depth=4`, `iters=120`, `min-pot=15 BB`)*
 ```bash
 # Auto-Play chế độ Silent DOM (gửi lệnh qua Tampermonkey, cổng 3000)
 cargo run --release --bin play_lounge -- --game-url "https://www.pokernow.com/games/<ROOM_ID>"
 
 # Chế độ chỉ xem phân tích EV/GTO, không tự động bấm nút
 cargo run --release --bin play_lounge -- --advice-only --game-url "https://www.pokernow.com/games/<ROOM_ID>"
+
+# Tùy chỉnh Subgame Solver (ép search mọi vòng, chỉnh depth/iters, hoặc tắt solver chạy mạng thuần)
+cargo run --release --bin play_lounge -- --search --depth 4 --iters 160 --game-url "https://www.pokernow.com/games/<ROOM_ID>"
+cargo run --release --bin play_lounge -- --no-solver --game-url "https://www.pokernow.com/games/<ROOM_ID>"
 
 # Chế độ trộn bài an toàn (Guarded Mixing) hoặc Pure GTO Roll
 cargo run --release --bin play_lounge -- --guarded --game-url "https://www.pokernow.com/games/<ROOM_ID>"
