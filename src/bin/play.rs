@@ -43,8 +43,6 @@ fn print_help() {
     println!("  --guarded                           Lọc nhánh tự sát & trộn an toàn");
     println!("\nTHAO TÁC & TRỢ LÝ:");
     println!("  --advice-only, --assist             Chỉ gợi ý quyết định, KHÔNG click/bấm nút");
-    println!("  --delay-min <ms>                    Độ trễ tối thiểu giả lập người (mặc định: 1500)");
-    println!("  --delay-max <ms>                    Độ trễ tối đa giả lập người (mặc định: 3000)");
     println!("  --enigo                             Bật click chuột qua OS thay vì in-page DOM");
     println!("  -h, --help                          Hiển thị hướng dẫn này");
 }
@@ -143,18 +141,6 @@ fn parse_play_args(args: &[String]) -> Result<Option<PlayCliArgs>, String> {
             "--roll" => parsed.config.decision_mode = DecisionMode::PureGtoRoll,
             "--guarded" => parsed.config.decision_mode = DecisionMode::GuardedMixing,
             "--advice-only" | "--assist" => parsed.config.advice_only = true,
-            "--delay-min" => {
-                let raw = next_arg(args, &mut i, flag)?;
-                parsed.config.delay_min_ms = raw
-                    .parse::<u64>()
-                    .map_err(|_| format!("delay-min '{}' không hợp lệ", raw))?;
-            }
-            "--delay-max" => {
-                let raw = next_arg(args, &mut i, flag)?;
-                parsed.config.delay_max_ms = raw
-                    .parse::<u64>()
-                    .map_err(|_| format!("delay-max '{}' không hợp lệ", raw))?;
-            }
             "--enigo" => parsed.config.use_os_enigo = true,
             unknown => {
                 return Err(format!("Tham số không được nhận diện: '{}'", unknown));
@@ -163,7 +149,6 @@ fn parse_play_args(args: &[String]) -> Result<Option<PlayCliArgs>, String> {
         i += 1;
     }
 
-    parsed.config.delay_max_ms = parsed.config.delay_max_ms.max(parsed.config.delay_min_ms);
     Ok(Some(parsed))
 }
 
@@ -483,10 +468,6 @@ mod tests {
             "6.5",
             "--advice-only",
             "--guarded",
-            "--delay-min",
-            "800",
-            "--delay-max",
-            "500",
         ]);
         let parsed = parse_play_args(&args).unwrap().unwrap();
         assert_eq!(parsed.config.mode, PlayMode::Lounge);
@@ -498,9 +479,6 @@ mod tests {
         assert_eq!(parsed.port, 3005);
         assert!(parsed.config.advice_only);
         assert_eq!(parsed.config.decision_mode, DecisionMode::GuardedMixing);
-        // delay_max được kẹp >= delay_min
-        assert_eq!(parsed.config.delay_min_ms, 800);
-        assert_eq!(parsed.config.delay_max_ms, 800);
     }
 
     #[test]

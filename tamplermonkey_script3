@@ -29,8 +29,6 @@
 
     const DUMP_URL = "http://127.0.0.1:3002/packet";
 
-    let pendingActionTimeout = null;
-
     // =========================================================================
     // 🥷 TỰ ĐỘNG THAO TÁC TRÊN BÀN POKERSTARS (IN-PAGE ANGULAR DOM CLICKER)
     // =========================================================================
@@ -512,16 +510,8 @@
                     try {
                         const data = JSON.parse(response.responseText);
                         if (data && data.bot_action) {
-                            if (pendingActionTimeout) {
-                                clearTimeout(pendingActionTimeout);
-                            }
-                            const delay = data.bot_action.delay_ms || (Math.floor(Math.random() * 2001) + 3000);
                             console.log("📥 [POKERSTARS BOT] Nhận lệnh từ Rust (:3002):", data.bot_action);
-                            console.log(`⏳ [HUMAN DELAY] Đợi ${(delay / 1000).toFixed(1)}s trước khi thao tác...`);
-                            pendingActionTimeout = setTimeout(() => {
-                                executePokerStarsAction(data.bot_action);
-                                pendingActionTimeout = null;
-                            }, delay);
+                            executePokerStarsAction(data.bot_action);
                         }
                     } catch(e) {}
                 },

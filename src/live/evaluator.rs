@@ -5,9 +5,7 @@ use crate::live::protocol::{build_environment, HandState};
 use crate::live::{DecisionMode, InPageAction, PlayConfig};
 use crate::poker_core::Card;
 use crate::self_play::Policy;
-use rand::Rng;
 use std::thread;
-use std::time::Duration;
 
 fn blueprint_eval(
     policy: &DeepCFRPolicy,
@@ -409,16 +407,11 @@ pub fn run_gto_evaluation(
             best_action
         };
 
-        let lo = cfg.delay_min_ms.min(cfg.delay_max_ms);
-        let hi = cfg.delay_min_ms.max(cfg.delay_max_ms);
-        let delay_ms: u64 = rand::thread_rng().gen_range(lo..=hi);
-
         let in_page_cmd = match safe_action {
             Action::Fold => InPageAction {
                 action: "fold".to_string(),
                 amount: 0,
                 to_call: 0,
-                delay_ms,
             },
             Action::CheckCall => {
                 if to_call == 0 {
@@ -426,14 +419,12 @@ pub fn run_gto_evaluation(
                         action: "check".to_string(),
                         amount: 0,
                         to_call: 0,
-                        delay_ms,
                     }
                 } else {
                     InPageAction {
                         action: "call".to_string(),
                         amount: to_call,
                         to_call,
-                        delay_ms,
                     }
                 }
             }
@@ -441,7 +432,6 @@ pub fn run_gto_evaluation(
                 action: "all_in".to_string(),
                 amount: max_total_bet,
                 to_call,
-                delay_ms,
             },
             Action::BetSmall | Action::BetPot33 | Action::BetPot75 => {
                 let final_bet = target_total.min(max_total_bet);
@@ -450,14 +440,12 @@ pub fn run_gto_evaluation(
                         action: "all_in".to_string(),
                         amount: max_total_bet,
                         to_call,
-                        delay_ms,
                     }
                 } else {
                     InPageAction {
                         action: "raise".to_string(),
                         amount: final_bet,
                         to_call,
-                        delay_ms,
                     }
                 }
             }
@@ -465,15 +453,13 @@ pub fn run_gto_evaluation(
 
         if cfg.use_os_enigo {
             thread::spawn(move || {
-                thread::sleep(Duration::from_millis(delay_ms));
                 execute_bot_action(safe_action, to_call, target_total, max_total_bet, can_raise);
             });
         } else {
             println!(
-                "🥷 [SILENT MODE] Lệnh gửi Browser: {} (Chip: {}, Trễ: {:.2}s)",
+                "🥷 [SILENT MODE] Lệnh gửi Browser: {} (Chip: {})",
                 in_page_cmd.action.to_uppercase(),
-                in_page_cmd.amount,
-                delay_ms as f64 / 1000.0
+                in_page_cmd.amount
             );
         }
 
@@ -529,9 +515,7 @@ mod tests {
             "pITT": "p0"
         });
 
-        let mut cfg = PlayConfig::for_mode(PlayMode::Lounge);
-        cfg.delay_min_ms = 1500;
-        cfg.delay_max_ms = 1500;
+        let cfg = PlayConfig::for_mode(PlayMode::Lounge);
 
         let active = {
             let mut advice_cfg = cfg.clone();
@@ -553,7 +537,6 @@ mod tests {
         let act = process_game_update(&mut state, &payload, &policy, &cfg);
         assert!(act.is_some());
         let cmd = act.unwrap();
-        assert_eq!(cmd.delay_ms, 1500);
         assert!(["fold", "check", "call", "raise", "all_in"].contains(&cmd.action.as_str()));
     }
 
@@ -627,8 +610,6 @@ mod tests {
         state.players.get_mut("villain").unwrap().stack = 500;
         state.players.get_mut("villain").unwrap().is_all_in = true;
         let mut cfg = PlayConfig::for_mode(PlayMode::Lounge);
-        cfg.delay_min_ms = 100;
-        cfg.delay_max_ms = 100;
         cfg.solver_config.iterations = 60;
 
         let fold_cmd = run_gto_evaluation(&state, air_hole, &policy, &cfg).unwrap();
@@ -681,9 +662,7 @@ mod tests {
         state.seats_order = vec!["hero1".to_string(), "opp1".to_string()];
 
         let hole = [robust_parse_card("Tc").unwrap(), robust_parse_card("2s").unwrap()];
-        let mut cfg = PlayConfig::for_mode(PlayMode::Tournament);
-        cfg.delay_min_ms = 100;
-        cfg.delay_max_ms = 100;
+        let cfg = PlayConfig::for_mode(PlayMode::Tournament);
 
         let cmd = run_gto_evaluation(&state, hole, &policy, &cfg).unwrap();
         assert_ne!(cmd.action, "fold", "Broadway straight facing overbet must not fold");

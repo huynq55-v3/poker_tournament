@@ -52,8 +52,6 @@ pub struct PlayConfig {
     pub decision_mode: DecisionMode,
     pub use_os_enigo: bool,
     pub advice_only: bool,
-    pub delay_min_ms: u64,
-    pub delay_max_ms: u64,
     pub enable_solver: bool,
     pub force_search: bool,
     pub solver_config: SubgameSolverConfig,
@@ -70,8 +68,6 @@ impl PlayConfig {
             decision_mode: DecisionMode::PureMaxEv,
             use_os_enigo: false,
             advice_only: false,
-            delay_min_ms: 1500,
-            delay_max_ms: 3000,
             enable_solver: true,
             force_search: false,
             solver_config,
@@ -84,6 +80,4 @@ pub struct InPageAction {
     pub action: String, // "fold", "check", "call", "all_in", "raise"
     pub amount: u32,
     pub to_call: u32,
-    #[serde(default)]
-    pub delay_ms: u64,
 }
