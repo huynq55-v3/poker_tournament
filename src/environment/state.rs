@@ -8,10 +8,10 @@ use std::cell::RefCell;
 pub const FEATURE_DIM: usize = 187;
 pub const MAX_PLAYERS: usize = 10;
 
-const EQUITY_CACHE_SIZE: usize = 512;
+const EQUITY_CACHE_SIZE: usize = 4096;
 const EQUITY_CACHE_MASK: usize = EQUITY_CACHE_SIZE - 1;
 
-// Bộ nhớ đệm Thread-Local Direct-Mapped 512 slots siêu tốc cho Equity, Hand Strength & Draw Features (tránh tính lại Monte Carlo / Exact HS)
+// Bộ nhớ đệm Thread-Local Direct-Mapped 4096 slots siêu tốc cho Equity, Hand Strength & Draw Features (tránh tính lại Monte Carlo / Exact HS)
 thread_local! {
     static EQUITY_CACHE: RefCell<[(u64, f32, f32, [f32; 5]); EQUITY_CACHE_SIZE]> =
         const { RefCell::new([(0, 0.0, 0.0, [0.0; 5]); EQUITY_CACHE_SIZE]) };
@@ -19,12 +19,22 @@ thread_local! {
 
 #[inline(always)]
 fn compute_cache_key(c0: Card, c1: Card, board: &[Card], num_opp: usize) -> u64 {
-    let mut k = ((c0.0 as u64) << 8) | (c1.0 as u64) | ((num_opp as u64) << 16) | ((board.len() as u64) << 20);
+    let (lo, hi) = if c0.0 <= c1.0 { (c0.0, c1.0) } else { (c1.0, c0.0) };
+    let mut k = ((lo as u64) << 8) | (hi as u64) | ((num_opp as u64) << 16) | ((board.len() as u64) << 20);
     for (i, b) in board.iter().enumerate() {
         k ^= (b.0 as u64 + 1) << (24 + i * 7);
     }
     // Đảm bảo key != 0
     k | 0x8000_0000_0000_0000
+}
+
+#[inline(always)]
+fn cache_index(key: u64) -> usize {
+    let mut h = key;
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    (h as usize) & EQUITY_CACHE_MASK
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -52,6 +62,22 @@ pub enum Position {
 }
 
 impl Position {
+    #[inline(always)]
+    pub fn to_slot(self) -> usize {
+        match self {
+            Position::BTN => 0,
+            Position::SB => 1,
+            Position::BB => 2,
+            Position::UTG => 3,
+            Position::UTG1 => 4,
+            Position::UTG2 => 5,
+            Position::MP1 => 6,
+            Position::MP2 => 7,
+            Position::HJ => 8,
+            Position::CO => 9,
+        }
+    }
+
     pub fn for_seat_alive(seat: usize, button: usize, alive_seats: &[usize]) -> Self {
         let num_alive = alive_seats.len().max(2);
         let btn_pos = alive_seats.iter().position(|&s| s == button).unwrap_or(0);
@@ -65,13 +91,18 @@ impl Position {
                 0 => Position::BTN,
                 1 => Position::SB,
                 2 => Position::BB,
-                3 => Position::UTG,
-                4 => if num_alive > 7 { Position::UTG1 } else if num_alive > 5 { Position::MP1 } else { Position::CO },
-                5 => if num_alive > 8 { Position::UTG2 } else if num_alive > 6 { Position::MP2 } else { Position::CO },
-                6 => if num_alive > 7 { Position::MP1 } else { Position::HJ },
-                7 => if num_alive > 8 { Position::MP2 } else { Position::HJ },
-                8 => Position::HJ,
-                _ => Position::CO,
+                _ => {
+                    let seats_before_btn = num_alive.saturating_sub(rel_pos);
+                    match seats_before_btn {
+                        1 => Position::CO,
+                        2 => Position::HJ,
+                        3 => Position::MP2,
+                        4 => Position::MP1,
+                        5 => Position::UTG2,
+                        6 => Position::UTG1,
+                        _ => Position::UTG,
+                    }
+                }
             }
         }
     }
@@ -168,7 +199,7 @@ impl GameState {
         let num_opp = in_hand.saturating_sub(1);
 
         let key = compute_cache_key(c0, c1, &self.community_cards, num_opp);
-        let idx = (key as usize) & EQUITY_CACHE_MASK;
+        let idx = cache_index(key);
         let (eq, hs, d) = EQUITY_CACHE.with(|cache| {
             let mut c = cache.borrow_mut();
             if c[idx].0 == key {
@@ -310,17 +341,25 @@ impl GameState {
                 pos_vec[2] = 1.0;
             }
         } else {
-            pos_vec[rel_pos.min(9)] = 1.0;
+            let pos = Position::for_seat_alive(player_idx, self.button_idx, &alive);
+            pos_vec[pos.to_slot()] = 1.0;
         }
         f.extend_from_slice(&pos_vec);
         f.push(num_alive as f32 / MAX_PLAYERS as f32);
         f.push(if num_alive == 2 { 1.0 } else { 0.0 });
 
         // 🟢 CÁC ĐẶC TRƯNG TOURNAMENT ICM BỔ SUNG (4 chiều):
-        // a. Đang ở vòng Bubble tranh Top 4 (5 người còn sống)
-        f.push(if num_alive == 5 { 1.0 } else { 0.0 });
-        // b. Đã lọt vào Top 4 có điểm (<= 4 người)
-        f.push(if num_alive <= 4 { 1.0 } else { 0.0 });
+        if self.is_cash_game {
+            // Cash / Lounge: không có Bubble hay ITM giải đấu
+            f.push(0.0);
+            f.push(0.0);
+        } else {
+            let bubble_alive = if self.num_players >= 9 { 6 } else { 5 };
+            // a. Đang ở vòng Bubble tranh ITM
+            f.push(if num_alive == bubble_alive { 1.0 } else { 0.0 });
+            // b. Đã lọt vào vùng có điểm (ITM)
+            f.push(if num_alive <= bubble_alive - 1 { 1.0 } else { 0.0 });
+        }
         // c. Xếp hạng stack của mình so với những người còn sống (0.0: nghèo nhất, 1.0: giàu nhất bàn)
         let my_chips = me.stack + me.current_bet;
         let smaller_stacks_count = alive.iter().filter(|&&seat| {
@@ -526,4 +565,56 @@ pub fn chen_score(c0: Card, c1: Card) -> f32 {
         }
     }
     ((s + 1.0) / 21.0).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::environment::engine::Environment;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    #[test]
+    fn test_canonical_positions_all_table_sizes() {
+        for n in 3..=10 {
+            let alive: Vec<usize> = (0..n).collect();
+            let mut seen_slots = [false; 10];
+            for seat in 0..n {
+                let pos = Position::for_seat_alive(seat, 0, &alive);
+                let slot = pos.to_slot();
+                assert!(!seen_slots[slot], "Duplicate slot {:?} at n={}", pos, n);
+                seen_slots[slot] = true;
+            }
+            assert_eq!(Position::for_seat_alive(0, 0, &alive), Position::BTN);
+            assert_eq!(Position::for_seat_alive(1, 0, &alive), Position::SB);
+            assert_eq!(Position::for_seat_alive(2, 0, &alive), Position::BB);
+            if n >= 4 {
+                assert_eq!(Position::for_seat_alive(n - 1, 0, &alive), Position::CO);
+                let mut rng = StdRng::seed_from_u64(123);
+                let mut env = Environment::new(n, &vec![5000; n], 100, 50, 0);
+                env.reset_hand(&mut rng, 0);
+                let f_co = env.state.encode_features(n - 1);
+                assert_eq!(f_co[109 + 9], 1.0, "CO must map to slot 9 (f[118]) for n={}", n);
+            }
+            if n >= 5 {
+                assert_eq!(Position::for_seat_alive(n - 2, 0, &alive), Position::HJ);
+                let mut rng = StdRng::seed_from_u64(124);
+                let mut env = Environment::new(n, &vec![5000; n], 100, 50, 0);
+                env.reset_hand(&mut rng, 0);
+                let f_hj = env.state.encode_features(n - 2);
+                assert_eq!(f_hj[109 + 8], 1.0, "HJ must map to slot 8 (f[117]) for n={}", n);
+            }
+        }
+    }
+
+    #[test]
+    fn test_cash_game_zeroes_icm_bubble_features() {
+        let mut rng = StdRng::seed_from_u64(99);
+        let mut env = Environment::new(5, &vec![5000; 5], 100, 50, 0);
+        env.state.is_cash_game = true;
+        env.reset_hand(&mut rng, 0);
+        let f = env.state.encode_features(env.state.current_player_idx);
+        assert_eq!(f[121], 0.0, "Cash game must zero out is_bubble feature");
+        assert_eq!(f[122], 0.0, "Cash game must zero out is_itm feature");
+    }
 }

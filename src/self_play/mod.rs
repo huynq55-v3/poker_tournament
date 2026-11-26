@@ -101,7 +101,7 @@ impl SelfPlayEngine {
                             break;
                         }
 
-                        let num_players = rand::Rng::gen_range(&mut rng, 2..=8);
+                        let num_players = rand::Rng::gen_range(&mut rng, 2..=crate::environment::MAX_PLAYERS);
                         let button_idx = rand::Rng::gen_range(&mut rng, 0..num_players);
                         let stacks = TournamentStackSampler::sample_dirichlet_stacks(&mut rng, num_players, bb_size);
 

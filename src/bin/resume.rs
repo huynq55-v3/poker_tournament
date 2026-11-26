@@ -99,7 +99,7 @@ fn print_help() {
     println!("  --iters <N>           Số iteration cần train tiếp (mặc định: 500)");
     println!();
     println!("Tùy chọn môi trường huấn luyện:");
-    println!("  --players <N>         Quy mô bàn: 6 hoặc 8 (mặc định: 8)");
+    println!("  --players <N>         Quy mô bàn: 6, 8 hoặc 10 (mặc định: 8)");
     println!("  --stack <N>           Stack BB khởi điểm mỗi người (mặc định: 50 BB)");
     println!("  --lr <F>              Tốc độ học Base Learning Rate (mặc định: 0.0005)");
     println!("  --traversals <N>      Số ván duyệt cây mỗi iter (mặc định: 250)");
@@ -252,13 +252,25 @@ fn main() {
 
     // Thiết lập Champion cơ sở để làm thước đo soán ngôi
     let champ_file = champ_arg.unwrap_or_else(|| from_adv.clone());
-    let mut current_champion_net: MLP = if std::path::Path::new(&champ_file).exists() && champ_file != from_adv {
-        println!("   👑 Nạp Champion đối đầu độc lập từ: {}", champ_file);
-        MLP::load_from_file(&champ_file).unwrap_or_else(|_| trainer.advantage_net.read().unwrap().clone())
-    } else {
-        println!("   👑 Dùng mô hình hiện tại làm mốc Champion xuất phát để Challenger soán ngôi.");
-        trainer.advantage_net.read().unwrap().clone()
-    };
+    let (mut current_champion_net, mut current_champion_strat): (MLP, Option<MLP>) =
+        if std::path::Path::new(&champ_file).exists() && champ_file != from_adv {
+            println!("   👑 Nạp Champion đối đầu độc lập từ: {}", champ_file);
+            let net = MLP::load_from_file(&champ_file)
+                .unwrap_or_else(|_| trainer.advantage_net.read().unwrap().clone());
+            let champ_strat_path = guess_strategy_path(&champ_file);
+            let s = MLP::load_from_file(&champ_strat_path)
+                .ok()
+                .filter(|sm| sm.layer_dims() == net.layer_dims());
+            (net, s)
+        } else {
+            println!("   👑 Dùng mô hình hiện tại làm mốc Champion xuất phát để Challenger soán ngôi.");
+            let s = if trainer.strategy_trained {
+                trainer.strategy_net.read().ok().map(|n| (*n).clone())
+            } else {
+                None
+            };
+            (trainer.advantage_net.read().unwrap().clone(), s)
+        };
 
     let total = start_iter + iters;
     let t_all = Instant::now();
@@ -291,14 +303,9 @@ fn main() {
         if !warm && (k % bench_every == 0 || global % bench_every == 0) {
             let bt = Instant::now();
             let challenger_policy = trainer.get_policy(false);
-            let champion_strat = if std::path::Path::new(&best_strat_path).exists() {
-                MLP::load_from_file(&best_strat_path).ok()
-            } else {
-                None
-            };
             let champion_policy = DeepCFRPolicy::with_strategy(
                 Arc::new(RwLock::new(current_champion_net.clone())),
-                champion_strat,
+                current_champion_strat.clone(),
                 false,
             );
 
@@ -335,6 +342,11 @@ fn main() {
                         tour_res.challenger_avg_rank, tour_res.champion_avg_rank, best_path
                     );
                     current_champion_net = trainer.advantage_net.read().unwrap().clone();
+                    current_champion_strat = if trainer.strategy_trained {
+                        trainer.strategy_net.read().ok().map(|n| (*n).clone())
+                    } else {
+                        None
+                    };
                     let _ = trainer.save_models(&best_path, &best_strat_path);
                     if out != "deep_cfr" {
                         println!("   🌟 Đã lưu Champion vào {} & {}", best_path, best_strat_path);
@@ -370,6 +382,11 @@ fn main() {
                         arena_res.challenger_bb_per_100, best_path
                     );
                     current_champion_net = trainer.advantage_net.read().unwrap().clone();
+                    current_champion_strat = if trainer.strategy_trained {
+                        trainer.strategy_net.read().ok().map(|n| (*n).clone())
+                    } else {
+                        None
+                    };
                     let _ = trainer.save_models(&best_path, &best_strat_path);
                 } else {
                     println!("   🛡️  Champion giữ vững ngôi vương. Challenger chưa đủ cách biệt thống kê để soán ngôi.");
@@ -419,7 +436,7 @@ fn main() {
 
     if use_icm {
         println!("   🏆 Đang kiểm tra 500 giải đấu Tournament {}-max (50 BB khởi điểm)...", max_players);
-        let dummy_champ = DeepCFRPolicy::with_strategy(Arc::new(RwLock::new(current_champion_net.clone())), strat, false);
+        let dummy_champ = DeepCFRPolicy::with_strategy(Arc::new(RwLock::new(current_champion_net.clone())), current_champion_strat.clone(), false);
         let final_tour = evaluate_against_champion_tournament(
             best_policy.as_ref(),
             &dummy_champ,
@@ -458,11 +475,11 @@ fn main() {
         })
         .collect();
 
-    let mut finishes = [0usize; 8];
+    let mut finishes = [0usize; poker_tournament::environment::MAX_PLAYERS];
     let mut total_hands = 0usize;
 
     for &(rank, hands) in &results {
-        if rank >= 1 && rank <= 8 {
+        if rank >= 1 && rank <= max_players {
             finishes[rank - 1] += 1;
         }
         total_hands += hands;
@@ -471,13 +488,18 @@ fn main() {
     let elapsed = t_sim.elapsed().as_secs_f64();
     let itm = finishes[0] + finishes[1] + finishes[2];
     let avg_rank: f64 = finishes.iter().enumerate().map(|(i, &c)| (i + 1) as f64 * c as f64).sum::<f64>() / num_sim_tours as f64;
+    let early_bust = if max_players >= 2 {
+        finishes[max_players - 2] + finishes[max_players - 1]
+    } else {
+        0
+    };
 
     println!("   🏆 Tổng số giải đấu hoàn tất: {} giải trong {:.2}s ({:.1} tours/sec)", num_sim_tours, elapsed, num_sim_tours as f64 / elapsed);
-    println!("   🥇 Vô địch (Top 1)        : {:4} lần ({:5.1}%) [Kỳ vọng ngẫu nhiên: 12.5%]", finishes[0], finishes[0] as f64 * 100.0 / num_sim_tours as f64);
+    println!("   🥇 Vô địch (Top 1)        : {:4} lần ({:5.1}%) [Kỳ vọng ngẫu nhiên: {:.1}%]", finishes[0], finishes[0] as f64 * 100.0 / num_sim_tours as f64, 100.0 / max_players as f64);
     println!("   🥈 Á quân  (Top 2)        : {:4} lần ({:5.1}%)", finishes[1], finishes[1] as f64 * 100.0 / num_sim_tours as f64);
     println!("   🥉 Hạng 3   (Top 3)        : {:4} lần ({:5.1}%)", finishes[2], finishes[2] as f64 * 100.0 / num_sim_tours as f64);
     println!("   💰 Tỷ lệ vào tiền (ITM Top 3): {:4} lần ({:5.1}%)", itm, itm as f64 * 100.0 / num_sim_tours as f64);
-    println!("   💀 Bị loại sớm (Hạng 7-8)  : {:4} lần ({:5.1}%)", finishes[6] + finishes[7], (finishes[6] + finishes[7]) as f64 * 100.0 / num_sim_tours as f64);
+    println!("   💀 Bị loại sớm (Hạng {}-{})  : {:4} lần ({:5.1}%)", max_players - 1, max_players, early_bust, early_bust as f64 * 100.0 / num_sim_tours as f64);
     println!("   📊 Thứ hạng trung bình     : {:.2} / {}", avg_rank, max_players);
     println!("   ⏱️  Số ván trung bình/tour  : {:.1} ván", total_hands as f64 / num_sim_tours as f64);
     println!("\n📈 Lịch sử benchmark đã lưu tại: {}", csv_path);

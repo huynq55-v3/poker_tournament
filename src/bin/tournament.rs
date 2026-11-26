@@ -600,7 +600,7 @@ pub fn process_game_update(
         for (pid, sval) in pgs_obj {
             let entry = state.players.entry(pid.clone()).or_insert_with(|| PlayerTracker { id: pid.clone(), ..Default::default() });
             if let Some(st) = sval.as_str() {
-                if st == "fold" || st == "quit" || st == "stoodUp" {
+                if st == "fold" || st == "quit" || st == "stoodUp" || st == "away" || st == "sittingOut" || st == "quitted" {
                     entry.is_folded = true;
                 } else if st == "allIn" {
                     entry.is_folded = false;
@@ -1439,6 +1439,11 @@ fn main() {
     if is_lounge {
         IS_CASH_GAME.store(true, std::sync::atomic::Ordering::Relaxed);
         println!("🎰 Chế độ: LOUNGE / REAL CHIP CASH GAME (Chuẩn hóa Deep-Stack 12-300+ BB)");
+        if custom_model.is_none() && !std::path::Path::new("deep_cfr_lounge_model.json").exists() {
+            println!("⚠️  [CẢNH BÁO] Chưa tìm thấy 'deep_cfr_lounge_model.json'! Khuyên dùng:");
+            println!("    1. Train Lounge: cargo run --release --bin train_lounge -- --players 10 --fresh");
+            println!("    2. Play Lounge : cargo run --release --bin play_lounge -- --game-url \"{}\"", target_url);
+        }
     }
     set_target_game(&target_url);
     println!("🎮 Target Game URL: {}", target_url);

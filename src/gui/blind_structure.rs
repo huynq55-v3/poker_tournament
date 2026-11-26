@@ -48,7 +48,7 @@ impl TournamentBlindSchedule {
             })
             .collect();
 
-        let hands_per_level = num_seats.clamp(2, 8); // Mặc định: 1 vòng cược quanh bàn (8 ván cho bàn 8 người)
+        let hands_per_level = num_seats.clamp(2, crate::environment::MAX_PLAYERS); // Mặc định: 1 vòng cược quanh bàn (tối đa 10 ván cho 10-Max)
 
         Self {
             levels,

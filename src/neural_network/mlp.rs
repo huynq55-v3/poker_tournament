@@ -386,12 +386,31 @@ impl MLP {
         };
 
         let scale = 1.0 / n as f32;
+        let mut norm_sq = 0.0f32;
         for (l, layer) in self.layers.iter_mut().enumerate() {
             for (dst, src) in layer.grad_weights.iter_mut().zip(&grads.w[l]) {
-                *dst = *src * scale;
+                let g = *src * scale;
+                *dst = g;
+                norm_sq += g * g;
             }
             for (dst, src) in layer.grad_bias.iter_mut().zip(&grads.b[l]) {
-                *dst = *src * scale;
+                let g = *src * scale;
+                *dst = g;
+                norm_sq += g * g;
+            }
+        }
+
+        const MAX_GRAD_NORM: f32 = 5.0;
+        let grad_norm = norm_sq.sqrt();
+        if grad_norm > MAX_GRAD_NORM && grad_norm.is_finite() {
+            let clip_scale = MAX_GRAD_NORM / grad_norm;
+            for layer in &mut self.layers {
+                for g in &mut layer.grad_weights {
+                    *g *= clip_scale;
+                }
+                for g in &mut layer.grad_bias {
+                    *g *= clip_scale;
+                }
             }
         }
 

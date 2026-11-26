@@ -6,30 +6,54 @@ use crate::gui::blind_structure::TournamentBlindSchedule;
 use crate::neural_network::MLP;
 use crate::poker_core::card::{Card, Suit};
 use crate::poker_core::evaluator::evaluate_7_cards;
+use crate::sampler::TournamentStackSampler;
 use crate::self_play::Policy;
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Shape, Stroke, Vec2};
-use rand::thread_rng;
+use rand::{thread_rng, Rng};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 const ADV_MODEL_PATH: &str = "deep_cfr_model.json";
 const STRAT_MODEL_PATH: &str = "deep_cfr_strategy.json";
+const LOUNGE_ADV_MODEL_PATH: &str = "deep_cfr_lounge_model.json";
+const LOUNGE_STRAT_MODEL_PATH: &str = "deep_cfr_lounge_strategy.json";
 
 fn new_untrained_net() -> MLP {
-    MLP::new(&[FEATURE_DIM, 256, 256, 128, NUM_ACTIONS])
+    MLP::new(&[FEATURE_DIM, 256, 256, 256, NUM_ACTIONS])
 }
 
-fn load_models() -> (MLP, Option<MLP>, String) {
-    let adv = match MLP::load_from_file(ADV_MODEL_PATH) {
-        Ok(mlp) if mlp.input_dim() == FEATURE_DIM => mlp,
-        _ => new_untrained_net(),
-    };
-    let strat = MLP::load_from_file(STRAT_MODEL_PATH).ok();
-    let status = if strat.is_some() {
-        "🟢 Deep CFR Strategy Net + Advantage Net Active".to_string()
+fn load_models_for_mode(is_lounge: bool) -> (MLP, Option<MLP>, String) {
+    let (adv_path, strat_path, mode_label) = if is_lounge {
+        (LOUNGE_ADV_MODEL_PATH, LOUNGE_STRAT_MODEL_PATH, "Lounge Cash")
     } else {
-        "🟡 Advantage Net Active (Strategy Net not found)".to_string()
+        (ADV_MODEL_PATH, STRAT_MODEL_PATH, "Tournament")
+    };
+
+    let adv = match MLP::load_from_file(adv_path) {
+        Ok(mlp) if mlp.input_dim() == FEATURE_DIM => mlp,
+        Ok(mlp) => {
+            return (
+                new_untrained_net(),
+                None,
+                format!("🔴 {} dim mismatch ({} != {})", mode_label, mlp.input_dim(), FEATURE_DIM),
+            );
+        }
+        Err(_) => {
+            return (
+                new_untrained_net(),
+                None,
+                format!("🟡 Untrained {} Net ({} missing)", mode_label, adv_path),
+            );
+        }
+    };
+    let strat = MLP::load_from_file(strat_path)
+        .ok()
+        .filter(|s| s.input_dim() == FEATURE_DIM);
+    let status = if strat.is_some() {
+        format!("🟢 {} Strategy + Advantage Net Active", mode_label)
+    } else {
+        format!("🟡 {} Advantage Net Active (No Strategy Net)", mode_label)
     };
     (adv, strat, status)
 }
@@ -57,7 +81,7 @@ fn load_model_from_path(path: &std::path::Path) -> Result<(MLP, Option<MLP>, Str
     }
 }
 
-/// Giao diện giải đấu Poker phong cách PokerNow (Purple Oval Table + Neon Chips + Dynamic Plates)
+/// Giao diện bàn Poker phong cách PokerNow (Tournament & Lounge Cash 2-10 Max)
 pub struct PokerNowApp {
     pub env: Environment,
     pub policy: DeepCFRPolicy,
@@ -76,6 +100,7 @@ pub struct PokerNowApp {
     pub button_idx: usize,
     pub hand_number: u32,
     pub tournament_over: bool,
+    pub is_lounge_mode: bool,
     pub winner_announcement: Option<String>,
     pub eliminated_logged: Vec<bool>,
     pub hero_bet_slider_bb: f32,
@@ -86,25 +111,42 @@ pub struct PokerNowApp {
 
 impl PokerNowApp {
     pub fn new(num_seats: usize) -> Self {
+        Self::new_with_mode(num_seats, false)
+    }
+
+    pub fn new_with_mode(num_seats: usize, is_lounge_mode: bool) -> Self {
+        let _ = crate::equity::preflop_table();
         let seats = num_seats.clamp(2, crate::environment::MAX_PLAYERS);
         let schedule = TournamentBlindSchedule::new(seats);
         let bl = schedule.current_level();
 
-        let initial_stack = 50 * bl.bb; // 50 BB = 5,000 chips
-        let stacks = vec![initial_stack; seats];
+        let mut rng = thread_rng();
+        let stacks = if is_lounge_mode {
+            TournamentStackSampler::sample_lounge_stacks(&mut rng, seats, bl.bb)
+        } else {
+            vec![50 * bl.bb; seats]
+        };
         let button_idx = 0;
         let mut env = Environment::new(seats, &stacks, bl.bb, bl.sb, button_idx);
-        let mut rng = thread_rng();
+        env.state.is_cash_game = is_lounge_mode;
         env.reset_hand(&mut rng, button_idx);
 
-        let (adv_net, strat_net, model_status) = load_models();
+        let (adv_net, strat_net, model_status) = load_models_for_mode(is_lounge_mode);
         let policy = DeepCFRPolicy::with_strategy(Arc::new(RwLock::new(adv_net)), strat_net, true);
 
         let mut action_logs = Vec::new();
-        action_logs.push(format!(
-            "🏆 Tournament Started: {} seats, {} chips ({:.0} BB), Blinds: {}/{}",
-            seats, initial_stack, initial_stack as f32 / bl.bb as f32, bl.sb, bl.bb
-        ));
+        if is_lounge_mode {
+            action_logs.push(format!(
+                "🎰 Lounge Cash Started: {} seats (12-300 BB), Blinds: {}/{}",
+                seats, bl.sb, bl.bb
+            ));
+        } else {
+            let initial_stack = 50 * bl.bb;
+            action_logs.push(format!(
+                "🏆 Tournament Started: {} seats, {} chips ({:.0} BB), Blinds: {}/{}",
+                seats, initial_stack, initial_stack as f32 / bl.bb as f32, bl.sb, bl.bb
+            ));
+        }
 
         let mut app = Self {
             env,
@@ -124,6 +166,7 @@ impl PokerNowApp {
             button_idx,
             hand_number: 1,
             tournament_over: false,
+            is_lounge_mode,
             winner_announcement: None,
             eliminated_logged: vec![false; seats],
             hero_bet_slider_bb: 2.0,
@@ -163,13 +206,27 @@ impl PokerNowApp {
     }
 
     pub fn start_new_tournament(&mut self, seats: usize) {
+        self.start_new_game(seats, false);
+    }
+
+    pub fn start_new_game(&mut self, seats: usize, is_lounge: bool) {
+        let mode_changed = self.is_lounge_mode != is_lounge;
+        self.is_lounge_mode = is_lounge;
         self.num_seats = seats.clamp(2, crate::environment::MAX_PLAYERS);
         self.selected_num_seats = self.num_seats;
         self.blind_schedule = TournamentBlindSchedule::new(self.num_seats);
         let current_blind = self.blind_schedule.current_level();
 
-        let initial_stack = 50 * current_blind.bb;
-        let stacks = vec![initial_stack; self.num_seats];
+        if mode_changed {
+            self.reload_model();
+        }
+
+        let mut rng = thread_rng();
+        let stacks = if is_lounge {
+            TournamentStackSampler::sample_lounge_stacks(&mut rng, self.num_seats, current_blind.bb)
+        } else {
+            vec![50 * current_blind.bb; self.num_seats]
+        };
         self.button_idx = 0;
         self.hand_number = 1;
         self.tournament_over = false;
@@ -178,14 +235,22 @@ impl PokerNowApp {
         self.hero_bet_slider_bb = 2.0;
 
         self.env = Environment::new(self.num_seats, &stacks, current_blind.bb, current_blind.sb, self.button_idx);
-        let mut rng = thread_rng();
+        self.env.state.is_cash_game = is_lounge;
         self.env.reset_hand(&mut rng, self.button_idx);
 
         self.action_logs.clear();
-        self.action_logs.push(format!(
-            "🏆 Tournament Started: {} seats, {} chips ({:.0} BB), Blinds: {}/{}",
-            self.num_seats, initial_stack, initial_stack as f32 / current_blind.bb as f32, current_blind.sb, current_blind.bb
-        ));
+        if is_lounge {
+            self.action_logs.push(format!(
+                "🎰 Lounge Cash Started: {} seats (12-300 BB), Blinds: {}/{}",
+                self.num_seats, current_blind.sb, current_blind.bb
+            ));
+        } else {
+            let initial_stack = 50 * current_blind.bb;
+            self.action_logs.push(format!(
+                "🏆 Tournament Started: {} seats, {} chips ({:.0} BB), Blinds: {}/{}",
+                self.num_seats, initial_stack, initial_stack as f32 / current_blind.bb as f32, current_blind.sb, current_blind.bb
+            ));
+        }
         self.begin_hand();
     }
 
@@ -225,6 +290,35 @@ impl PokerNowApp {
     }
 
     fn start_next_hand(&mut self) {
+        if self.is_lounge_mode {
+            let bb = self.env.state.bb_size;
+            let mut rng = thread_rng();
+            for i in 0..self.num_seats {
+                if self.env.state.players[i].stack < 12 * bb {
+                    let topup = if i == self.hero_seat {
+                        100 * bb
+                    } else {
+                        rng.gen_range(40..=100) * bb
+                    };
+                    self.env.state.players[i].stack = topup;
+                    self.eliminated_logged[i] = false;
+                    self.action_logs.push(format!(
+                        "💵 [Rebuy] {} topped up to {} chips ({:.0} BB)",
+                        self.player_name(i),
+                        topup,
+                        topup as f32 / bb as f32
+                    ));
+                }
+            }
+            self.hand_number += 1;
+            self.button_idx = (self.env.state.button_idx + 1) % self.num_seats;
+            self.hero_bet_slider_bb = 2.0;
+            self.env.state.is_cash_game = true;
+            self.env.reset_hand(&mut rng, self.button_idx);
+            self.begin_hand();
+            return;
+        }
+
         let surviving = self.surviving_players();
         if surviving.len() <= 1 {
             self.tournament_over = true;
@@ -337,6 +431,18 @@ impl PokerNowApp {
         let announcement = format!("Hand ended. In hand: {}", remaining.join(", "));
         self.action_logs.push(announcement.clone());
 
+        if self.is_lounge_mode {
+            for i in 0..self.num_seats {
+                let p = &self.env.state.players[i];
+                if p.stack == 0 {
+                    let name = self.player_name(i);
+                    self.action_logs.push(format!("💸 {} busted (auto-rebuy next hand)", name));
+                }
+            }
+            self.winner_announcement = Some(announcement);
+            return;
+        }
+
         for i in 0..self.num_seats {
             let p = &mut self.env.state.players[i];
             if p.stack == 0 && !self.eliminated_logged[i] {
@@ -370,7 +476,7 @@ impl PokerNowApp {
     }
 
     pub fn reload_model(&mut self) {
-        let (adv, strat, status) = load_models();
+        let (adv, strat, status) = load_models_for_mode(self.is_lounge_mode);
         if let Ok(mut net) = self.policy.advantage_net.write() {
             *net = adv;
         }
@@ -387,6 +493,8 @@ impl PokerNowApp {
         }
 
         self.is_training.store(true, Ordering::SeqCst);
+        let is_lounge = self.is_lounge_mode;
+        let max_players = self.num_seats;
         let is_training_flag = Arc::clone(&self.is_training);
         let progress_msg = Arc::clone(&self.train_progress_msg);
         let target_adv = Arc::clone(&self.policy.advantage_net);
@@ -394,7 +502,13 @@ impl PokerNowApp {
 
         std::thread::spawn(move || {
             let mut rng = thread_rng();
-            let mut trainer = DeepCFRTrainer::new(FEATURE_DIM, &[256, 256, 128], 30_000, true);
+            let mut trainer = DeepCFRTrainer::new(FEATURE_DIM, &[256, 256, 256], 30_000, !is_lounge);
+            trainer.is_cash_game = is_lounge;
+            trainer.use_icm = !is_lounge;
+            trainer.max_players = max_players;
+            if is_lounge {
+                trainer.stack_bb = 0;
+            }
             let total_iters = 10;
 
             for iter in 1..=total_iters {
@@ -585,37 +699,60 @@ impl eframe::App for PokerNowApp {
                     self.selected_num_seats -= 1;
                 }
                 ui.label(RichText::new(format!("{}", self.selected_num_seats)).size(15.0).color(Color32::from_rgb(120, 210, 255)).strong());
-                if ui.button("+").clicked() && self.selected_num_seats < 8 {
+                if ui.button("+").clicked() && self.selected_num_seats < crate::environment::MAX_PLAYERS {
                     self.selected_num_seats += 1;
                 }
 
-                if ui.button(RichText::new("New Tournament").color(Color32::from_rgb(100, 230, 150)).strong()).clicked() {
-                    self.start_new_tournament(self.selected_num_seats);
+                let tour_btn = RichText::new("Tour")
+                    .color(if !self.is_lounge_mode { Color32::from_rgb(255, 215, 0) } else { Color32::GRAY })
+                    .strong();
+                if ui.button(tour_btn).clicked() && self.is_lounge_mode {
+                    self.start_new_game(self.selected_num_seats, false);
+                }
+                let lounge_btn = RichText::new("Lounge")
+                    .color(if self.is_lounge_mode { Color32::from_rgb(100, 240, 180) } else { Color32::GRAY })
+                    .strong();
+                if ui.button(lounge_btn).clicked() && !self.is_lounge_mode {
+                    self.start_new_game(self.selected_num_seats, true);
+                }
+
+                let new_label = if self.is_lounge_mode { "New Cash Table" } else { "New Tournament" };
+                if ui.button(RichText::new(new_label).color(Color32::from_rgb(100, 230, 150)).strong()).clicked() {
+                    self.start_new_game(self.selected_num_seats, self.is_lounge_mode);
                 }
 
                 ui.separator();
                 let bl = self.blind_schedule.current_level();
-                ui.label(RichText::new(format!("Level {}", bl.level_num)).color(Color32::WHITE).strong());
-                ui.label(RichText::new(format!("Blinds: {}/{}", bl.sb, bl.bb)).color(Color32::from_rgb(120, 245, 120)).strong());
+                if self.is_lounge_mode {
+                    ui.label(RichText::new("LOUNGE CASH").color(Color32::from_rgb(100, 240, 180)).strong());
+                    ui.label(RichText::new(format!("Blinds: {}/{} (12-300 BB | Auto-Rebuy)", bl.sb, bl.bb)).color(Color32::from_rgb(120, 245, 120)).strong());
+                } else {
+                    ui.label(RichText::new(format!("Level {}", bl.level_num)).color(Color32::WHITE).strong());
+                    ui.label(RichText::new(format!("Blinds: {}/{}", bl.sb, bl.bb)).color(Color32::from_rgb(120, 245, 120)).strong());
 
-                let progress = self.blind_schedule.formatted_hand_progress();
-                ui.label(RichText::new(progress).color(Color32::from_rgb(255, 180, 70)));
+                    let progress = self.blind_schedule.formatted_hand_progress();
+                    ui.label(RichText::new(progress).color(Color32::from_rgb(255, 180, 70)));
 
-                let alive_count = self.surviving_players().len();
-                ui.label(RichText::new(format!("(Alive: {}/{})", alive_count, self.num_seats)).color(Color32::from_rgb(180, 180, 180)));
+                    let alive_count = self.surviving_players().len();
+                    ui.label(RichText::new(format!("(Alive: {}/{})", alive_count, self.num_seats)).color(Color32::from_rgb(180, 180, 180)));
+                }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(if self.show_side_panel { "Hide GTO Panel" } else { "Show GTO Panel" }).clicked() {
                         self.show_side_panel = !self.show_side_panel;
                     }
 
-                    if ui.button("Next Blind").clicked() && self.blind_schedule.advance_level_manually() {
-                        let next_bl = self.blind_schedule.current_level();
-                        self.action_logs.push(format!("Blinds -> Level {}: {}/{}", next_bl.level_num, next_bl.sb, next_bl.bb));
-                    }
+                    if !self.is_lounge_mode {
+                        if ui.button("Next Blind").clicked() && self.blind_schedule.advance_level_manually() {
+                            let next_bl = self.blind_schedule.current_level();
+                            self.action_logs.push(format!("Blinds -> Level {}: {}/{}", next_bl.level_num, next_bl.sb, next_bl.bb));
+                        }
 
-                    let next_bl = self.blind_schedule.current_level();
-                    ui.label(RichText::new(format!("NEXT BLIND: {}/{} (Hand #{})", next_bl.sb, next_bl.bb, self.hand_number)).color(Color32::from_rgb(255, 110, 90)).size(12.0));
+                        let next_bl = self.blind_schedule.current_level();
+                        ui.label(RichText::new(format!("NEXT BLIND: {}/{} (Hand #{})", next_bl.sb, next_bl.bb, self.hand_number)).color(Color32::from_rgb(255, 110, 90)).size(12.0));
+                    } else {
+                        ui.label(RichText::new(format!("Hand #{}", self.hand_number)).color(Color32::from_rgb(180, 220, 255)).size(12.0));
+                    }
                 });
             });
             ui.add_space(3.0);
@@ -823,8 +960,8 @@ impl eframe::App for PokerNowApp {
                     if let Some(ann) = &self.winner_announcement {
                         ui.label(RichText::new(ann).color(Color32::from_rgb(255, 215, 0)).size(16.0).strong());
                     }
-                    if ui.button(RichText::new("Start New Tournament").size(15.0).color(Color32::GREEN).strong()).clicked() {
-                        self.start_new_tournament(self.selected_num_seats);
+                    if ui.button(RichText::new("Start New Game").size(15.0).color(Color32::GREEN).strong()).clicked() {
+                        self.start_new_game(self.selected_num_seats, self.is_lounge_mode);
                     }
                 } else if !self.hand_in_progress {
                     if ui.button(RichText::new("Deal Next Hand").size(16.0).strong().color(Color32::GREEN)).clicked() {

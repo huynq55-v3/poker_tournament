@@ -1,5 +1,5 @@
 //! Equity so với bài ngẫu nhiên của đối thủ + đặc trưng draw/board.
-//! - Preflop: bảng tính sẵn 169 lớp bài x 1..=7 đối thủ (tự build lần đầu, lưu preflop_equity.json)
+//! - Preflop: bảng tính sẵn 169 lớp bài x 1..=9 đối thủ (tự build lần đầu, lưu preflop_equity.json)
 //! - Postflop: Monte Carlo với RNG xác định theo bài (cùng tình huống -> cùng kết quả, GUI không bị nhấp nháy)
 
 use crate::poker_core::card::{Card, Rank, Suit};
@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 
 pub mod icm;
 pub const PREFLOP_CLASSES: usize = 169;
-pub const MAX_OPP: usize = 7;
+pub const MAX_OPP: usize = 9;
 pub const PREFLOP_TABLE_PATH: &str = "preflop_equity.json";
 const PREFLOP_BUILD_SAMPLES: usize = 8_000;
 /// Số mẫu Monte Carlo postflop. 64 ~ sai số ±6%; tăng lên 128+ nếu muốn chính xác hơn (chậm hơn).
@@ -181,21 +181,21 @@ pub struct PreflopEquityTable {
 }
 
 impl PreflopEquityTable {
-    /// Build song song bằng rayon (vài giây)
+    /// Build song song bằng private rayon thread pool (tránh deadlock với OnceLock khi gọi từ global pool)
     pub fn build(samples: usize) -> Self {
         let reps = class_representatives();
-        let rows: Vec<[f32; MAX_OPP]> = reps
-            .par_iter()
-            .enumerate()
-            .map(|(cls, hole)| {
-                let mut row = [0.0f32; MAX_OPP];
-                for n in 1..=MAX_OPP {
-                    let mut rng = XorShift::new(cls as u64 * 31 + n as u64 * 1_000_003 + 17);
-                    row[n - 1] = monte_carlo_equity(*hole, &[], n, samples, &mut rng);
-                }
-                row
-            })
-            .collect();
+        let compute_row = |(cls, hole): (usize, &[Card; 2])| {
+            let mut row = [0.0f32; MAX_OPP];
+            for n in 1..=MAX_OPP {
+                let mut rng = XorShift::new(cls as u64 * 31 + n as u64 * 1_000_003 + 17);
+                row[n - 1] = monte_carlo_equity(*hole, &[], n, samples, &mut rng);
+            }
+            row
+        };
+        let rows: Vec<[f32; MAX_OPP]> = match rayon::ThreadPoolBuilder::new().build() {
+            Ok(pool) => pool.install(|| reps.par_iter().enumerate().map(compute_row).collect()),
+            Err(_) => reps.iter().enumerate().map(compute_row).collect(),
+        };
         let data = rows.into_iter().flat_map(|r| r.into_iter()).collect();
         Self { samples, data }
     }
@@ -203,7 +203,16 @@ impl PreflopEquityTable {
     pub fn save(&self, path: &str) -> std::io::Result<()> {
         let json = serde_json::to_string(self)
             .map_err(std::io::Error::other)?;
-        std::fs::write(path, json)
+        let tmp = format!("{}.{}.tmp", path, std::process::id());
+        if let Err(e) = std::fs::write(&tmp, json) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn load(path: &str) -> Option<Self> {
@@ -408,6 +417,7 @@ mod tests {
 
     #[test]
     fn test_known_equities() {
+        assert_eq!(MAX_OPP, 9);
         let mut rng = XorShift::new(1);
         let aa = monte_carlo_equity([c("As"), c("Ah")], &[], 1, 20_000, &mut rng);
         assert!((aa - 0.85).abs() < 0.02, "AA vs 1 = {}", aa);
@@ -416,6 +426,8 @@ mod tests {
         // nhiều đối thủ thì equity giảm
         let aa6 = monte_carlo_equity([c("As"), c("Ah")], &[], 6, 10_000, &mut rng);
         assert!(aa6 < aa);
+        let aa9 = monte_carlo_equity([c("As"), c("Ah")], &[], 9, 10_000, &mut rng);
+        assert!(aa9 < aa6, "AA vs 9 ({}) should be < AA vs 6 ({})", aa9, aa6);
     }
 
     #[test]

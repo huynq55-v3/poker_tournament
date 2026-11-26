@@ -6,7 +6,8 @@ use crate::environment::action::Action;
 use crate::environment::engine::Environment;
 use crate::environment::state::Street;
 use crate::self_play::Policy;
-use rand::{thread_rng, Rng};
+use rand::rngs::StdRng;
+use rand::{thread_rng, Rng, SeedableRng};
 use rayon::prelude::*;
 
 const F_STREET_PREFLOP: usize = 125;
@@ -175,44 +176,62 @@ pub fn evaluate_against_champion_table(
     acc_to_result(&acc)
 }
 
-/// Đấu trường Cash Game thực chiến (mô phỏng bàn 6-max PokerStars có tích lũy chip và Deep Stack)
+/// Đấu trường Cash Game thực chiến (Duplicate Deals: cùng bài & stack đánh 2 lượt đảo ghế giảm mạnh variance)
 pub fn evaluate_against_champion_cash(
     challenger: &dyn Policy,
     champion: &dyn Policy,
     total_hands: usize,
     num_players: usize,
 ) -> ArenaMatchResult {
-    let opps = [champion];
-    let acc = (0..total_hands)
+    let n = num_players.clamp(2, crate::environment::MAX_PLAYERS);
+    let pairs = (total_hands / 2).max(1);
+    let acc = (0..pairs)
         .into_par_iter()
         .fold(ArenaAcc::default, |mut acc, _| {
             let mut rng = thread_rng();
-            play_arena_cash_hand(challenger, &opps, &mut acc, &mut rng, num_players);
+            let bb = 100u32;
+            let stacks = crate::sampler::TournamentStackSampler::sample_lounge_stacks(&mut rng, n, bb);
+            let button = rng.gen_range(0..n);
+            let seed: u64 = rng.gen();
+
+            let profit_a_bb = play_arena_cash_hand_seeded(challenger, champion, &stacks, button, seed, true, &mut acc);
+            let profit_b_bb = play_arena_cash_hand_seeded(challenger, champion, &stacks, button, seed, false, &mut acc);
+
+            // Tổng số ghế Challenger đã ngồi qua 2 ván (Hand A + Hand B) đúng bằng n
+            let pair_avg_bb = (profit_a_bb + profit_b_bb) / (n as f64);
+            acc.hands += 1;
+            acc.sum_diff += pair_avg_bb;
+            acc.sum_sq_diff += pair_avg_bb * pair_avg_bb;
             acc
         })
         .reduce(ArenaAcc::default, |a, b| a.merge(&b));
 
-    acc_to_result(&acc)
+    let mut res = acc_to_result(&acc);
+    res.hands = acc.hands * 2;
+    res
 }
 
-fn play_arena_cash_hand<R: Rng>(
+fn play_arena_cash_hand_seeded(
     challenger: &dyn Policy,
-    opponents: &[&dyn Policy],
+    champion: &dyn Policy,
+    stacks: &[u32],
+    button: usize,
+    seed: u64,
+    challenger_on_even: bool,
     acc: &mut ArenaAcc,
-    rng: &mut R,
-    num_players: usize,
-) {
+) -> f64 {
     let bb = 100u32;
     let sb = 50u32;
-    let n = num_players.clamp(2, crate::environment::MAX_PLAYERS);
-    let stacks = crate::sampler::TournamentStackSampler::sample_lounge_stacks(rng, n, bb);
-    let button = rng.gen_range(0..n);
+    let n = stacks.len().clamp(2, crate::environment::MAX_PLAYERS);
+    let mut deal_rng = StdRng::seed_from_u64(seed);
 
-    let mut env = Environment::new(n, &stacks, bb, sb, button);
+    let mut env = Environment::new(n, stacks, bb, sb, button);
     env.state.is_cash_game = true;
-    env.reset_hand(rng, button);
+    env.reset_hand(&mut deal_rng, button);
 
-    let challenger_seats: Vec<usize> = (0..n).filter(|&seat| seat % 2 == 0).collect();
+    let challenger_seats: Vec<usize> = (0..n)
+        .filter(|&seat| seat.is_multiple_of(2) == challenger_on_even)
+        .collect();
     let initial_team_chips: f64 = challenger_seats.iter().map(|&seat| stacks[seat] as f64).sum();
 
     let mut guard = 0;
@@ -225,7 +244,7 @@ fn play_arena_cash_hand<R: Rng>(
         }
 
         let feats = env.state.encode_features(cur);
-        let is_challenger = cur.is_multiple_of(2);
+        let is_challenger = cur.is_multiple_of(2) == challenger_on_even;
 
         let action = if is_challenger {
             let a = challenger.select_action(&feats, &mask);
@@ -242,8 +261,7 @@ fn play_arena_cash_hand<R: Rng>(
             }
             a
         } else {
-            let opp_idx = (cur / 2) % opponents.len();
-            opponents[opp_idx].select_action(&feats, &mask)
+            champion.select_action(&feats, &mask)
         };
 
         match env.step(action) {
@@ -257,12 +275,7 @@ fn play_arena_cash_hand<R: Rng>(
         .map(|&seat| env.state.players[seat].stack as f64)
         .sum();
 
-    let num_challengers = challenger_seats.len().max(1) as f64;
-    let diff_bb = (final_team_chips - initial_team_chips) / (bb as f64) / num_challengers;
-
-    acc.hands += 1;
-    acc.sum_diff += diff_bb;
-    acc.sum_sq_diff += diff_bb * diff_bb;
+    (final_team_chips - initial_team_chips) / (bb as f64)
 }
 
 /// Đấu trường Final Table Tournament (bàn 4-max, Chip-EV thuần, random stack Dirichlet bất đối xứng)
@@ -536,7 +549,7 @@ fn play_single_full_tournament<R: Rng>(
             break;
         }
 
-        let mut stacks_before = [0u32; 8];
+        let mut stacks_before = [0u32; crate::environment::MAX_PLAYERS];
         for &i in &alive_before {
             stacks_before[i] = env.state.players[i].stack;
         }
@@ -738,7 +751,7 @@ pub fn simulate_demo_tournament<R: Rng>(
             break;
         }
 
-        let mut stacks_before = [0u32; 8];
+        let mut stacks_before = [0u32; crate::environment::MAX_PLAYERS];
         for &i in &alive_before {
             stacks_before[i] = env.state.players[i].stack;
         }
@@ -850,7 +863,7 @@ pub fn simulate_hero_tournament<R: Rng>(
             break;
         }
 
-        let mut stacks_before = [0u32; 8];
+        let mut stacks_before = [0u32; crate::environment::MAX_PLAYERS];
         for &i in &alive_before {
             stacks_before[i] = env.state.players[i].stack;
         }
@@ -915,5 +928,41 @@ pub fn simulate_hero_tournament<R: Rng>(
     }
 
     (finish_ranks[0], hand_idx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::benchmark::TightAggressive;
+
+    #[test]
+    fn test_10max_tournament_arena_no_panic() {
+        let mut rng = thread_rng();
+        let res = evaluate_against_champion_tournament(&TightAggressive, &TightAggressive, 4, 20, 10);
+        assert_eq!(res.tournaments, 4);
+
+        let (rank, hands) = simulate_hero_tournament(&TightAggressive, 10, 20, &mut rng);
+        assert!((1..=10).contains(&rank));
+        assert!(hands > 0);
+    }
+
+    #[test]
+    fn test_cash_arena_duplicate_symmetry() {
+        let res_10 = evaluate_against_champion_cash(&TightAggressive, &TightAggressive, 200, 10);
+        assert_eq!(res_10.hands, 200);
+        assert!(
+            res_10.challenger_bb_per_100.abs() < 1e-6,
+            "Duplicate 10-max self-play must be exactly 0 bb/100, got {}",
+            res_10.challenger_bb_per_100
+        );
+
+        let res_9 = evaluate_against_champion_cash(&TightAggressive, &TightAggressive, 200, 9);
+        assert_eq!(res_9.hands, 200);
+        assert!(
+            res_9.challenger_bb_per_100.abs() < 1e-6,
+            "Duplicate 9-max (odd seats) self-play must be exactly 0 bb/100, got {}",
+            res_9.challenger_bb_per_100
+        );
+    }
 }
 

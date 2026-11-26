@@ -28,11 +28,10 @@ struct Payoff {
     start_stacks: Vec<f32>,
     use_icm: bool,
     bb: f32,
-    is_cash_game: bool,
 }
 
 impl Payoff {
-    fn new(start: &[f32], traverser: usize, bb: f32, use_icm: bool, is_cash_game: bool) -> Self {
+    fn new(start: &[f32], traverser: usize, bb: f32, use_icm: bool) -> Self {
         let start_stacks = start.to_vec();
         let use_icm_effective = use_icm && start_stacks.len() >= 2;
         let start_icm_ev = if use_icm_effective {
@@ -49,7 +48,6 @@ impl Payoff {
             start_stacks,
             use_icm: use_icm_effective,
             bb,
-            is_cash_game,
         }
     }
 
@@ -66,13 +64,7 @@ impl Payoff {
                 .map(|(i, _)| i)
                 .collect();
             if in_hand.contains(&self.traverser) {
-                let mut share = env.state.pot as f32 / in_hand.len() as f32;
-                // Trừ Rake nếu là Cash Game và ván bài đi tới Flop/Turn/River
-                // (No Flop No Drop: Ăn pot preflop không mất phế)
-                if self.is_cash_game && env.state.street != Street::Preflop {
-                    let rake = (share * 0.055).min(3.0 * self.bb);
-                    share -= rake;
-                }
+                let share = env.state.pot as f32 / in_hand.len() as f32;
                 my_end_chips += share;
             }
         }
@@ -241,21 +233,7 @@ fn traverse<R: Rng>(env: &mut Environment, ctx: &mut Ctx, pay: &Payoff, rng: &mu
             iteration_weight: ctx.weight,
         });
 
-        // 8% Smart Exploration: Thử nghiệm các nhánh BetSmall / BetPot33 / BetPot75 để mở khóa cây Postflop,
-        // tuyệt đối KHÔNG chọn bừa All-In hay Fold làm nhiễu TrashShove!
-        let a = if rng.gen_bool(0.08) {
-            if mask.is_valid(Action::BetSmall) && rng.gen_bool(0.35) {
-                Action::BetSmall
-            } else if mask.is_valid(Action::BetPot33) && rng.gen_bool(0.55) {
-                Action::BetPot33
-            } else if mask.is_valid(Action::BetPot75) {
-                Action::BetPot75
-            } else {
-                sample_action(&strat, &mask, rng)
-            }
-        } else {
-            sample_action(&strat, &mask, rng)
-        };
+        let a = sample_action(&strat, &mask, rng);
         step_and_continue(env, a, ctx, pay, rng, depth)
     }
 }
@@ -354,7 +332,9 @@ impl DeepCFRTrainer {
         self.iteration += 1;
 
         // Dọn dẹp các mẫu nhiễu thời kỳ đầu (Iter 1..11) đúng 1 lần tại Iter 25
-        if self.iteration == 25 {
+        if self.iteration == 25
+            && self.adv_memory.buffer.iter().any(|s| s.iteration_weight >= 12.0)
+        {
             self.adv_memory.buffer.retain(|s| s.iteration_weight >= 12.0);
             self.adv_memory.seen = self.adv_memory.buffer.len();
             self.strategy_memory.buffer.retain(|s| s.iteration_weight >= 12.0);
@@ -438,7 +418,7 @@ impl DeepCFRTrainer {
                         if env.state.street != Street::Showdown {
                             // MCCFR Chuẩn: Chọn ngẫu nhiên 1 người chơi còn sống làm Traverser duyệt cây ván này
                             let traverser = alive[trng.gen_range(0..alive.len())];
-                            let pay = Payoff::new(&start, traverser, env.state.bb_size as f32, use_icm, false);
+                            let pay = Payoff::new(&start, traverser, env.state.bb_size as f32, use_icm);
                             let mut branch = env.clone();
                             traverse(&mut branch, &mut ctx, &pay, &mut trng, 0);
 
@@ -503,11 +483,12 @@ impl DeepCFRTrainer {
                         } else {
                             8u32
                         };
+                        let clamped_max = max_p.clamp(2, 10);
                         let players = match depth {
-                            50 => max_p.clamp(6, 8),
-                            25 => trng.gen_range(5..=max_p.clamp(6, 8)),
-                            12 => trng.gen_range(3..=6.min(max_p)),
-                            _ => trng.gen_range(3..=max_p),
+                            50 => clamped_max,
+                            25 => trng.gen_range(5.min(clamped_max)..=clamped_max),
+                            12 => trng.gen_range(3.min(clamped_max)..=6.min(clamped_max).max(3.min(clamped_max))),
+                            _ => trng.gen_range(3.min(clamped_max)..=clamped_max),
                         };
                         (players, depth)
                     };
@@ -558,7 +539,7 @@ impl DeepCFRTrainer {
                         let mut env = Environment::new(n, &stacks, bb_size, sb_size, button);
                         env.state.is_cash_game = false;
                         env.reset_hand(&mut trng, button);
-                        let pay = Payoff::new(&start, t, bb_size as f32, use_icm, false);
+                        let pay = Payoff::new(&start, t, bb_size as f32, use_icm);
                         let mut branch = env.clone();
                         traverse(&mut branch, &mut ctx, &pay, &mut trng, 0);
                     }
@@ -574,30 +555,53 @@ impl DeepCFRTrainer {
                 .map(|_| {
                     let mut trng = rand::thread_rng();
                     let n = fixed.unwrap_or_else(|| {
-                        if max_p <= 4 {
+                        let mp = max_p.clamp(2, 10);
+                        if is_cash {
+                            if mp <= 2 {
+                                2
+                            } else if mp <= 6 {
+                                let r: f32 = trng.gen();
+                                if r < 0.15 {
+                                    2
+                                } else if r < 0.50 {
+                                    trng.gen_range(3..=mp.saturating_sub(1).max(3))
+                                } else {
+                                    mp
+                                }
+                            } else {
+                                let r: f32 = trng.gen();
+                                if r < 0.12 {
+                                    2
+                                } else if r < 0.40 {
+                                    trng.gen_range(3..=6)
+                                } else if r < 0.70 {
+                                    trng.gen_range(7..=mp)
+                                } else {
+                                    mp
+                                }
+                            }
+                        } else if mp <= 4 {
                             if trng.gen_bool(0.35) {
                                 2
                             } else if trng.gen_bool(0.25) {
                                 3
                             } else {
-                                max_p
+                                mp
                             }
-                        } else if max_p <= 6 {
+                        } else if mp <= 6 {
                             if trng.gen_bool(0.35) {
                                 2
                             } else if trng.gen_bool(0.45) {
-                                max_p
+                                mp
                             } else {
-                                trng.gen_range(3..=max_p.saturating_sub(1).max(3))
+                                trng.gen_range(3..=mp.saturating_sub(1).max(3))
                             }
+                        } else if trng.gen_bool(0.35) {
+                            2
+                        } else if trng.gen_bool(0.45) {
+                            trng.gen_range(7..=mp)
                         } else {
-                            if trng.gen_bool(0.35) {
-                                2
-                            } else if trng.gen_bool(0.45) {
-                                trng.gen_range(7..=max_p.min(10))
-                            } else {
-                                trng.gen_range(3..=6)
-                            }
+                            trng.gen_range(3..=6)
                         }
                     });
                     let button = trng.gen_range(0..n);
@@ -625,7 +629,7 @@ impl DeepCFRTrainer {
                             env.state.is_cash_game = true;
                         }
                         env.reset_hand(&mut trng, button);
-                        let pay = Payoff::new(&start, t, bb_size as f32, use_icm, is_cash);
+                        let pay = Payoff::new(&start, t, bb_size as f32, use_icm);
                         traverse(&mut env, &mut ctx, &pay, &mut trng, 0);
                     }
                     (ctx.adv_out, ctx.strat_out)
@@ -650,7 +654,7 @@ impl DeepCFRTrainer {
             train_steps_per_iter
         };
 
-        // Train Advantage Network (Huber Loss)
+        // Train Advantage Network (MSE Loss - hội tụ đúng EV Mean theo Deep CFR chuẩn)
         let mut adv_loss = 0.0f32;
         if self.adv_memory.len() >= batch_size && effective_steps > 0 {
             for _ in 0..effective_steps {
@@ -658,7 +662,7 @@ impl DeepCFRTrainer {
                 adv_loss += Self::train_from_batch(
                     &self.advantage_net,
                     batch,
-                    LossType::Huber,
+                    LossType::MSE,
                     effective_lr,
                     self.weight_decay,
                 );

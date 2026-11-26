@@ -588,7 +588,7 @@ impl eframe::App for PokerGuiApp {
                     self.selected_num_seats -= 1;
                 }
                 ui.label(RichText::new(format!("{}", self.selected_num_seats)).size(16.0).color(Color32::from_rgb(100, 200, 255)).strong());
-                if ui.button("+").clicked() && self.selected_num_seats < 8 {
+                if ui.button("+").clicked() && self.selected_num_seats < crate::environment::MAX_PLAYERS {
                     self.selected_num_seats += 1;
                 }
 

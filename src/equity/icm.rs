@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn test_icm_all_table_sizes_zero_sum() {
-        for n in 2..=8 {
+        for n in 2..=10 {
             let payouts = get_sng_payouts(n);
             assert_eq!(payouts.len(), n);
             let payout_sum: f32 = payouts.iter().sum();

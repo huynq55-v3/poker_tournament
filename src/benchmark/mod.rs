@@ -47,8 +47,11 @@ const F_MAX_SUIT_BOARD: usize = 183;
 const F_BOARD_HIGH: usize = 184;
 #[allow(dead_code)]
 const F_FACING_RAISE: usize = 185;
-#[allow(dead_code)]
 const F_RELATIVE_BET_SIZE: usize = 186;
+const F_STREET_AGGR: usize = 169;
+
+const CAT_ONE_PAIR: f32 = 0.20; // HandCategory::OnePair = 2/9 = 0.222
+const CAT_TWO_PAIR: f32 = 0.31; // HandCategory::TwoPair = 3/9 = 0.333
 
 /// Bộ sinh số giả ngẫu nhiên thuần túy (Deterministic Randomizer) từ đặc trưng ván bài
 /// giúp bot thực hiện các chiến thuật hỗn hợp (GTO Mixing / Trapping) mà không làm mất tính tái lập.
@@ -63,7 +66,7 @@ fn pseudo_rand(f: &[f32]) -> f32 {
 #[inline(always)]
 fn is_facing_real_bet(f: &[f32]) -> bool {
     if f[F_STREET_PREFLOP] > 0.5 {
-        f[F_TO_CALL_NORM] > 0.055
+        (f[F_TO_CALL_NORM] > 0.001 && f[F_STREET_AGGR] >= 0.15) || f[F_TO_CALL_NORM] > 0.055
     } else {
         f[F_TO_CALL_NORM] > 0.001
     }
@@ -182,7 +185,7 @@ impl Policy for TightAggressive {
         let pot_odds = f[F_POT_ODDS];
         let facing = is_facing_real_bet(f);
         let chen = f[F_HAND_STRENGTH]; // Điểm Chen ở Preflop (0..1)
-        let cat = f[F_HAND_CAT];       // 0.0 = High Card, 1/9 = One Pair, 2/9 = Two Pair, 3/9 = Trips...
+        let cat = f[F_HAND_CAT];       // 1/9 = High Card, 2/9 = One Pair, 3/9 = Two Pair, 4/9 = Trips...
         let is_preflop = f[F_STREET_PREFLOP] > 0.5;
         let is_wet_board = f[F_MAX_SUIT_BOARD] >= 0.60 || f[F_STRAIGHT_DRAW] > 0.5;
         let is_dry_paired = f[F_PAIRED_BOARD] > 0.5 && f[F_MAX_SUIT_BOARD] <= 0.40;
@@ -204,7 +207,7 @@ impl Policy for TightAggressive {
         }
 
         // 2. Pot Commitment: Đã bỏ nhiều chip vào pot và có bài Made Hand -> Đẩy All-In không tiếc!
-        if is_committed && (cat >= 0.11 || edge > 1.50) {
+        if is_committed && (cat >= CAT_ONE_PAIR || edge > 1.50) {
             return pick(m, &[Action::AllIn, Action::BetPot75, Action::CheckCall]);
         }
 
@@ -224,9 +227,9 @@ impl Policy for TightAggressive {
             }
 
             // B. Postflop đối mặt Bet/Raise:
-            // - Cầm Monster Hand (Set/Two Pair lớn/Straight/Flush, cat >= 2/9 hoặc edge > 2.2):
+            // - Cầm Monster Hand (Set/Two Pair lớn/Straight/Flush, cat >= 3/9 hoặc edge > 2.2):
             //   Check-Raise / 3-Bet to (BetPot75 / AllIn) với 80% tần suất để lấy max value, 20% trap Call!
-            if (cat >= 0.22 || edge > 2.20) && rand < 0.80 {
+            if (cat >= CAT_TWO_PAIR || edge > 2.20) && rand < 0.80 {
                 return pick(m, &[Action::BetPot75, Action::AllIn, Action::CheckCall]);
             }
 
@@ -237,7 +240,7 @@ impl Policy for TightAggressive {
             }
 
             // - Call chuẩn toán học Pot Odds + Margin an toàn:
-            if eq > pot_odds + 0.03 || edge > 1.50 || (cat >= 0.11 && eq > pot_odds - 0.02) {
+            if eq > pot_odds + 0.03 || edge > 1.50 || (cat >= CAT_ONE_PAIR && eq > pot_odds - 0.02) {
                 pick(m, &[Action::CheckCall])
             } else {
                 pick(m, &[Action::Fold, Action::CheckCall])
@@ -250,7 +253,7 @@ impl Policy for TightAggressive {
                 if chen >= open_chen || edge > 1.40 {
                     // Open-raise chuẩn 33% hoặc 75%
                     pick(m, &[Action::BetPot33, Action::BetPot75, Action::CheckCall])
-                } else if f[F_TO_CALL_NORM] > 0.05 {
+                } else if f[F_TO_CALL_NORM] > 0.005 {
                     pick(m, &[Action::Fold, Action::CheckCall])
                 } else {
                     pick(m, &[Action::CheckCall])
@@ -258,13 +261,13 @@ impl Policy for TightAggressive {
             } else {
                 // Postflop:
                 // Monster: Bet to (BetPot75) hoặc Trap Check (15% mixing)
-                if cat >= 0.22 || edge > 2.0 {
+                if cat >= CAT_TWO_PAIR || edge > 2.0 {
                     if rand < 0.85 {
                         pick(m, &[Action::BetPot75, Action::BetPot33, Action::CheckCall])
                     } else {
                         pick(m, &[Action::CheckCall]) // Trap slowplay
                     }
-                } else if edge > 1.50 || (cat >= 0.11 && is_wet_board) {
+                } else if edge > 1.50 || (cat >= CAT_ONE_PAIR && is_wet_board) {
                     // Top Pair trên Wet board -> Bet to (BetPot75) để bảo vệ (Protection)
                     if is_wet_board {
                         pick(m, &[Action::BetPot75, Action::BetPot33, Action::CheckCall])
@@ -349,7 +352,7 @@ impl Policy for LagShark {
                 return pick(m, &[Action::BetPot75, Action::BetPot33, Action::CheckCall]);
             }
 
-            if edge > 2.10 || cat >= 0.22 {
+            if edge > 2.10 || cat >= CAT_TWO_PAIR {
                 // Value Raise to
                 pick(m, &[Action::BetPot75, Action::BetPot33, Action::CheckCall])
             } else if eff_eq > pot_odds + 0.01 || edge > 1.48 {
@@ -364,7 +367,7 @@ impl Policy for LagShark {
                 let steal_chen = if is_late_pos { 0.20 } else { 0.28 };
                 if chen >= steal_chen || edge > 1.20 {
                     pick(m, &[Action::BetPot33, Action::BetPot75, Action::CheckCall])
-                } else if f[F_TO_CALL_NORM] > 0.05 {
+                } else if f[F_TO_CALL_NORM] > 0.005 {
                     pick(m, &[Action::Fold, Action::CheckCall])
                 } else {
                     pick(m, &[Action::CheckCall])
@@ -405,7 +408,12 @@ impl Policy for NashPushBot {
         let edge = normalized_edge(eq, n);
         let pot_odds = f[F_POT_ODDS];
         let facing = is_facing_real_bet(f);
-        let eff_bb = f[F_EFF_BB] * 50.0;
+        let is_pushfold = f[F_PUSHFOLD] > 0.5;
+        let eff_bb = if is_pushfold {
+            (f[F_EFF_BB] * 50.0).clamp(4.0, 12.0)
+        } else {
+            f[F_EFF_BB] * 50.0
+        };
         let chen = f[F_HAND_STRENGTH];
         let is_preflop = f[F_STREET_PREFLOP] > 0.5;
 
@@ -415,8 +423,8 @@ impl Policy for NashPushBot {
         let is_co = f[F_POS_CO] > 0.5;
         let is_late = is_btn || is_sb || is_co;
 
-        // Chế độ Short-stack Nash Push/Fold (<= 15 BB):
-        if eff_bb <= 15.0 && is_preflop {
+        // Chế độ Short-stack Nash Push/Fold (< 12 BB):
+        if is_pushfold && is_preflop {
             let min_chen = anti_shove_chen_threshold(n);
 
             if !facing {
@@ -540,7 +548,7 @@ impl Policy for IcmSniper {
             }
 
             // Postflop:
-            if edge > 2.30 || cat >= 0.25 {
+            if edge > 2.30 || cat >= CAT_TWO_PAIR {
                 pick(m, &[Action::BetPot75, Action::AllIn, Action::CheckCall])
             } else if edge > 1.90 {
                 pick(m, &[Action::BetPot75, Action::BetPot33, Action::CheckCall])
@@ -554,13 +562,13 @@ impl Policy for IcmSniper {
             // Chip Leader ép bàn ở Bubble hoặc bài cực mạnh
             if stack_rank > 0.80 && is_bubble {
                 pick(m, &[Action::BetPot75, Action::BetPot33, Action::CheckCall])
-            } else if edge > 1.95 || cat >= 0.25 {
+            } else if edge > 1.95 || cat >= CAT_TWO_PAIR {
                 pick(m, &[Action::BetPot75, Action::CheckCall])
             } else if edge > 1.30 || (is_late && edge > 1.10) {
                 pick(m, &[Action::BetPot33, Action::BetSmall, Action::CheckCall])
             } else if edge > 1.05 && f[F_STREET_PREFLOP] < 0.5 {
                 pick(m, &[Action::BetSmall, Action::CheckCall])
-            } else if f[F_STREET_PREFLOP] > 0.5 && f[F_TO_CALL_NORM] > 0.05 {
+            } else if f[F_STREET_PREFLOP] > 0.5 && f[F_TO_CALL_NORM] > 0.005 {
                 pick(m, &[Action::Fold, Action::CheckCall])
             } else {
                 pick(m, &[Action::CheckCall])
@@ -622,8 +630,8 @@ impl Policy for NitTrap {
         }
 
         // Postflop:
-        // Nếu không dính Two Pair trở lên (cat < 0.22) và edge không vượt trội:
-        if cat < 0.22 && edge < 1.70 {
+        // Nếu không dính Two Pair trở lên (cat < 3/9) và edge không vượt trội:
+        if cat < CAT_TWO_PAIR && edge < 1.70 {
             if facing {
                 if eq > pot_odds + 0.08 {
                     return pick(m, &[Action::CheckCall]);
@@ -679,7 +687,7 @@ impl Policy for StickyFish {
         let has_draw = f[F_FLUSH_DRAW] > 0.5 || f[F_STRAIGHT_DRAW] > 0.5;
         let is_preflop = f[F_STREET_PREFLOP] > 0.5;
         let call_ratio = f[F_TO_CALL_RATIO_STACK]; // Tỷ lệ chip phải bỏ ra so với stack hiện tại
-        let is_huge_bet = call_ratio > 0.35 || f[F_TO_CALL_NORM] > 0.25; // Bet > 5 BB hoặc > 35% stack / All-in
+        let is_huge_bet = call_ratio > 0.35 || f[F_RELATIVE_BET_SIZE] > 0.75 || f[F_TO_CALL_NORM] > 0.25; // Bet > 75% pot hoặc > 35% stack / All-in
 
         // 1. Preflop:
         if is_preflop {
@@ -706,9 +714,9 @@ impl Policy for StickyFish {
         }
 
         // 2. Postflop:
-        // A. Cầm bài rất mạnh (Two Pair, Trips, Straight, Flush... cat >= 0.20):
+        // A. Cầm bài rất mạnh (Two Pair, Trips, Straight, Flush... cat >= 3/9):
         // Fish không check thụ động nữa! Chủ động Bet để lấy tiền từ đối thủ!
-        if cat >= 0.20 {
+        if cat >= CAT_TWO_PAIR {
             if facing {
                 // Đối mặt bet: Call hoặc Raise
                 return pick(m, &[Action::BetPot75, Action::CheckCall, Action::AllIn]);
@@ -717,8 +725,8 @@ impl Policy for StickyFish {
             }
         }
 
-        // B. Cầm bài tốt (One Pair - cat >= 0.10):
-        if cat >= 0.10 {
+        // B. Cầm bài tốt (One Pair - cat >= 2/9):
+        if cat >= CAT_ONE_PAIR {
             if facing {
                 // Nếu đối thủ Shove All-In hoặc Bet cực to (> 35% stack):
                 // Phải có ít nhất Top Pair / bài tốt (eq > 0.45 hoặc chen > 0.30) mới call, không call tự sát với bottom pair!
@@ -811,7 +819,7 @@ impl Policy for ThreeBetAggro {
                 let open_chen = if is_late { 0.22 } else { 0.28 };
                 if chen >= open_chen || edge > 1.25 {
                     return pick(m, &[Action::BetPot75, Action::BetPot33, Action::CheckCall]);
-                } else if f[F_TO_CALL_NORM] > 0.05 {
+                } else if f[F_TO_CALL_NORM] > 0.005 {
                     return pick(m, &[Action::Fold, Action::CheckCall]);
                 } else {
                     return pick(m, &[Action::CheckCall]);
@@ -828,8 +836,8 @@ impl Policy for ThreeBetAggro {
                 pick(m, &[Action::CheckCall])
             }
         } else {
-            // Đối mặt cược: Raise tiếp nếu có bài (cat >= 1/9 hoặc draw)
-            if cat >= 0.11 || has_draw {
+            // Đối mặt cược: Raise tiếp nếu có bài (cat >= 2/9 hoặc draw)
+            if cat >= CAT_ONE_PAIR || has_draw {
                 pick(m, &[Action::BetPot75, Action::CheckCall])
             } else if eq > pot_odds + 0.05 {
                 pick(m, &[Action::CheckCall])
@@ -859,7 +867,7 @@ impl Policy for BountyHunter {
         let chen = f[F_HAND_STRENGTH];
         let cat = f[F_HAND_CAT];
         let is_preflop = f[F_STREET_PREFLOP] > 0.5;
-        let is_short_opp = f[F_EFF_BB] <= 0.24 || f[F_PUSHFOLD] > 0.5; // Đối thủ ngắn chip <= 12 BB
+        let is_short_opp = f[F_PUSHFOLD] > 0.5; // Đối thủ ngắn chip < 12 BB
         let my_stack_rich = f[F_STACK_RANK] >= 0.60;
 
         // Preflop:
@@ -890,7 +898,7 @@ impl Policy for BountyHunter {
             } else {
                 if chen >= 0.28 || edge > 1.35 {
                     return pick(m, &[Action::BetPot75, Action::BetPot33, Action::CheckCall]);
-                } else if f[F_TO_CALL_NORM] > 0.05 {
+                } else if f[F_TO_CALL_NORM] > 0.005 {
                     return pick(m, &[Action::Fold, Action::CheckCall]);
                 } else {
                     return pick(m, &[Action::CheckCall]);
@@ -901,20 +909,20 @@ impl Policy for BountyHunter {
         // Postflop:
         // Đánh dồn dập ép short-stack phải all-in
         if is_short_opp {
-            if cat >= 0.11 || edge > 1.20 {
+            if cat >= CAT_ONE_PAIR || edge > 1.20 {
                 return pick(m, &[Action::AllIn, Action::BetPot75, Action::CheckCall]);
             }
         }
 
         if facing {
-            if edge > 1.90 || cat >= 0.22 {
+            if edge > 1.90 || cat >= CAT_TWO_PAIR {
                 pick(m, &[Action::BetPot75, Action::AllIn, Action::CheckCall])
             } else if eq > pot_odds + 0.02 || edge > 1.50 {
                 pick(m, &[Action::CheckCall])
             } else {
                 pick(m, &[Action::Fold, Action::CheckCall])
             }
-        } else if edge > 1.50 || cat >= 0.11 {
+        } else if edge > 1.50 || cat >= CAT_ONE_PAIR {
             pick(m, &[Action::BetPot75, Action::BetPot33, Action::CheckCall])
         } else if edge > 1.15 {
             pick(m, &[Action::BetPot33, Action::CheckCall])
@@ -1202,6 +1210,100 @@ pub fn run_suite(hero: &dyn Policy, hands: usize, depths: &[u32]) -> Vec<BenchRe
     out
 }
 
+fn play_cash_hand_table<R: Rng>(
+    hero: &dyn Policy,
+    opp: Option<&dyn Policy>,
+    acc: &mut Acc,
+    rng: &mut R,
+    num_players: usize,
+) {
+    let bb = 100u32;
+    let sb = 50u32;
+    let n = num_players.clamp(2, TABLE_SIZE);
+    let stacks = crate::sampler::TournamentStackSampler::sample_lounge_stacks(rng, n, bb);
+    let button = rng.gen_range(0..n);
+    let hero_seat = rng.gen_range(0..n);
+    let offset = rng.gen_range(0..TABLE_SIZE);
+
+    let mut env = Environment::new(n, &stacks, bb, sb, button);
+    env.state.is_cash_game = true;
+    env.reset_hand(rng, button);
+
+    let mut guard = 0;
+    while env.state.street != Street::Showdown && guard < 400 {
+        guard += 1;
+        let cur = env.state.current_player_idx;
+        let mask = env.get_action_mask();
+        if mask.0 == 0 {
+            break;
+        }
+        let feats = env.state.encode_features(cur);
+        let action = if cur == hero_seat {
+            let a = hero.select_action(&feats, &mask);
+            acc.acts[a.to_index()] += 1;
+            let in_hand_cnt = env.state.players.iter().filter(|p| p.is_in_hand()).count();
+            if feats[F_STREET_PREFLOP] > 0.5 && feats[F_HAND_STRENGTH] < trash_chen_threshold(in_hand_cnt) {
+                acc.trash += 1;
+                if a == Action::AllIn {
+                    acc.trash_shove += 1;
+                }
+            }
+            a
+        } else if let Some(fixed_opp) = opp {
+            fixed_opp.select_action(&feats, &mask)
+        } else {
+            let opp_slot = (if cur > hero_seat { cur - 1 } else { cur } + offset) % 8;
+            match opp_slot {
+                0 => TightAggressive.select_action(&feats, &mask),
+                1 => LagShark.select_action(&feats, &mask),
+                2 => NitTrap.select_action(&feats, &mask),
+                3 => StickyFish.select_action(&feats, &mask),
+                4 => ThreeBetAggro.select_action(&feats, &mask),
+                5 => BountyHunter.select_action(&feats, &mask),
+                6 => NashPushBot.select_action(&feats, &mask),
+                _ => CallStation.select_action(&feats, &mask),
+            }
+        };
+        match env.step(action) {
+            Ok(true) | Err(_) => break,
+            Ok(false) => {}
+        }
+    }
+
+    let end = env.state.players[hero_seat].stack as f64;
+    let r = (end - stacks[hero_seat] as f64) / bb as f64;
+    acc.n += 1;
+    acc.sum += r;
+    acc.sumsq += r * r;
+}
+
+/// Bộ benchmark chuyên dụng cho chế độ Lounge Cash Game (12-300+ BB, is_cash_game = true)
+pub fn run_cash_suite(hero: &dyn Policy, hands: usize, num_players: usize) -> Vec<BenchResult> {
+    let n = num_players.clamp(2, TABLE_SIZE);
+    let opps: [(&str, Option<&dyn Policy>); 6] = [
+        ("TAG", Some(&TightAggressive)),
+        ("LagShark", Some(&LagShark)),
+        ("NitTrap", Some(&NitTrap)),
+        ("StickyFish", Some(&StickyFish)),
+        ("ThreeBetAggro", Some(&ThreeBetAggro)),
+        ("MixedLounge", None),
+    ];
+
+    let mut out = Vec::with_capacity(opps.len());
+    for (name, opp_opt) in opps {
+        let acc = (0..hands)
+            .into_par_iter()
+            .fold(Acc::default, |mut acc, _| {
+                let mut rng = thread_rng();
+                play_cash_hand_table(hero, opp_opt, &mut acc, &mut rng, n);
+                acc
+            })
+            .reduce(Acc::default, |a, b| a.merge(&b));
+        out.push(to_result(name, 150, &acc));
+    }
+    out
+}
+
 /// Hàm chấm điểm chuyên nghiệp cho Poker AI (Đánh giá đa tiêu chí & Trừng phạt lối chơi cờ bạc)
 pub fn score(results: &[BenchResult]) -> f64 {
     let mut total_score = 0.0;
@@ -1217,7 +1319,7 @@ pub fn score(results: &[BenchResult]) -> f64 {
         }
 
         match r.opponent.as_str() {
-            "MixedTable" => {
+            "MixedTable" | "MixedLounge" => {
                 // Bàn MixedTable là thước đo thực chiến quan trọng nhất
                 mixed_score += r.bb_per_100.clamp(-200.0, 200.0);
             }
@@ -1450,6 +1552,7 @@ mod tests {
         f_sb[F_STREET_PREFLOP] = 1.0;
         f_sb[F_IN_HAND] = 6.0 / 10.0;
         f_sb[F_EFF_BB] = 10.0 / 50.0;
+        f_sb[F_PUSHFOLD] = 1.0;
         f_sb[F_HAND_STRENGTH] = 0.18; // K7o / Q8s
         f_sb[F_POS_SB] = 1.0; // Ở SB vs BB
 
@@ -1476,7 +1579,7 @@ mod tests {
         f[F_STREET_PREFLOP] = 0.0;
         f[F_STREET_FLOP] = 1.0;
         f[F_IN_HAND] = 3.0 / 10.0; // 3 người
-        f[F_HAND_CAT] = 0.11;     // Top Pair
+        f[F_HAND_CAT] = 2.0 / 9.0; // One Pair (Top Pair)
         f[F_EQUITY] = 0.65;
         f[F_MAX_SUIT_BOARD] = 0.60; // 3 lá cùng chất trên bàn (Wet Board)
 
@@ -1525,7 +1628,7 @@ mod tests {
         f_fish[F_STREET_FLOP] = 1.0;
         f_fish[F_TO_CALL_NORM] = 0.10;
         f_fish[F_POT_ODDS] = 0.25;
-        f_fish[F_HAND_CAT] = 0.11; // One Pair
+        f_fish[F_HAND_CAT] = 2.0 / 9.0; // One Pair
         f_fish[F_EQUITY] = 0.40;
         let mut fish_mask = ActionMask::EMPTY;
         fish_mask.enable(Action::Fold);
@@ -1533,6 +1636,14 @@ mod tests {
         fish_mask.enable(Action::BetPot75);
         let fish_act = StickyFish.select_action(&f_fish, &fish_mask);
         assert_eq!(fish_act, Action::CheckCall, "StickyFish cầm One Pair đối mặt Bet vừa phải tuyệt đối không Fold!");
+
+        // StickyFish v2: Cầm High Card (1/9) đối mặt Bet với equity thấp -> Phải Fold (không nhầm High Card thành One Pair)!
+        let mut f_fish_hc = f_fish.clone();
+        f_fish_hc[F_HAND_CAT] = 1.0 / 9.0; // High Card
+        f_fish_hc[F_EQUITY] = 0.15;
+        f_fish_hc[F_POT_ODDS] = 0.33;
+        let fish_hc_act = StickyFish.select_action(&f_fish_hc, &fish_mask);
+        assert_eq!(fish_hc_act, Action::Fold, "StickyFish cầm High Card (1/9) equity thấp phải Fold!");
 
         // StickyFish v2: Đối mặt All-In cực to khi chỉ có bài yếu (eq thấp, chen thấp) -> Biết Fold tránh tự sát!
         let mut f_fish_huge = f_fish.clone();
@@ -1543,10 +1654,10 @@ mod tests {
         let fish_huge_act = StickyFish.select_action(&f_fish_huge, &fish_mask);
         assert_eq!(fish_huge_act, Action::Fold, "StickyFish gặp cú Shove All-In cực to với bài yếu phải biết Fold!");
 
-        // StickyFish v2: Cầm Two Pair (cat 0.22) khi chưa ai bet -> Phải Bet lấy tiền, không check thụ động!
+        // StickyFish v2: Cầm Two Pair (cat 3/9) khi chưa ai bet -> Phải Bet lấy tiền, không check thụ động!
         let mut f_fish_twopair = f_fish.clone();
         f_fish_twopair[F_TO_CALL_NORM] = 0.0;
-        f_fish_twopair[F_HAND_CAT] = 0.22;
+        f_fish_twopair[F_HAND_CAT] = 3.0 / 9.0;
         let mut fish_bet_mask = ActionMask::EMPTY;
         fish_bet_mask.enable(Action::CheckCall);
         fish_bet_mask.enable(Action::BetPot33);
@@ -1579,6 +1690,7 @@ mod tests {
         f_bounty[F_STREET_PREFLOP] = 1.0;
         f_bounty[F_STACK_RANK] = 0.80; // Nhiều chip hơn đối thủ
         f_bounty[F_EFF_BB] = 8.0 / 50.0; // Short stack 8 BB
+        f_bounty[F_PUSHFOLD] = 1.0;
         f_bounty[F_HAND_STRENGTH] = 0.35; // JJ, AJs
         f_bounty[F_IN_HAND] = 3.0 / 10.0;
         let mut bounty_mask = ActionMask::EMPTY;
@@ -1588,5 +1700,22 @@ mod tests {
         bounty_mask.enable(Action::AllIn);
         let bounty_act = BountyHunter.select_action(&f_bounty, &bounty_mask);
         assert_eq!(bounty_act, Action::AllIn, "BountyHunter thấy Short Stack 8 BB với bài đẹp phải Shove All-In!");
+    }
+
+    #[test]
+    fn test_cash_facing_open_raise_detected() {
+        let mut rng = StdRng::seed_from_u64(77);
+        let mut env = Environment::new(6, &[15_000; 6], 100, 50, 0);
+        env.state.is_cash_game = true;
+        env.reset_hand(&mut rng, 0);
+
+        // Trước khi có open-raise: UTG chỉ đối mặt BB 100 chip -> is_facing_real_bet == false
+        let utg_feats = env.state.encode_features(env.state.current_player_idx);
+        assert!(!is_facing_real_bet(&utg_feats), "Unopened Cash pot must not be treated as facing raise");
+
+        // UTG open-raise ~2 BB (BetPot33) -> người tiếp theo phải nhận diện is_facing_real_bet == true
+        env.step(Action::BetPot33).unwrap();
+        let next_feats = env.state.encode_features(env.state.current_player_idx);
+        assert!(is_facing_real_bet(&next_feats), "2 BB open-raise in Cash mode must be detected as facing real bet");
     }
 }

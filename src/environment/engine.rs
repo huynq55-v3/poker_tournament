@@ -637,7 +637,7 @@ mod tests {
     fn test_chip_conservation_random_play() {
         let mut rng = rand::thread_rng();
         for _ in 0..300 {
-            let n = rng.gen_range(2..=8);
+            let n = rng.gen_range(2..=10);
             // Stack nhỏ (50 = bằng SB) để kiểm tra trường hợp all-in ngay từ blind
             let stacks: Vec<u32> = (0..n).map(|_| rng.gen_range(1..=60) * 50).collect();
             let total: u32 = stacks.iter().sum();
