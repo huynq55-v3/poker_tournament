@@ -281,14 +281,14 @@ impl GameState {
             }
         }
         let eff_chips = player_stack.min(max_opp_stack);
-        eff_chips as f32 / self.bb_size as f32
+        eff_chips as f32 / self.bb_size.max(1) as f32
     }
 
     /// Mã hóa vector đặc trưng chuẩn xác:
     /// Nén và đồng bộ tuyệt đối giữa số người còn sống thực tế và mạng lúc train.
     pub fn encode_features(&self, player_idx: usize) -> Vec<f32> {
         let mut f = Vec::with_capacity(FEATURE_DIM);
-        let bb = self.bb_size as f32;
+        let bb = self.bb_size.max(1) as f32;
         let me = &self.players[player_idx];
 
         // 0. Sức mạnh bài tẩy (5)
@@ -452,8 +452,8 @@ impl GameState {
             opp_count += 1;
         }
 
-        // 7. Tóm tắt lịch sử (2) -> index 159..160
-        // Chiều 159: Tổng số cú Bet/Raise theo size chuẩn (15%/33%/75%/100%) của các đối thủ trong cả ván
+        // 7. Tóm tắt lịch sử (2) -> index 169..170
+        // Chiều 169: Tổng số cú Bet/Raise theo size chuẩn (15%/33%/75%/100%) trong ván
         let total_opp_sized_bets: u8 = (0..self.num_players)
             .filter(|&i| i != player_idx)
             .map(|i| seat_sized_bets[i])
@@ -473,31 +473,31 @@ impl GameState {
         f.push(((street_raises as f32 * 0.20) + (total_opp_sized_bets as f32 * 0.20)).min(1.0));
 
         let in_hand = self.players.iter().filter(|p| p.is_in_hand()).count();
-        f.push(in_hand as f32 / MAX_PLAYERS as f32); // index 160: F_IN_HAND
+        f.push(in_hand as f32 / MAX_PLAYERS as f32); // index 170: F_IN_HAND
 
-        // 8. Ngữ cảnh push/fold & sức mạnh bài -> index 161..165
+        // 8. Ngữ cảnh push/fold & sức mạnh bài -> index 171..175
         let eff_bb = self.effective_stack_bb(player_idx);
         if self.is_cash_game {
-            f.push((eff_bb / 150.0).min(2.0)); // index 161: dải mượt 0..300 BB
+            f.push((eff_bb / 150.0).min(2.0)); // index 171: dải mượt 0..300 BB
         } else {
-            f.push((eff_bb / 50.0).min(1.5));  // index 161: Tournament cũ
+            f.push((eff_bb / 50.0).min(1.5));  // index 171: Tournament
         }
-        f.push(if eff_bb < 12.0 { 1.0 } else { 0.0 }); // index 162: F_PUSHFOLD
+        f.push(if eff_bb < 12.0 { 1.0 } else { 0.0 }); // index 172: F_PUSHFOLD
         let my_stack = me.stack as f32;
-        f.push(if my_stack > 0.0 { (to_call as f32 / my_stack).min(1.0) } else { 1.0 }); // index 163: F_TO_CALL_RATIO_STACK
-        // index 164: Tỷ lệ Pot-Commitment của bản thân (đã bỏ bao nhiêu % tổng tài sản vào pot này)
+        f.push(if my_stack > 0.0 { (to_call as f32 / my_stack).min(1.0) } else { 1.0 }); // index 173: F_TO_CALL_RATIO_STACK
+        // index 174: Tỷ lệ Pot-Commitment của bản thân (đã bỏ bao nhiêu % tổng tài sản vào pot này)
         let my_total_wealth = (me.stack + me.total_contributed).max(1) as f32;
-        f.push((me.total_contributed as f32 / my_total_wealth).clamp(0.0, 1.0)); // index 164: F_POT_COMMITMENT
+        f.push((me.total_contributed as f32 / my_total_wealth).clamp(0.0, 1.0)); // index 174: F_POT_COMMITMENT
         let (cat, _) = self.hand_strength(player_idx);
-        f.push(cat);      // index 165: F_HAND_CAT
+        f.push(cat);      // index 175: F_HAND_CAT
 
-        // 9. Equity, Hand Strength & Board Texture -> index 166..174
+        // 9. Equity, Hand Strength & Board Texture -> index 176..184
         let (eq_feats, hs) = self.equity_features(player_idx, to_call);
-        f.push(hs);       // index 166: F_HAND_STRENGTH (Preflop: Chen score, Postflop: Monte Carlo current hand strength!)
-        f.extend_from_slice(&eq_feats); // index 167..174: 8 chiều equity thô và board features
+        f.push(hs);       // index 176: F_HAND_STRENGTH (Preflop: Chen score, Postflop: Exact HS)
+        f.extend_from_slice(&eq_feats); // index 177..184: 8 chiều equity thô và board features
 
-        // 10. Tín hiệu cược nâng cao -> index 175..176
-        // index 175: facing_raise (đối mặt cú raise/check-raise trên vòng hiện tại)
+        // 10. Tín hiệu cược nâng cao -> index 185..186
+        // index 185: facing_raise (đối mặt cú raise/check-raise trên vòng hiện tại)
         let street_bets_and_raises = self.action_history.iter().filter(|r| {
             r.street == self.street && matches!(
                 r.action,

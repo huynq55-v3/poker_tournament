@@ -2,9 +2,10 @@ use crate::benchmark::{
     BountyHunter, IcmSniper, LagShark, NashPushBot, NitTrap, StickyFish, ThreeBetAggro,
     TightAggressive,
 };
-use crate::deep_cfr::advantage_memory::{AdvantageMemory, AdvantageSample, SampleBatch};
+use crate::deep_cfr::memory::{
+    AdvantageMemory, AdvantageSample, SampleBatch, StrategyMemory, StrategySample,
+};
 use crate::deep_cfr::policy::DeepCFRPolicy;
-use crate::deep_cfr::strategy_memory::{StrategyMemory, StrategySample};
 use crate::environment::action::{Action, ActionMask, NUM_ACTIONS};
 use crate::environment::engine::Environment;
 use crate::environment::state::Street;
@@ -458,40 +459,64 @@ impl DeepCFRTrainer {
                 .into_par_iter()
                 .map(|_| {
                     let mut trng = rand::thread_rng();
-                    // 🟢 DÀNH RIÊNG 35% BOOSTER CHO HEADS-UP (1-vs-1) ĐỂ HUẤN LUYỆN SÁT THỦ HEADS-UP:
-                    let is_hu = trng.gen_bool(0.35);
-                    let (n, target_depth) = if is_hu {
-                        // Heads-Up: Quét đều mọi tầng stack từ Deep Stack đến Push/Fold
-                        let hu_depth = match trng.gen_range(0..5) {
-                            0 => 50u32,
-                            1 => 35u32,
-                            2 => 20u32,
-                            3 => 12u32,
-                            _ => 8u32,
-                        };
-                        (2, hu_depth)
-                    } else {
-                        // 65% còn lại cho các giai đoạn Multiway trong giải đấu:
-                        // Phân bổ có chủ đích: 50 BB (40%), 25 BB (30%), 12 BB (15%), 8 BB (15%)
-                        let roll: f32 = trng.gen();
-                        let depth = if roll < 0.40 {
-                            50u32
-                        } else if roll < 0.70 {
-                            25u32
-                        } else if roll < 0.85 {
-                            12u32
+                    let (n, target_depth) = if let Some(fp) = fixed {
+                        let clamped_n = fp.clamp(2, 10);
+                        let depth = if clamped_n == 2 {
+                            match trng.gen_range(0..5) {
+                                0 => 50u32,
+                                1 => 35u32,
+                                2 => 20u32,
+                                3 => 12u32,
+                                _ => 8u32,
+                            }
                         } else {
-                            8u32
+                            let roll: f32 = trng.gen();
+                            if roll < 0.40 {
+                                50u32
+                            } else if roll < 0.70 {
+                                25u32
+                            } else if roll < 0.85 {
+                                12u32
+                            } else {
+                                8u32
+                            }
                         };
-                        let clamped_max = max_p.clamp(2, 10);
-                        let players = match depth {
-                            50 => clamped_max,
-                            25 => trng.gen_range(5.min(clamped_max)..=clamped_max),
-                            12 => trng.gen_range(3.min(clamped_max)..=6.min(clamped_max).max(3.min(clamped_max))),
-                            _ => trng.gen_range(3.min(clamped_max)..=clamped_max),
-                        };
-                        (players, depth)
+                        (clamped_n, depth)
+                    } else {
+                        // 🟢 DÀNH RIÊNG 35% BOOSTER CHO HEADS-UP (1-vs-1) ĐỂ HUẤN LUYỆN SÁT THỦ HEADS-UP:
+                        let is_hu = trng.gen_bool(0.35);
+                        if is_hu {
+                            let hu_depth = match trng.gen_range(0..5) {
+                                0 => 50u32,
+                                1 => 35u32,
+                                2 => 20u32,
+                                3 => 12u32,
+                                _ => 8u32,
+                            };
+                            (2, hu_depth)
+                        } else {
+                            // 65% còn lại cho các giai đoạn Multiway trong giải đấu:
+                            let roll: f32 = trng.gen();
+                            let depth = if roll < 0.40 {
+                                50u32
+                            } else if roll < 0.70 {
+                                25u32
+                            } else if roll < 0.85 {
+                                12u32
+                            } else {
+                                8u32
+                            };
+                            let clamped_max = max_p.clamp(2, 10);
+                            let players = match depth {
+                                50 => clamped_max,
+                                25 => trng.gen_range(5.min(clamped_max)..=clamped_max),
+                                12 => trng.gen_range(3.min(clamped_max)..=6.min(clamped_max).max(3.min(clamped_max))),
+                                _ => trng.gen_range(3.min(clamped_max)..=clamped_max),
+                            };
+                            (players, depth)
+                        }
                     };
+                    let is_hu = n == 2;
 
                     let button = trng.gen_range(0..n);
                     let stacks = if is_hu {

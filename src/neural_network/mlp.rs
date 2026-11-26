@@ -5,8 +5,6 @@ use rayon::prelude::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LossType {
     MSE,
-    Huber,
-    CrossEntropy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,7 +187,17 @@ impl MLP {
     pub fn save_to_file<P: AsRef<std::path::Path>>(&self, path: P) -> std::io::Result<()> {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        std::fs::write(path, json)
+        let target = path.as_ref();
+        let tmp = std::path::PathBuf::from(format!("{}.{}.tmp", target.display(), std::process::id()));
+        if let Err(e) = std::fs::write(&tmp, json) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(&tmp, target) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn load_from_file<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<Self> {
@@ -296,20 +304,6 @@ impl MLP {
                 LossType::MSE => {
                     total += w * 0.5 * diff * diff;
                     delta[o] = w * diff;
-                }
-                LossType::Huber => {
-                    let d = 1.0f32;
-                    if diff.abs() <= d {
-                        total += w * 0.5 * diff * diff;
-                        delta[o] = w * diff;
-                    } else {
-                        total += w * d * (diff.abs() - 0.5 * d);
-                        delta[o] = w * d * diff.signum();
-                    }
-                }
-                LossType::CrossEntropy => {
-                    total -= w * target[o] * (output[o].max(1e-7)).ln();
-                    delta[o] = w * (output[o] - target[o]);
                 }
             }
         }

@@ -10,22 +10,19 @@ use std::io::Write;
 
 pub mod arena;
 pub use arena::{
-    evaluate_against_champion, evaluate_against_champion_cash, evaluate_against_champion_final_table,
-    evaluate_against_champion_table, evaluate_against_champion_tournament, evaluate_against_heuristic_team,
-    evaluate_arena_suite, print_arena_results, simulate_demo_tournament, simulate_hero_tournament,
+    evaluate_against_champion_cash, evaluate_against_champion_table,
+    evaluate_against_champion_tournament, simulate_demo_tournament, simulate_hero_tournament,
     ArenaMatchResult, TournamentArenaResult,
 };
 
 // ---- Vị trí các đặc trưng trong encode_features (đổi layout thì phải cập nhật; có test kiểm tra) ----
 const F_POS_BTN: usize = 109;
 const F_POS_SB: usize = 110;
-#[allow(dead_code)]
-const F_POS_BB: usize = 111;
 const F_POS_CO: usize = 118; // Index 109 + 9 = 118 (Bàn 10-Max)
 const F_IS_BUBBLE: usize = 121;     // 1.0 nếu còn 5 người (vòng Bubble)
 const F_STACK_RANK: usize = 123;    // 0.0 (nghèo nhất) .. 1.0 (Chip Leader)
 const F_STREET_PREFLOP: usize = 125;
-#[allow(dead_code)]
+#[cfg(test)]
 const F_STREET_FLOP: usize = 126;
 const F_STREET_TURN: usize = 127;
 const F_STREET_RIVER: usize = 128;
@@ -45,7 +42,7 @@ const F_STRAIGHT_DRAW: usize = 181;
 const F_PAIRED_BOARD: usize = 182;
 const F_MAX_SUIT_BOARD: usize = 183;
 const F_BOARD_HIGH: usize = 184;
-#[allow(dead_code)]
+#[cfg(test)]
 const F_FACING_RAISE: usize = 185;
 const F_RELATIVE_BET_SIZE: usize = 186;
 const F_STREET_AGGR: usize = 169;
@@ -1032,17 +1029,6 @@ fn play_hand_table<R: Rng>(
     acc.sumsq += r * r;
 }
 
-#[allow(dead_code)]
-fn play_hand<R: Rng>(
-    hero: &dyn Policy,
-    opp: &dyn Policy,
-    stack_bb: u32,
-    acc: &mut Acc,
-    rng: &mut R,
-) {
-    play_hand_table(hero, opp, stack_bb, acc, rng, TABLE_SIZE);
-}
-
 fn run_match_table(
     hero: &dyn Policy,
     opp: &dyn Policy,
@@ -1055,18 +1041,6 @@ fn run_match_table(
         .fold(Acc::default, |mut acc, _| {
             let mut rng = thread_rng();
             play_hand_table(hero, opp, stack_bb, &mut acc, &mut rng, num_players);
-            acc
-        })
-        .reduce(Acc::default, |a, b| a.merge(&b))
-}
-
-#[allow(dead_code)]
-fn run_match(hero: &dyn Policy, opp: &dyn Policy, hands: usize, stack_bb: u32) -> Acc {
-    (0..hands)
-        .into_par_iter()
-        .fold(Acc::default, |mut acc, _| {
-            let mut rng = thread_rng();
-            play_hand(hero, opp, stack_bb, &mut acc, &mut rng);
             acc
         })
         .reduce(Acc::default, |a, b| a.merge(&b))
@@ -1458,7 +1432,7 @@ mod tests {
         // Fold 100% trong bàn 6-max: lý thuyết trừ blind là -25 bb/100,
         // nhưng thực tế khi ở BB được check miễn phí hoặc đối thủ fold tới BB (walk),
         // tỷ lệ lỗ ròng thực tế rơi vào khoảng -11.0 đến -15.0 bb/100.
-        let acc = run_match(&AlwaysFold, &TightAggressive, 4000, 50);
+        let acc = run_match_table(&AlwaysFold, &TightAggressive, 4000, 50, TABLE_SIZE);
         let res = to_result("AlwaysFold", 50, &acc);
         println!("AlwaysFold vs TAG: {:.2} ± {:.2} bb/100", res.bb_per_100, res.ci95);
         assert!(
@@ -1505,7 +1479,7 @@ mod tests {
 
     #[test]
     fn test_arena_heuristic_team_smoke() {
-        let res = evaluate_against_heuristic_team(&TightAggressive, 100, 35);
+        let res = crate::benchmark::arena::evaluate_against_heuristic_team(&TightAggressive, 100, 35);
         assert_eq!(res.hands, 100);
     }
 

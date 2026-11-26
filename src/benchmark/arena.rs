@@ -12,7 +12,6 @@ use rayon::prelude::*;
 
 const F_STREET_PREFLOP: usize = 125;
 const F_HAND_STRENGTH: usize = 176;
-const ARENA_PLAYERS: usize = 8;
 
 #[derive(Default, Clone)]
 struct ArenaAcc {
@@ -143,17 +142,7 @@ fn acc_to_result(acc: &ArenaAcc) -> ArenaMatchResult {
     }
 }
 
-/// Đấu trường mặc định 8-max (tương thích ngược với các caller cũ)
-pub fn evaluate_against_champion(
-    challenger: &dyn Policy,
-    champion: &dyn Policy,
-    total_hands: usize,
-    stack_bb: u32,
-) -> ArenaMatchResult {
-    evaluate_against_champion_table(challenger, champion, total_hands, stack_bb, ARENA_PLAYERS)
-}
-
-/// Đấu trường đối đầu Champion tùy biến số người chơi trên bàn (6-max hoặc 8-max)
+/// Đấu trường đối đầu Champion tùy biến số người chơi trên bàn (2..=10 Max)
 pub fn evaluate_against_champion_table(
     challenger: &dyn Policy,
     champion: &dyn Policy,
@@ -278,103 +267,7 @@ fn play_arena_cash_hand_seeded(
     (final_team_chips - initial_team_chips) / (bb as f64)
 }
 
-/// Đấu trường Final Table Tournament (bàn 4-max, Chip-EV thuần, random stack Dirichlet bất đối xứng)
-pub fn evaluate_against_champion_final_table(
-    challenger: &dyn Policy,
-    champion: &dyn Policy,
-    total_hands: usize,
-    num_players: usize,
-) -> ArenaMatchResult {
-    let opps = [champion];
-    let acc = (0..total_hands)
-        .into_par_iter()
-        .fold(ArenaAcc::default, |mut acc, _| {
-            let mut rng = thread_rng();
-            play_arena_final_table_hand(challenger, &opps, &mut acc, &mut rng, num_players);
-            acc
-        })
-        .reduce(ArenaAcc::default, |a, b| a.merge(&b));
-
-    acc_to_result(&acc)
-}
-
-fn play_arena_final_table_hand<R: Rng>(
-    challenger: &dyn Policy,
-    opponents: &[&dyn Policy],
-    acc: &mut ArenaAcc,
-    rng: &mut R,
-    num_players: usize,
-) {
-    let bb = 100u32;
-    let sb = 50u32;
-    let n = num_players.clamp(2, crate::environment::MAX_PLAYERS);
-    let stacks = if rng.gen_bool(0.75) {
-        crate::sampler::TournamentStackSampler::sample_dirichlet_stacks(rng, n, bb)
-    } else {
-        crate::sampler::TournamentStackSampler::sample_equal_stacks(rng, n, bb)
-    };
-    let button = rng.gen_range(0..n);
-
-    let mut env = Environment::new(n, &stacks, bb, sb, button);
-    env.state.is_cash_game = false; // Thuần Chip-EV Tournament, không trừ phế sàn (No Rake)
-    env.reset_hand(rng, button);
-
-    let challenger_seats: Vec<usize> = (0..n).filter(|&seat| seat % 2 == 0).collect();
-    let initial_team_chips: f64 = challenger_seats.iter().map(|&seat| stacks[seat] as f64).sum();
-
-    let mut guard = 0;
-    while env.state.street != Street::Showdown && guard < 400 {
-        guard += 1;
-        let cur = env.state.current_player_idx;
-        let mask = env.get_action_mask();
-        if mask.0 == 0 {
-            break;
-        }
-
-        let feats = env.state.encode_features(cur);
-        let is_challenger = cur.is_multiple_of(2);
-
-        let action = if is_challenger {
-            let a = challenger.select_action(&feats, &mask);
-            acc.total_actions += 1;
-            if a == Action::AllIn {
-                acc.challenger_shoves += 1;
-            }
-            let in_hand_cnt = env.state.players.iter().filter(|p| p.is_in_hand()).count();
-            if feats[F_STREET_PREFLOP] > 0.5 && feats[F_HAND_STRENGTH] < trash_chen_threshold(in_hand_cnt) {
-                acc.challenger_trash += 1;
-                if a == Action::AllIn {
-                    acc.challenger_trash_shoves += 1;
-                }
-            }
-            a
-        } else {
-            let opp_idx = (cur / 2) % opponents.len();
-            opponents[opp_idx].select_action(&feats, &mask)
-        };
-
-        match env.step(action) {
-            Ok(true) | Err(_) => break,
-            Ok(false) => {}
-        }
-    }
-
-    let final_team_chips: f64 = challenger_seats
-        .iter()
-        .map(|&seat| env.state.players[seat].stack as f64)
-        .sum();
-
-    let num_challengers = challenger_seats.len().max(1) as f64;
-    let diff_bb = (final_team_chips - initial_team_chips) / (bb as f64) / num_challengers;
-
-    acc.hands += 1;
-    acc.sum_diff += diff_bb;
-    acc.sum_sq_diff += diff_bb * diff_bb;
-}
-
-/// Đấu trường 8-max đối đầu Biệt đội Heuristic All-Star (luân phiên cả 8 trường phái quân xanh):
-/// Ghế 0, 2, 4, 6: Challenger
-/// Ghế 1, 3, 5, 7: Luân phiên [&tag, &lag, &nash, &icm, &nit, &fish, &aggro, &bounty]
+/// Đấu trường 10-Max đối đầu Biệt đội Heuristic All-Star (luân phiên cả 8 trường phái quân xanh)
 pub fn evaluate_against_heuristic_team(
     challenger: &dyn Policy,
     total_hands: usize,
@@ -406,43 +299,19 @@ pub fn evaluate_against_heuristic_team(
                 opps[(shift + 6) % 8],
                 opps[(shift + 7) % 8],
             ];
-            play_arena_team_hand(challenger, &rotated_opps, actual_depth, &mut acc, &mut rng, ARENA_PLAYERS);
+            play_arena_team_hand(
+                challenger,
+                &rotated_opps,
+                actual_depth,
+                &mut acc,
+                &mut rng,
+                crate::environment::MAX_PLAYERS,
+            );
             acc
         })
         .reduce(ArenaAcc::default, |a, b| a.merge(&b));
 
     acc_to_result(&acc)
-}
-
-/// Đánh giá toàn diện trên Đấu trường Arena 8-max với từng bot Heuristic và Biệt đội hỗn hợp
-pub fn evaluate_arena_suite(
-    challenger: &dyn Policy,
-    hands_per_match: usize,
-    stack_bb: u32,
-) -> Vec<(&'static str, ArenaMatchResult)> {
-    vec![
-        ("Arena_TAG", evaluate_against_champion(challenger, &TightAggressive, hands_per_match, stack_bb)),
-        ("Arena_LagShark", evaluate_against_champion(challenger, &LagShark, hands_per_match, stack_bb)),
-        ("Arena_NashPush", evaluate_against_champion(challenger, &NashPushBot, hands_per_match, stack_bb)),
-        ("Arena_IcmSniper", evaluate_against_champion(challenger, &IcmSniper, hands_per_match, stack_bb)),
-        ("Arena_NitTrap", evaluate_against_champion(challenger, &NitTrap, hands_per_match, stack_bb)),
-        ("Arena_StickyFish", evaluate_against_champion(challenger, &StickyFish, hands_per_match, stack_bb)),
-        ("Arena_ThreeBetAggro", evaluate_against_champion(challenger, &ThreeBetAggro, hands_per_match, stack_bb)),
-        ("Arena_BountyHunter", evaluate_against_champion(challenger, &BountyHunter, hands_per_match, stack_bb)),
-        ("Arena_HeuristicTeam", evaluate_against_heuristic_team(challenger, hands_per_match, stack_bb)),
-    ]
-}
-
-pub fn print_arena_results(label: &str, results: &[(&str, ArenaMatchResult)]) {
-    println!("   ┌─ Arena Benchmark: {}", label);
-    println!("   │ {:<20} {:>8} {:>10} {:>8} {:>12} {:>8}",
-        "Opponent", "Hands", "bb/100", "±95%", "TrashShove%", "Status");
-    for (name, r) in results {
-        let status = if r.is_winner { "WIN 👑" } else { "DEF 🛡️" };
-        println!("   │ {:<20} {:>8} {:>+10.1} {:>8.1} {:>11.1}% {:>8}",
-            name, r.hands, r.challenger_bb_per_100, r.ci95, r.challenger_trash_shove_pct, status);
-    }
-    println!("   └─");
 }
 
 // =========================================================================

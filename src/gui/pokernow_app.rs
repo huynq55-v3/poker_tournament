@@ -502,7 +502,28 @@ impl PokerNowApp {
 
         std::thread::spawn(move || {
             let mut rng = thread_rng();
-            let mut trainer = DeepCFRTrainer::new(FEATURE_DIM, &[256, 256, 256], 30_000, !is_lounge);
+            let current_adv = target_adv.read().unwrap().clone();
+            let current_strat = target_strat.read().unwrap().clone();
+            let dims = current_adv.layer_dims();
+            let hidden_dims: Vec<usize> = if dims.len() >= 3 && dims[0] == FEATURE_DIM {
+                dims[1..dims.len() - 1].to_vec()
+            } else {
+                vec![256, 256, 256]
+            };
+
+            let mut trainer = DeepCFRTrainer::new(FEATURE_DIM, &hidden_dims, 30_000, !is_lounge);
+            if current_adv.input_dim() == FEATURE_DIM {
+                let mut adv_loaded = current_adv;
+                adv_loaded.reset_optimizer();
+                *trainer.advantage_net.write().unwrap() = adv_loaded;
+            }
+            if let Some(mut strat_loaded) = current_strat {
+                if strat_loaded.layer_dims() == trainer.strategy_net.read().unwrap().layer_dims() {
+                    strat_loaded.reset_optimizer();
+                    *trainer.strategy_net.write().unwrap() = strat_loaded;
+                    trainer.strategy_trained = true;
+                }
+            }
             trainer.is_cash_game = is_lounge;
             trainer.use_icm = !is_lounge;
             trainer.max_players = max_players;
@@ -836,12 +857,12 @@ impl eframe::App for PokerNowApp {
             // Viền đệm ngoài (Padded Rail - Dark Charcoal)
             let rail_rect = Rect::from_center_size(center, felt_size + Vec2::new(26.0, 26.0));
             painter.rect_filled(rail_rect, 130.0, Color32::from_rgb(26, 20, 34));
-            painter.rect_stroke(rail_rect, 130.0, Stroke::new(3.0, Color32::from_rgb(50, 42, 64)));
+            painter.rect_stroke(rail_rect, 130.0, Stroke::new(3.0_f32, Color32::from_rgb(50, 42, 64)));
 
             // Lớp nỉ tím sang trọng bên trong
             painter.rect_filled(felt_rect, 120.0, Color32::from_rgb(86, 26, 116));
             // Viền nẹp vàng/bạc mỏng sát mép nỉ
-            painter.rect_stroke(felt_rect, 120.0, Stroke::new(2.5, Color32::from_rgb(130, 46, 170)));
+            painter.rect_stroke(felt_rect, 120.0, Stroke::new(2.5_f32, Color32::from_rgb(130, 46, 170)));
 
             // Watermark chìm ở giữa bàn phong cách PokerNow
             painter.text(
@@ -1117,7 +1138,7 @@ fn draw_pokernow_player_seat(
         // Người chơi đã bị loại
         let plate_rect = Rect::from_center_size(pos, Vec2::new(110.0, 38.0));
         painter.rect_filled(plate_rect, 6.0, Color32::from_rgba_unmultiplied(20, 18, 24, 210));
-        painter.rect_stroke(plate_rect, 6.0, Stroke::new(1.0, Color32::from_rgb(60, 40, 40)));
+        painter.rect_stroke(plate_rect, 6.0, Stroke::new(1.0_f32, Color32::from_rgb(60, 40, 40)));
 
         let p_name = if is_hero { "Hero (You)".to_string() } else { format!("Bot_{}", player.seat_idx) };
         painter.text(Pos2::new(pos.x, pos.y - 7.0), egui::Align2::CENTER_CENTER, p_name, FontId::proportional(12.0), Color32::from_rgb(140, 70, 70));
@@ -1132,7 +1153,7 @@ fn draw_pokernow_player_seat(
         let fold_rect = Rect::from_center_size(pos, Vec2::new(seat_width, seat_height));
 
         painter.rect_filled(fold_rect, 6.0, Color32::from_rgba_unmultiplied(26, 28, 35, 210));
-        painter.rect_stroke(fold_rect, 6.0, Stroke::new(1.0, Color32::from_rgb(50, 55, 65)));
+        painter.rect_stroke(fold_rect, 6.0, Stroke::new(1.0_f32, Color32::from_rgb(50, 55, 65)));
 
         // Biểu tượng X FOLD bên trái (ASCII 'X' chuẩn, không lo lỗi font Linux)
         let x_box = Rect::from_center_size(Pos2::new(pos.x - 44.0, pos.y), Vec2::new(32.0, 32.0));
@@ -1191,7 +1212,7 @@ fn draw_pokernow_player_seat(
         let aura_rect = plate_rect.expand(4.0);
         painter.rect_filled(aura_rect, 8.0, Color32::from_rgba_unmultiplied(255, 255, 255, 60));
         painter.rect_filled(plate_rect, 6.0, Color32::WHITE);
-        painter.rect_stroke(plate_rect, 6.0, Stroke::new(2.0, Color32::from_rgb(255, 220, 80)));
+        painter.rect_stroke(plate_rect, 6.0, Stroke::new(2.0_f32, Color32::from_rgb(255, 220, 80)));
 
         // Tên người chơi màu đen đậm
         let p_name = if is_hero { "Hero".to_string() } else { format!("Bot_{}", player.seat_idx) };
@@ -1213,7 +1234,7 @@ fn draw_pokernow_player_seat(
     } else {
         // Trạng thái bình thường: Thẻ tối màu viền xám
         painter.rect_filled(plate_rect, 6.0, Color32::from_rgba_unmultiplied(22, 25, 34, 235));
-        painter.rect_stroke(plate_rect, 6.0, Stroke::new(1.2, if is_hero { Color32::from_rgb(90, 170, 250) } else { Color32::from_rgb(60, 65, 78) }));
+        painter.rect_stroke(plate_rect, 6.0, Stroke::new(1.2_f32, if is_hero { Color32::from_rgb(90, 170, 250) } else { Color32::from_rgb(60, 65, 78) }));
 
         let p_name = if is_hero { "Hero".to_string() } else { format!("Bot_{}", player.seat_idx) };
         painter.text(Pos2::new(plate_center.x, plate_center.y - 8.0), egui::Align2::CENTER_CENTER, format!("{} ({:?})", p_name, pos_name), FontId::proportional(12.5), if is_hero { Color32::from_rgb(130, 210, 255) } else { Color32::WHITE });
@@ -1244,7 +1265,7 @@ fn draw_pokernow_player_seat(
 
             // Badge đỏ bo tròn chữ trắng đậm (Chuẩn PokerNow!)
             painter.rect_filled(badge_rect, 4.0, Color32::from_rgb(220, 40, 40));
-            painter.rect_stroke(badge_rect, 4.0, Stroke::new(1.0, Color32::from_rgb(255, 100, 100)));
+            painter.rect_stroke(badge_rect, 4.0, Stroke::new(1.0_f32, Color32::from_rgb(255, 100, 100)));
             painter.text(badge_pos, egui::Align2::CENTER_CENTER, cat_name, FontId::proportional(10.0), Color32::WHITE);
         }
     }
@@ -1256,7 +1277,7 @@ fn draw_dealer_button(painter: &egui::Painter, pos: Pos2) {
     // Đổ bóng nhẹ
     painter.circle_filled(Pos2::new(pos.x + 1.0, pos.y + 1.5), r, Color32::from_rgba_unmultiplied(0, 0, 0, 120));
     painter.circle_filled(pos, r, Color32::WHITE);
-    painter.circle_stroke(pos, r, Stroke::new(1.5, Color32::from_rgb(80, 80, 90)));
+    painter.circle_stroke(pos, r, Stroke::new(1.5_f32, Color32::from_rgb(80, 80, 90)));
     painter.text(pos, egui::Align2::CENTER_CENTER, "D", FontId::proportional(13.5), Color32::from_rgb(20, 30, 80));
 }
 
@@ -1277,7 +1298,7 @@ fn draw_pokernow_bet_chip(painter: &egui::Painter, pos: Pos2, chips: u32, bb: f3
 
     // Chip màu vàng chanh/neon (`#D4FF32`) chuẩn PokerNow
     painter.rect_filled(chip_rect, 11.0, Color32::from_rgb(212, 255, 50));
-    painter.rect_stroke(chip_rect, 11.0, Stroke::new(1.2, Color32::from_rgb(140, 180, 20)));
+    painter.rect_stroke(chip_rect, 11.0, Stroke::new(1.2_f32, Color32::from_rgb(140, 180, 20)));
 
     // Chữ màu đen đậm
     painter.text(pos, egui::Align2::CENTER_CENTER, text, FontId::proportional(11.5), Color32::BLACK);
@@ -1295,7 +1316,7 @@ fn draw_pokernow_large_card(painter: &egui::Painter, pos: Pos2, card: Card) {
 
     // Thân lá bài trắng tinh bo góc
     painter.rect_filled(card_rect, 5.0, Color32::WHITE);
-    painter.rect_stroke(card_rect, 5.0, Stroke::new(1.2, Color32::from_rgb(190, 190, 195)));
+    painter.rect_stroke(card_rect, 5.0, Stroke::new(1.2_f32, Color32::from_rgb(190, 190, 195)));
 
     let suit_color = match card.suit() {
         Suit::Hearts | Suit::Diamonds => Color32::from_rgb(210, 25, 25),
@@ -1333,7 +1354,7 @@ fn draw_pokernow_hole_card(painter: &egui::Painter, pos: Pos2, card: Card, is_he
     painter.rect_filled(shadow_rect, 4.0, Color32::from_rgba_unmultiplied(10, 5, 20, 120));
 
     painter.rect_filled(card_rect, 4.0, Color32::WHITE);
-    painter.rect_stroke(card_rect, 4.0, Stroke::new(1.0, Color32::from_rgb(180, 180, 185)));
+    painter.rect_stroke(card_rect, 4.0, Stroke::new(1.0_f32, Color32::from_rgb(180, 180, 185)));
 
     let suit_color = match card.suit() {
         Suit::Hearts | Suit::Diamonds => Color32::from_rgb(210, 25, 25),
@@ -1368,11 +1389,11 @@ fn draw_pokernow_card_back(painter: &egui::Painter, pos: Pos2, is_hero: bool) {
 
     // Nền tối và viền cam/vàng PokerNow
     painter.rect_filled(card_rect, 4.0, Color32::from_rgb(28, 20, 36));
-    painter.rect_stroke(card_rect, 4.0, Stroke::new(1.4, Color32::from_rgb(200, 130, 45)));
+    painter.rect_stroke(card_rect, 4.0, Stroke::new(1.4_f32, Color32::from_rgb(200, 130, 45)));
 
     // Họa tiết khung trong
     let inner_rect = card_rect.shrink(3.0);
-    painter.rect_stroke(inner_rect, 2.5, Stroke::new(0.8, Color32::from_rgb(160, 95, 30)));
+    painter.rect_stroke(inner_rect, 2.5, Stroke::new(0.8_f32, Color32::from_rgb(160, 95, 30)));
 
     // Diamond pattern
     let d_size = 7.0;
@@ -1385,6 +1406,6 @@ fn draw_pokernow_card_back(painter: &egui::Painter, pos: Pos2, is_hero: bool) {
     painter.add(Shape::convex_polygon(
         diamond_pts,
         Color32::from_rgb(215, 140, 50),
-        Stroke::new(0.8, Color32::from_rgb(240, 180, 80)),
+        Stroke::new(0.8_f32, Color32::from_rgb(240, 180, 80)),
     ));
 }
