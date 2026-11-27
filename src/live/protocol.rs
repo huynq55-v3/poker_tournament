@@ -546,11 +546,13 @@ pub fn process_game_update(
                         entry.is_folded = true;
                         entry.is_sitting_out = false;
                     }
-                    "" => {}
-                    _ => {
+                    "away" | "sittingOut" | "sitOut" | "quit" | "quitted" | "stoodUp" | "standing"
+                    | "waitBigBlind" | "waitingBigBlind" => {
                         entry.is_folded = true;
                         entry.is_sitting_out = true;
                     }
+                    // Status lạ / rỗng: giữ nguyên trạng thái hiện có (không tự ý loại người chơi khỏi ván)
+                    _ => {}
                 }
             }
         }
@@ -1000,8 +1002,10 @@ pub fn build_environment(state: &HandState, hole: [Card; 2], mode: PlayMode) -> 
         if idx == hero_seat {
             return false;
         }
-        let pid = &active_seats[idx];
-        let is_sitting_out = state.players.get(pid).is_some_and(|p| p.is_sitting_out);
+        let is_sitting_out = active_seats
+            .get(idx)
+            .and_then(|pid| state.players.get(pid))
+            .is_some_and(|p| p.is_sitting_out);
         let opp_stack_behind = if pl.is_all_in { 0 } else { pl.stack };
         !pl.is_folded && !pl.is_all_in && !is_sitting_out && opp_stack_behind > 0
     });

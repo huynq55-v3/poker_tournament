@@ -230,21 +230,11 @@ pub fn run_gto_evaluation(
     let (chosen_idx, decision_note) = match cfg.decision_mode {
         DecisionMode::PureMaxEv => {
             if let Some(ref res) = solver_result_opt {
-                let tie_eps = if solver.config.use_icm { 1e-3 } else { 1e-2 };
-                let mut best_i = 0;
-                let mut best_ev = f32::NEG_INFINITY;
-                let mut best_p = -1.0f32;
-                for (i, &ev) in res.action_evs.iter().enumerate().take(NUM_ACTIONS) {
-                    if mask.is_index_valid(i) {
-                        let p = res.action_probs[i];
-                        if ev > best_ev + tie_eps || ((ev - best_ev).abs() <= tie_eps && p > best_p) {
-                            best_ev = ev;
-                            best_p = p;
-                            best_i = i;
-                        }
-                    }
-                }
-                let best_act = Action::from_index(best_i).unwrap();
+                // Dùng đúng quyết định của solver (EV cao nhất có xét sai số thống kê), không tự tính lại
+                let best_i = res.best_action.to_index();
+                let best_ev = res.action_evs[best_i];
+                let best_p = res.action_probs[best_i];
+                let best_act = res.best_action;
                 let note = format!(
                     "⚡ [SOLVER EV MAX] Nhánh EV cao nhất từ Search Tree: {:?} (EV: {:>+6.2} {}, GTO: {:.1}%, BP: {:.1}%)",
                     best_act,
