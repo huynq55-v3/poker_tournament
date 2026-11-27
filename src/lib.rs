@@ -6,6 +6,7 @@ pub mod gui;
 pub mod live;
 pub mod neural_network;
 pub mod poker_core;
+pub mod rl;
 pub mod sampler;
 pub mod self_play;
 
