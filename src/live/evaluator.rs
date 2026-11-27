@@ -1057,4 +1057,76 @@ mod tests {
             "BB CheckCall in 6-way limped pot must immediately advance to Flop"
         );
     }
+
+    /// Hero BTN raise 74, BB short all-in lên 100 (chỉ +26 < full raise 54), người còn lại call.
+    /// Raise thiếu KHÔNG mở lại action → Hero chỉ được Fold/Call. Nếu BB all-in là full raise thì Hero raise được.
+    #[test]
+    fn short_all_in_does_not_reopen_raise_for_hero() {
+        fn build(messi_total: u32) -> HandState {
+            let mut state = HandState::new();
+            state.hand_id = "h_short_allin".to_string();
+            state.hero_id = "hero".to_string();
+            state.street = Street::Preflop;
+            state.sb_size = 2;
+            state.bb_size = 5;
+            state.highest_bet = messi_total;
+            state.min_raise = 54;
+            state.dealer_id = Some("hero".to_string());
+            let specs = [
+                ("sb", 0usize, 300u32, 2u32, 2u32, true, false),
+                ("messi", 1, 0, messi_total, messi_total, false, true),
+                ("limper", 3, 400, 5, 5, true, false),
+                ("raiser", 4, 2615, messi_total, messi_total, false, false),
+                ("henry", 5, 500, 20, 20, true, false),
+                ("hero", 6, 509, 74, 74, false, false),
+            ];
+            for &(pid, seat, stack, bet, tot, folded, all_in) in &specs {
+                state.seats_order.push(pid.to_string());
+                state.players.insert(
+                    pid.to_string(),
+                    PlayerTracker {
+                        id: pid.to_string(),
+                        name: pid.to_string(),
+                        seat_num: seat,
+                        stack,
+                        current_bet: bet,
+                        total_contributed: tot,
+                        is_folded: folded,
+                        is_all_in: all_in,
+                        is_sitting_out: false,
+                    },
+                );
+            }
+            for &(pid, seat, act, amt) in &[
+                ("limper", 3usize, Action::CheckCall, 5u32),
+                ("raiser", 4, Action::BetPot75, 20),
+                ("henry", 5, Action::CheckCall, 20),
+                ("hero", 6, Action::BetPot75, 74),
+                ("messi", 1, Action::AllIn, messi_total - 5),
+                ("raiser", 4, Action::CheckCall, messi_total - 20),
+            ] {
+                state.action_history.push(HandActionRecord {
+                    player_id: pid.to_string(),
+                    seat_num: seat,
+                    street: Street::Preflop,
+                    action: act,
+                    amount: amt,
+                });
+            }
+            state
+        }
+
+        let hole = [robust_parse_card("8c").unwrap(), robust_parse_card("Ad").unwrap()];
+
+        let ctx = build_environment(&build(100), hole, PlayMode::Lounge).unwrap();
+        assert_eq!(ctx.to_call, 26);
+        assert!(!ctx.can_raise, "Short all-in (+26 < 54) must not reopen raising for Hero");
+        let valid = ctx.env.get_action_mask().valid_actions();
+        assert_eq!(valid, vec![Action::Fold, Action::CheckCall], "Hero may only Fold/Call, got {:?}", valid);
+
+        // Đối chứng: BB all-in lên 200 (+126 ≥ 54) là full raise → Hero được raise lại.
+        let ctx_full = build_environment(&build(200), hole, PlayMode::Lounge).unwrap();
+        assert!(ctx_full.can_raise, "Full-raise all-in must reopen action for Hero");
+        assert!(ctx_full.env.get_action_mask().is_valid(Action::AllIn));
+    }
 }

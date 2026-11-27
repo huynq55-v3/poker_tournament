@@ -185,7 +185,11 @@ impl Environment {
             .iter()
             .enumerate()
             .any(|(i, opp)| i != p_idx && opp.is_active());
-        let can_raise = player.stack > to_call && opponents_can_respond;
+        // Luật raise thiếu (incomplete raise): nếu người chơi đã hành động ở street này và từ đó
+        // chưa có full raise nào (street_has_acted chỉ bị reset khi full raise), action KHÔNG được
+        // mở lại → chỉ được Fold/Call phần chênh lệch của short all-in.
+        let action_reopened = !self.street_has_acted.get(p_idx).copied().unwrap_or(false);
+        let can_raise = player.stack > to_call && opponents_can_respond && action_reopened;
 
         if can_raise {
             mask.enable(Action::AllIn);

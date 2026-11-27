@@ -956,20 +956,43 @@ pub fn build_environment(state: &HandState, hole: [Card; 2], mode: PlayMode) -> 
     let in_hand_count = env.state.players.iter().filter(|pl| !pl.is_folded).count();
 
     // Khôi phục chính xác street_has_acted cho cả người bet lẫn người call trước Hero
+    // Replay mức cược street hiện tại để phân biệt full raise với short all-in (raise thiếu):
+    // chỉ full raise mới mở lại action cho người đã hành động.
     env.street_has_acted = vec![false; num_players];
     let mut saw_current_street_action = false;
-    for rec in &env.state.action_history {
-        if rec.street == state.street && rec.player_idx < num_players {
+    {
+        let mut street_bets: Vec<u32> = env.state.players.iter().map(|pl| pl.current_bet).collect();
+        for rec in &env.state.action_history {
+            if rec.street == state.street && rec.player_idx < num_players && rec.action != Action::Fold {
+                street_bets[rec.player_idx] = street_bets[rec.player_idx].saturating_sub(rec.amount);
+            }
+        }
+        let mut replay_highest = street_bets.iter().copied().max().unwrap_or(0);
+        if state.street == Street::Preflop {
+            replay_highest = replay_highest.max(state.bb_size);
+        }
+        let mut replay_min_raise = state.bb_size.max(1);
+
+        for rec in &env.state.action_history {
+            if rec.street != state.street || rec.player_idx >= num_players {
+                continue;
+            }
             saw_current_street_action = true;
-            match rec.action {
-                Action::BetSmall | Action::BetPot33 | Action::BetPot75 | Action::AllIn => {
+            if rec.action == Action::Fold {
+                env.street_has_acted[rec.player_idx] = true;
+                continue;
+            }
+            street_bets[rec.player_idx] += rec.amount;
+            let new_bet = street_bets[rec.player_idx];
+            if new_bet > replay_highest {
+                let raise_size = new_bet - replay_highest;
+                replay_highest = new_bet;
+                if raise_size >= replay_min_raise {
+                    replay_min_raise = raise_size;
                     env.street_has_acted.fill(false);
-                    env.street_has_acted[rec.player_idx] = true;
-                }
-                Action::CheckCall | Action::Fold => {
-                    env.street_has_acted[rec.player_idx] = true;
                 }
             }
+            env.street_has_acted[rec.player_idx] = true;
         }
     }
     if !saw_current_street_action && state.street != Street::Preflop && actual_highest_bet == 0 {
@@ -991,7 +1014,9 @@ pub fn build_environment(state: &HandState, hole: [Card; 2], mode: PlayMode) -> 
             }
         }
     }
-    env.street_has_acted[hero_seat] = false;
+    // Không ép street_has_acted[hero] = false: nếu Hero đã hành động và sau đó chỉ có short all-in
+    // (không full raise), Hero chỉ được Call/Fold. Ép false làm bot gửi Raise/All-in bị client từ chối → treo.
+    let hero_action_reopened = !env.street_has_acted[hero_seat];
 
     let hero_bet = state.players.get(&state.hero_id).map(|p| p.current_bet).unwrap_or(0);
     let hero_stack_behind = env.state.players[hero_seat].stack;
@@ -1011,7 +1036,7 @@ pub fn build_environment(state: &HandState, hole: [Card; 2], mode: PlayMode) -> 
     });
     let has_chips_to_raise = hero_stack_behind > to_call;
     let mavtb_allows_raise = state.hero_mavtb.is_none_or(|m| m > actual_highest_bet);
-    let can_raise = has_opp_with_chips && has_chips_to_raise && mavtb_allows_raise;
+    let can_raise = has_opp_with_chips && has_chips_to_raise && mavtb_allows_raise && hero_action_reopened;
 
     Some(EvalContext {
         env,
