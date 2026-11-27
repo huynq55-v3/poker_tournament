@@ -169,15 +169,24 @@ fn extract_player_history_snapshots(
         }
     }
 
+    let first_street = history.first().map(|r| r.street).unwrap_or(Street::Preflop);
     let mut replay = env.state.clone();
     let mut sum_prior_contribs = 0u32;
+    let mut max_prior_bet = 0u32;
     for (i, p) in replay.players.iter_mut().enumerate() {
         let cur_total = p.total_contributed.max(p.current_bet);
         let prior_contrib = cur_total.saturating_sub(hist_spent[i]);
         sum_prior_contribs = sum_prior_contribs.saturating_add(prior_contrib);
 
         p.stack = p.stack.saturating_add(hist_spent[i]);
-        p.current_bet = 0;
+        p.current_bet = if first_street == Street::Preflop {
+            prior_contrib
+        } else {
+            0
+        };
+        if p.current_bet > max_prior_bet {
+            max_prior_bet = p.current_bet;
+        }
         p.total_contributed = prior_contrib;
         p.is_all_in = false;
         if history.iter().any(|r| r.player_idx == i) {
@@ -187,11 +196,10 @@ fn extract_player_history_snapshots(
 
     let total_hist_spent: u32 = hist_spent.iter().sum();
     replay.pot = env.state.pot.saturating_sub(total_hist_spent).max(sum_prior_contribs);
-    replay.current_highest_bet = 0;
+    replay.current_highest_bet = max_prior_bet;
     replay.min_raise = replay.bb_size.max(1);
     replay.action_history.clear();
 
-    let first_street = history.first().map(|r| r.street).unwrap_or(Street::Preflop);
     replay.street = first_street;
     let keep_cards = match first_street {
         Street::Preflop => 0,
@@ -1062,9 +1070,11 @@ fn pack_board_sig(community: &[Card]) -> u64 {
     sig
 }
 
-fn preflop_sextile_buckets() -> &'static [u8; 169] {
-    static SEXTILES: OnceLock<[u8; 169]> = OnceLock::new();
-    SEXTILES.get_or_init(|| {
+const PREFLOP_BUCKETS: u32 = 8;
+
+fn preflop_quantile_buckets() -> &'static [u8; 169] {
+    static QUANTILES: OnceLock<[u8; 169]> = OnceLock::new();
+    QUANTILES.get_or_init(|| {
         let mut entries: Vec<(usize, u32, f32)> = Vec::with_capacity(169);
         for hi in 0..13u8 {
             for lo in 0..=hi {
@@ -1087,7 +1097,8 @@ fn preflop_sextile_buckets() -> &'static [u8; 169] {
         let mut buckets = [0u8; 169];
         let mut cum_combos = 0u32;
         for (cls, combos, _) in entries {
-            buckets[cls] = (((cum_combos + combos / 2) * 6) / 1326).min(5) as u8;
+            buckets[cls] = (((cum_combos + combos / 2) * PREFLOP_BUCKETS) / 1326)
+                .min(PREFLOP_BUCKETS - 1) as u8;
             cum_combos += combos;
         }
         buckets
@@ -1103,7 +1114,7 @@ fn fast_hand_bucket(
 ) -> u8 {
     let _ = opp_count;
     if community.len() < 3 {
-        return preflop_sextile_buckets()[class_index(hole[0], hole[1])];
+        return preflop_quantile_buckets()[class_index(hole[0], hole[1])];
     }
 
     let (lo, hi) = if hole[0].0 <= hole[1].0 {
@@ -2398,7 +2409,11 @@ impl SubgameSolver {
                 .iter()
                 .filter(|p| p.is_active() && p.current_bet < env.state.current_highest_bet)
                 .count();
-            if !update_table && (depth == 1 || (depth >= max_depth && unanswered_cnt <= 1)) {
+            if !update_table
+                && (depth == 1
+                    || mask.valid_actions().len() <= 2
+                    || (depth >= max_depth && unanswered_cnt <= 1))
+            {
                 let valid = mask.valid_actions();
                 let mut exp_v = 0.0f32;
                 let mut prob_sum = 0.0f32;
@@ -2465,10 +2480,10 @@ impl SubgameSolver {
                     }
                     let a_idx = a.to_index();
                     let p = strat[a_idx];
-                    if !probe_all_root && p < 0.02 {
+                    if p <= 1e-4 || (!probe_all_root && p < 0.01) {
                         continue;
                     }
-                    let next_regret_weight = regret_weight * if probe_all_root { p.max(0.01) } else { p };
+                    let next_regret_weight = regret_weight * p;
                     let mut branch = env.clone();
                     let done = branch.step(a).unwrap_or(true);
                     let v = if done {
@@ -2653,30 +2668,45 @@ impl SubgameSolver {
             let has_hist = ranges.get(&s).map(|(_, _, steps)| *steps).unwrap_or(0) > 0;
             seat_roles[s] = if has_hist { 1 } else { 2 };
         }
+        let mut work_env = env.clone();
+        if !self.config.use_icm {
+            let hero_street_cap = work_env.state.players[hero_seat]
+                .current_bet
+                .saturating_add(work_env.state.players[hero_seat].stack);
+            for (i, p) in work_env.state.players.iter_mut().enumerate() {
+                if i != hero_seat && p.is_active() {
+                    let cap_behind = hero_street_cap.saturating_sub(p.current_bet);
+                    if cap_behind > 0 && p.stack > cap_behind {
+                        p.stack = cap_behind;
+                    }
+                }
+            }
+        }
+
         // Chỉ chọn đối thủ còn quyền hành động (không phí vòng lặp vào người đã All-In)
         let active_opp_seats: Vec<usize> = all_opp_seats
             .iter()
             .copied()
-            .filter(|&s| env.state.players[s].is_active())
+            .filter(|&s| work_env.state.players[s].is_active())
             .collect();
         // Đảm bảo độ sâu đủ phủ ít nhất hết 1 vòng cược cho mọi người chơi active còn lại
-        let active_count = active_opp_seats.len() + usize::from(env.state.players[hero_seat].is_active());
+        let active_count = active_opp_seats.len() + usize::from(work_env.state.players[hero_seat].is_active());
         let effective_max_depth = self.config.max_depth.max(active_count).min(8);
 
         // Tính Hero Showdown Equity ước lượng vs đối thủ trên sample
         let hero_showdown_eq = if let Some([hc0, hc1]) = hero_hole {
-            equity_vs_random([hc0, hc1], &env.state.community_cards, all_opp_seats.len())
+            equity_vs_random([hc0, hc1], &work_env.state.community_cards, all_opp_seats.len())
         } else {
             1.0 / in_hand_seats.len().max(1) as f32
         };
 
-        let root_street = env.state.street;
-        let base_need = 5usize.saturating_sub(env.state.community_cards.len().min(5));
+        let root_street = work_env.state.street;
+        let base_need = 5usize.saturating_sub(work_env.state.community_cards.len().min(5));
         let train_board_count = match base_need {
             0 => 1,
-            1 => 8,
-            2 => 12,
-            _ => 16,
+            1 => 6,
+            2 => 8,
+            _ => 10,
         };
         let eval_board_count = match base_need {
             0 => 1,
@@ -2686,19 +2716,40 @@ impl SubgameSolver {
         };
 
         let mut community_dead = [false; 52];
-        for c in &env.state.community_cards {
+        for c in &work_env.state.community_cards {
             community_dead[c.0 as usize] = true;
         }
         let hero_start_icm = start_icms.get(hero_seat).copied().unwrap_or(0.0);
 
         let base_iters = self.config.iterations.max(1);
         let total_iters = base_iters.saturating_mul(3);
-        let burn_in = total_iters / 3;
+        let burn_in = total_iters / 2;
+        let opp_batch = active_opp_seats.len().min(4);
+        let tempered_dists: HashMap<usize, Vec<f32>> = active_opp_seats
+            .iter()
+            .filter_map(|&s| {
+                let (_, w, _) = ranges.get(&s)?;
+                let sq: Vec<f32> = w.iter().map(|&x| x.max(1e-6).powf(0.25)).collect();
+                Some((s, sq))
+            })
+            .collect();
 
-        // Giai đoạn 1: Huấn luyện InfoSet đối thủ và Hero công khai (Pha B + Pha A)
+        // Giai đoạn 1: Huấn luyện InfoSet đối thủ và Hero công khai (Pha B + Pha A) bằng DCFR (alpha=1.5, beta=0.5)
         for iter_idx in 0..total_iters {
+            if iter_idx > 0 {
+                let t = iter_idx as f32;
+                let t15 = t * t.sqrt();
+                let d_pos = t15 / (t15 + 1.0);
+                let t05 = t.sqrt();
+                let d_neg = t05 / (t05 + 1.0);
+                for node in infoset_table.values_mut() {
+                    for r in &mut node.regrets {
+                        *r *= if *r >= 0.0 { d_pos } else { d_neg };
+                    }
+                }
+            }
             let (public_env, rem_deck) = sample_multiway_world(
-                env,
+                &work_env,
                 in_hand_seats,
                 &community_dead,
                 hero_seat,
@@ -2712,43 +2763,100 @@ impl SubgameSolver {
                 train_board_count,
                 &mut rng,
             );
-            let regret_iter_w = (iter_idx + 1) as f32;
+            let regret_iter_w = 1.0f32;
             let policy_iter_w = if iter_idx >= burn_in {
-                (iter_idx - burn_in + 1) as f32
+                ((iter_idx - burn_in + 1) as f32).powi(2)
             } else {
                 0.0
             };
             let probe = iter_idx % 2 == 0;
 
-            // Pha B: Cập nhật regret CFR+ cho TẤT CẢ đối thủ active trước Hero
-            for &opp_target in &active_opp_seats {
-                let mut opp_branch = public_env.clone();
-                let init_opp_stack = opp_branch.state.players[opp_target].stack;
-                let opp_start_icm = start_icms.get(opp_target).copied().unwrap_or(0.0);
-                self.traverse_multiway_cfr(
-                    &mut opp_branch,
-                    0,
-                    effective_max_depth,
-                    root_street,
-                    &train_boards,
-                    regret_iter_w,
-                    policy_iter_w,
-                    opp_target,
-                    init_opp_stack,
-                    opp_start_icm,
-                    &seat_roles,
-                    0,
-                    1.0,
-                    true,
-                    probe,
-                    None,
-                    &mut infoset_table,
-                    &mut bucket_cache,
-                    &mut rng,
-                );
+            // Pha B: Cập nhật regret DCFR cân bằng nhịp với Hero; dùng tempered importance w^0.5 cho traverser để không bỏ đói bucket hiếm
+            if !active_opp_seats.is_empty() {
+                for k in 0..opp_batch {
+                    let opp_target = active_opp_seats[(iter_idx * opp_batch + k) % active_opp_seats.len()];
+                    let (mut opp_branch, init_opp_stack, opp_rem_deck) = if let Some((ref hands, _, _)) = ranges.get(&opp_target) {
+                        if hands.len() > 1 {
+                            let mut b_env = work_env.clone();
+                            let mut used = community_dead;
+                            let picked = if let Some(tw) = tempered_dists.get(&opp_target) {
+                                if let Ok(dist) = WeightedIndex::new(tw.iter()) {
+                                    hands[dist.sample(&mut rng)]
+                                } else {
+                                    hands[rng.gen_range(0..hands.len())]
+                                }
+                            } else {
+                                hands[rng.gen_range(0..hands.len())]
+                            };
+                            used[picked[0].0 as usize] = true;
+                            used[picked[1].0 as usize] = true;
+                            b_env.state.players[opp_target].hole_cards = [Some(picked[0]), Some(picked[1])];
+                            for &s in in_hand_seats {
+                                if s == opp_target {
+                                    continue;
+                                }
+                                let already_known = s != hero_seat
+                                    && b_env.state.players[s].hole_cards[0].is_some()
+                                    && b_env.state.players[s].hole_cards[1].is_some();
+                                if already_known {
+                                    continue;
+                                }
+                                if let Some([c0, c1]) = sample_hand_from_bayesian_pool(
+                                    ranges.get(&s).map(|(h, w, _)| (h.as_slice(), w.as_slice())),
+                                    &mut used,
+                                    &mut rng,
+                                ) {
+                                    b_env.state.players[s].hole_cards = [Some(c0), Some(c1)];
+                                }
+                            }
+                            let mut rd: Vec<Card> = (0..52).filter(|&idx| !used[idx]).map(|idx| Card(idx as u8)).collect();
+                            for i in (1..rd.len()).rev() {
+                                let j = rng.gen_range(0..=i);
+                                rd.swap(i, j);
+                            }
+                            b_env.deck = Deck::from_remaining(&rd);
+                            let st = b_env.state.players[opp_target].stack;
+                            (b_env, st, Some(rd))
+                        } else {
+                            let b_env = public_env.clone();
+                            let st = b_env.state.players[opp_target].stack;
+                            (b_env, st, None)
+                        }
+                    } else {
+                        let b_env = public_env.clone();
+                        let st = b_env.state.players[opp_target].stack;
+                        (b_env, st, None)
+                    };
+                    let opp_boards_owned = opp_rem_deck.as_ref().map(|rd| {
+                        MultiwayBoardSet::build(&opp_branch, in_hand_seats, rd, train_board_count, &mut rng)
+                    });
+                    let opp_boards = opp_boards_owned.as_ref().unwrap_or(&train_boards);
+                    let opp_start_icm = start_icms.get(opp_target).copied().unwrap_or(0.0);
+                    self.traverse_multiway_cfr(
+                        &mut opp_branch,
+                        0,
+                        effective_max_depth,
+                        root_street,
+                        opp_boards,
+                        regret_iter_w,
+                        policy_iter_w,
+                        opp_target,
+                        init_opp_stack,
+                        opp_start_icm,
+                        &seat_roles,
+                        0,
+                        1.0,
+                        true,
+                        probe,
+                        None,
+                        &mut infoset_table,
+                        &mut bucket_cache,
+                        &mut rng,
+                    );
+                }
             }
 
-            // Pha A: Cập nhật bảng infoset công khai cho chính Hero (value + bluff đều cập nhật)
+            // Pha A: Cập nhật bảng infoset công khai cho Hero (1 lần mỗi iter để giữ nhịp hội tụ cân bằng với Đối thủ)
             {
                 let mut hero_pub_branch = public_env.clone();
                 self.traverse_multiway_cfr(
@@ -2776,10 +2884,10 @@ impl SubgameSolver {
         }
 
         // Giai đoạn 2 (Pha C): Đánh giá tay bài thật `hero_hole` trước chiến lược trung bình đã hội tụ
-        let eval_iters = base_iters.saturating_mul(2).clamp(160, 400);
+        let eval_iters = base_iters.saturating_mul(3).clamp(240, 480);
         for eval_idx in 0..eval_iters {
             let (branch, rem_deck) = sample_multiway_world(
-                env,
+                &work_env,
                 &all_opp_seats,
                 &fixed_dead,
                 hero_seat,
@@ -2816,7 +2924,10 @@ impl SubgameSolver {
                         hero_start_icm,
                     )
                 } else {
-                    if a != Action::Fold && child.state.current_player_idx != hero_seat {
+                    if a != Action::Fold
+                        && child.state.street == root_street
+                        && child.state.current_player_idx != hero_seat
+                    {
                         let opp_cur = child.state.current_player_idx;
                         let opp_mask = child.get_action_mask();
                         if opp_mask.0 != 0 {
@@ -2925,17 +3036,54 @@ impl SubgameSolver {
         } else {
             action_probs = Self::cfr_regret_matching(&root_regrets, &mask);
         }
+        let mut s1_probs_opt = None;
+        if let Some(hc) = hero_hole {
+            let hb = fast_hand_bucket(
+                hc,
+                &work_env.state.community_cards,
+                all_opp_seats.len(),
+                &mut bucket_cache,
+            );
+            if let Some(s1_node) = infoset_table.get(&(0, hb, 0)) {
+                let s1_probs = s1_node.average_strategy(&mask);
+                for &a in &valid_actions {
+                    let i = a.to_index();
+                    action_probs[i] = 0.75 * s1_probs[i] + 0.25 * action_probs[i];
+                }
+                s1_probs_opt = Some(s1_probs);
+            }
+        }
 
+        // Lựa chọn quyết định bằng PiKL + Lower Confidence Bound (EV - 1*SE + tau * ln(pi_GTO)):
+        // giữ quyết định bám sát cân bằng Stage-1 (không cho Pha C Best-Response khai thác nhánh hiếm bị đóng băng).
         let tie_eps = if self.config.use_icm { 1e-3 } else { 1e-2 };
+        let pot_bb = work_env.state.pot as f32 / work_env.state.bb_size.max(1) as f32;
+        let tau = if self.config.use_icm {
+            0.1
+        } else {
+            (pot_bb * 0.35).clamp(1.0, 5.0)
+        };
         let mut best_action = valid_actions[0];
-        let mut best_ev = action_evs[best_action.to_index()];
+        let pikl_score = |idx: usize| -> f32 {
+            let ev = action_evs[idx];
+            if !ev.is_finite() {
+                return ev;
+            }
+            let lcb = ev - action_ev_se[idx];
+            if let Some(ref s1) = s1_probs_opt {
+                lcb + tau * s1[idx].max(1e-2).ln()
+            } else {
+                lcb
+            }
+        };
+        let mut best_score = pikl_score(best_action.to_index());
         let mut best_p = action_probs[best_action.to_index()];
         for &a in &valid_actions[1..] {
             let idx = a.to_index();
-            let ev = action_evs[idx];
+            let sc = pikl_score(idx);
             let p = action_probs[idx];
-            if ev > best_ev + tie_eps || ((ev - best_ev).abs() <= tie_eps && p > best_p) {
-                best_ev = ev;
+            if sc > best_score + tie_eps || ((sc - best_score).abs() <= tie_eps && p > best_p) {
+                best_score = sc;
                 best_p = p;
                 best_action = a;
             }
@@ -2943,7 +3091,7 @@ impl SubgameSolver {
 
         let hero_is_ip = all_opp_seats
             .iter()
-            .all(|&s| !env.state.players[s].is_active() || env.street_has_acted[s]);
+            .all(|&s| !work_env.state.players[s].is_active() || work_env.street_has_acted[s]);
 
         SubgameResult {
             best_action,
@@ -3852,5 +4000,117 @@ mod tests {
         assert!(res.action_evs[fold_i].abs() < 1e-4, "Fold EV in Chip-EV must be 0.0");
         assert_ne!(res.best_action, Action::BetPot75, "K4s OOP facing 3.5x open + call at 52.5BB must not blast BetPot75");
         assert_ne!(res.best_action, Action::AllIn, "K4s OOP facing 3.5x open + call at 52.5BB must not 3-bet shove AllIn");
+    }
+
+    #[test]
+    fn test_multiway_cfr_bb_33_6way_limped_pot_checks_not_shoves_49bb() {
+        // Tái dựng chính xác spot BB [3♥ 3♦] 6-way limped pot (1/2, Hero stack behind 98, pot 12):
+        // Seat 0: BenMin486 SB (s:96, bet:2, tot:2, acted:true)
+        // Seat 1: Hero BB [3h 3d] (s:98, bet:2, tot:2)
+        // Seat 2: dravy (s:134, bet:2, tot:2, acted:true)
+        // Seat 3: pt2026 (s:672, bet:2, tot:2, acted:true)
+        // Seat 4: bingbong3425 (s:358, bet:2, tot:2, acted:true)
+        // Seat 5: talismann BTN (s:1566, bet:2, tot:2, acted:true)
+        let (adv_mlp, strat_mlp) = if let (Ok(adv), Ok(strat)) = (
+            MLP::load_from_file("deep_cfr_lounge_model.json"),
+            MLP::load_from_file("deep_cfr_lounge_strategy.json"),
+        ) {
+            if adv.input_dim() == crate::environment::FEATURE_DIM {
+                (adv, Some(strat))
+            } else {
+                (MLP::new(&[crate::environment::FEATURE_DIM, 64, NUM_ACTIONS]), None)
+            }
+        } else {
+            (MLP::new(&[crate::environment::FEATURE_DIM, 64, NUM_ACTIONS]), None)
+        };
+
+        let mut stacks = vec![200u32; 9];
+        stacks[0] = 96;
+        stacks[1] = 98;
+        stacks[2] = 134;
+        stacks[3] = 672;
+        stacks[4] = 358;
+        stacks[5] = 1566;
+
+        let mut env = Environment::new(9, &stacks, 2, 1, 5);
+        env.state.is_cash_game = true;
+        env.state.street = Street::Preflop;
+        env.state.pot = 12;
+        env.state.current_highest_bet = 2;
+        env.state.min_raise = 2;
+        env.state.current_player_idx = 1;
+
+        for s in 6..9 {
+            env.state.players[s].is_folded = true;
+        }
+        for s in 0..6 {
+            env.state.players[s].current_bet = 2;
+            env.state.players[s].total_contributed = 2;
+            env.state.players[s].hole_cards = [None, None];
+        }
+        env.state.players[1].hole_cards = [
+            Some(Card::from_str_repr("3h").unwrap()),
+            Some(Card::from_str_repr("3d").unwrap()),
+        ];
+
+        env.street_has_acted = vec![false; 9];
+        for s in [0usize, 2, 3, 4, 5] {
+            env.street_has_acted[s] = true;
+        }
+
+        env.state.action_history = vec![
+            ActionRecord { player_idx: 2, street: Street::Preflop, action: Action::CheckCall, amount: 2 },
+            ActionRecord { player_idx: 3, street: Street::Preflop, action: Action::CheckCall, amount: 2 },
+            ActionRecord { player_idx: 4, street: Street::Preflop, action: Action::CheckCall, amount: 2 },
+            ActionRecord { player_idx: 5, street: Street::Preflop, action: Action::CheckCall, amount: 2 },
+            ActionRecord { player_idx: 0, street: Street::Preflop, action: Action::CheckCall, amount: 1 },
+        ];
+
+        let mut cfg = SubgameSolverConfig::lounge_cash_default();
+        cfg.iterations = 160;
+        cfg.max_depth = 4;
+        let solver = SubgameSolver::new(cfg);
+
+        let res = solver.resolve(
+            &env,
+            1,
+            &adv_mlp,
+            strat_mlp.as_ref(),
+            SearchTrigger::ManualForced,
+            None,
+        );
+
+        println!(
+            "\n[33 BB 6-way Limped Pot 50BB] kind={} ESS={:.1} Hist={} Best={:?}",
+            res.diagnostics.solver_kind,
+            res.diagnostics.opp_bayesian_ess,
+            res.diagnostics.bayesian_history_steps,
+            res.best_action
+        );
+        for a in Action::ALL {
+            let i = a.to_index();
+            println!(
+                "  {:<15}: EV {:>+6.2} (±{:.2}) | GTO {:>5.1}% | Opp F:{:>4.1}% C:{:>4.1}% R:{:>4.1}%",
+                a.name(),
+                res.action_evs[i],
+                res.diagnostics.action_ev_se[i],
+                res.action_probs[i] * 100.0,
+                res.diagnostics.opp_fold_pct[i] * 100.0,
+                res.diagnostics.opp_call_pct[i] * 100.0,
+                res.diagnostics.opp_raise_pct[i] * 100.0
+            );
+        }
+
+        let check_i = Action::CheckCall.to_index();
+        assert_ne!(res.best_action, Action::AllIn, "33 in BB limped pot must not open-shove 49BB AllIn");
+        assert!(
+            res.action_evs[check_i] > 0.5,
+            "Checking BB with 33 in a 6BB limped pot must have EV > +0.5 BB, got {:.2}",
+            res.action_evs[check_i]
+        );
+        assert_eq!(
+            res.diagnostics.opp_raise_pct[check_i], 0.0,
+            "Checking to close Preflop must record 0.0% Preflop opp_raise_pct"
+        );
     }
 }

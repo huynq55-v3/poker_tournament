@@ -127,7 +127,7 @@ impl HandState {
         for p in self.players.values_mut() {
             p.current_bet = 0;
             p.total_contributed = 0;
-            p.is_folded = false;
+            p.is_folded = p.is_sitting_out;
             p.is_all_in = false;
         }
     }
@@ -527,24 +527,30 @@ pub fn process_game_update(
                 ..Default::default()
             });
             if let Some(st) = sval.as_str() {
-                if st == "away" || st == "sittingOut" || st == "quit" || st == "stoodUp" || st == "quitted" {
-                    entry.is_folded = true;
-                    entry.is_sitting_out = true;
-                } else if st == "fold" {
-                    entry.is_folded = true;
-                    entry.is_sitting_out = false;
-                } else if st == "allIn" {
-                    entry.is_folded = false;
-                    entry.is_sitting_out = false;
-                    if !entry.is_all_in {
-                        entry.is_all_in = true;
-                        if pid != &state.hero_id {
-                            state.has_evaluated_this_decision = false;
+                match st {
+                    "inHand" | "in" | "playing" => {
+                        entry.is_folded = false;
+                        entry.is_sitting_out = false;
+                    }
+                    "allIn" => {
+                        entry.is_folded = false;
+                        entry.is_sitting_out = false;
+                        if !entry.is_all_in {
+                            entry.is_all_in = true;
+                            if pid != &state.hero_id {
+                                state.has_evaluated_this_decision = false;
+                            }
                         }
                     }
-                } else if st == "inHand" {
-                    entry.is_folded = false;
-                    entry.is_sitting_out = false;
+                    "fold" | "folded" => {
+                        entry.is_folded = true;
+                        entry.is_sitting_out = false;
+                    }
+                    "" => {}
+                    _ => {
+                        entry.is_folded = true;
+                        entry.is_sitting_out = true;
+                    }
                 }
             }
         }
@@ -825,8 +831,6 @@ pub fn build_environment(state: &HandState, hole: [Card; 2], mode: PlayMode) -> 
     initial_stacks.truncate(num_players);
     env_players.truncate(num_players);
 
-    let in_hand_count = env_players.iter().filter(|pl| !pl.is_folded).count();
-
     let button_idx = if let Some(ref did) = state.dealer_id {
         active_seats.iter().position(|id| id == did).unwrap_or(0)
     } else if let Some(d_seat) = state.dealer_seat {
@@ -866,6 +870,88 @@ pub fn build_environment(state: &HandState, hole: [Card; 2], mode: PlayMode) -> 
             })
         })
         .collect();
+
+    // Bất biến thứ tự hành động Poker: loại bỏ các ghế chưa all-in nhưng bet < cHB đã trôi qua lượt trước Hero
+    if actual_highest_bet > 0 {
+        let last_raiser_opt = env
+            .state
+            .action_history
+            .iter()
+            .rev()
+            .find(|rec| {
+                rec.street == state.street
+                    && matches!(
+                        rec.action,
+                        Action::BetSmall | Action::BetPot33 | Action::BetPot75 | Action::AllIn
+                    )
+            })
+            .map(|rec| rec.player_idx);
+
+        if let Some(last_raiser) = last_raiser_opt {
+            let mut cursor = (last_raiser + 1) % num_players;
+            for _ in 0..num_players {
+                if cursor == hero_seat || cursor == last_raiser {
+                    break;
+                }
+                let pl = &mut env.state.players[cursor];
+                if !pl.is_folded && !pl.is_all_in && pl.current_bet < actual_highest_bet {
+                    pl.is_folded = true;
+                }
+                cursor = (cursor + 1) % num_players;
+            }
+        } else if state.street == Street::Preflop {
+            let hero_bet_cur = env.state.players[hero_seat].current_bet;
+            let partial_bet_seats: Vec<usize> = env
+                .state
+                .players
+                .iter()
+                .enumerate()
+                .filter(|&(i, pl)| {
+                    i != hero_seat
+                        && !pl.is_folded
+                        && !pl.is_all_in
+                        && pl.current_bet > 0
+                        && pl.current_bet < actual_highest_bet
+                })
+                .map(|(i, _)| i)
+                .collect();
+
+            if hero_bet_cur == actual_highest_bet && partial_bet_seats.is_empty() {
+                for (i, pl) in env.state.players.iter_mut().enumerate() {
+                    if i != hero_seat && !pl.is_folded && !pl.is_all_in && pl.current_bet < actual_highest_bet {
+                        pl.is_folded = true;
+                    }
+                }
+            } else if partial_bet_seats.len() == 1 {
+                let sb_idx = partial_bet_seats[0];
+                let mut bb_opt = None;
+                for offset in 1..num_players {
+                    let idx = (sb_idx + offset) % num_players;
+                    if !env.state.players[idx].is_folded {
+                        bb_opt = Some(idx);
+                        break;
+                    }
+                }
+                if let Some(bb_idx) = bb_opt {
+                    if env.state.players[bb_idx].current_bet == actual_highest_bet {
+                        let mut cursor = (bb_idx + 1) % num_players;
+                        for _ in 0..num_players {
+                            if cursor == hero_seat || cursor == sb_idx || cursor == bb_idx {
+                                break;
+                            }
+                            let pl = &mut env.state.players[cursor];
+                            if !pl.is_folded && !pl.is_all_in && pl.current_bet < actual_highest_bet {
+                                pl.is_folded = true;
+                            }
+                            cursor = (cursor + 1) % num_players;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let in_hand_count = env.state.players.iter().filter(|pl| !pl.is_folded).count();
 
     // Khôi phục chính xác street_has_acted cho cả người bet lẫn người call trước Hero
     env.street_has_acted = vec![false; num_players];
@@ -910,20 +996,14 @@ pub fn build_environment(state: &HandState, hole: [Card; 2], mode: PlayMode) -> 
     let to_call = actual_highest_bet.saturating_sub(hero_bet);
     let max_total_bet = state.hero_mavtb.unwrap_or(hero_stack_behind + hero_bet);
 
-    let has_opp_with_chips = active_seats.iter().any(|pid| {
-        if pid == &state.hero_id {
+    let has_opp_with_chips = env.state.players.iter().enumerate().any(|(idx, pl)| {
+        if idx == hero_seat {
             return false;
         }
-        if let Some(p) = state.players.get(pid) {
-            let opp_stack_behind = if p.is_all_in {
-                0
-            } else {
-                p.stack.saturating_sub(p.current_bet)
-            };
-            !p.is_folded && !p.is_all_in && !p.is_sitting_out && opp_stack_behind > 0
-        } else {
-            false
-        }
+        let pid = &active_seats[idx];
+        let is_sitting_out = state.players.get(pid).is_some_and(|p| p.is_sitting_out);
+        let opp_stack_behind = if pl.is_all_in { 0 } else { pl.stack };
+        !pl.is_folded && !pl.is_all_in && !is_sitting_out && opp_stack_behind > 0
     });
     let has_chips_to_raise = hero_stack_behind > to_call;
     let mavtb_allows_raise = state.hero_mavtb.is_none_or(|m| m > actual_highest_bet);

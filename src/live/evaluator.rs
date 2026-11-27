@@ -958,4 +958,113 @@ mod tests {
         assert_eq!(s2.bb_size, 2);
         assert_eq!(s2.min_raise, 2);
     }
+
+    #[test]
+    fn test_bb_preflop_limped_pot_excludes_phantom_unbet_opponent_and_unknown_pgs_status() {
+        let adv_mlp = MLP::new(&[FEATURE_DIM, 64, NUM_ACTIONS]);
+        let policy = DeepCFRPolicy::new(Arc::new(RwLock::new(adv_mlp)), true);
+        let mut cfg = PlayConfig::for_mode(PlayMode::Lounge);
+        cfg.advice_only = true;
+
+        // (a) pGS với trạng thái chờ ("waitBigBlind") phải bị đánh dấu fold & sitting out, và giữ nguyên qua start_new_hand
+        let mut s_pgs = HandState::new();
+        s_pgs.hero_id = "hero".to_string();
+        let pkt = json!({
+            "hI": "h_wait_bb_1",
+            "gT": [0, 0],
+            "bigBlind": 2,
+            "smallBlind": 1,
+            "seats": [[1, "hero"], [2, "waiter"], [3, "btn"]],
+            "players": {
+                "hero":   { "stack": 100, "seat": 1 },
+                "waiter": { "stack": 26,  "seat": 2 },
+                "btn":    { "stack": 100, "seat": 3 }
+            },
+            "pGS": { "hero": "inHand", "waiter": "waitBigBlind", "btn": "inHand" }
+        });
+        let _ = process_game_update(&mut s_pgs, &pkt, &policy, &cfg);
+        assert!(s_pgs.players["waiter"].is_sitting_out);
+        assert!(s_pgs.players["waiter"].is_folded);
+
+        s_pgs.start_new_hand("h_wait_bb_2");
+        assert!(
+            s_pgs.players["waiter"].is_folded && s_pgs.players["waiter"].is_sitting_out,
+            "Sitting-out / waitBigBlind player must remain folded on start_new_hand"
+        );
+
+        // (b) Bàn 6-way limped pot với Gayman6 (bet=0, tot=0, stack=26) bị sót fold -> build_environment phải loại sạch
+        let mut state = HandState::new();
+        state.hand_id = "h_bb_limp_phantom".to_string();
+        state.hero_id = "hero_bb".to_string();
+        state.street = Street::Preflop;
+        state.sb_size = 1;
+        state.bb_size = 2;
+        state.highest_bet = 2;
+        state.min_raise = 2;
+        state.dealer_id = Some("talismann".to_string());
+
+        let specs = [
+            ("ben_sb", 1, 98, 2, 2, false),
+            ("hero_bb", 2, 100, 2, 2, false),
+            ("gayman6", 3, 26, 0, 0, false), // phantom unacted/unbet opponent
+            ("dravy", 4, 136, 2, 2, false),
+            ("pt2026", 5, 674, 2, 2, false),
+            ("bingbong", 6, 360, 2, 2, false),
+            ("talismann", 7, 1568, 2, 2, false),
+        ];
+        for &(pid, seat, stack, bet, tot, folded) in &specs {
+            state.seats_order.push(pid.to_string());
+            state.players.insert(
+                pid.to_string(),
+                PlayerTracker {
+                    id: pid.to_string(),
+                    name: pid.to_string(),
+                    seat_num: seat,
+                    stack,
+                    current_bet: bet,
+                    total_contributed: tot,
+                    is_folded: folded,
+                    is_all_in: false,
+                    is_sitting_out: false,
+                },
+            );
+        }
+        for &(pid, seat, amt) in &[
+            ("dravy", 4usize, 2u32),
+            ("pt2026", 5, 2),
+            ("bingbong", 6, 2),
+            ("talismann", 7, 2),
+            ("ben_sb", 1, 1),
+        ] {
+            state.action_history.push(HandActionRecord {
+                player_id: pid.to_string(),
+                seat_num: seat,
+                street: Street::Preflop,
+                action: Action::CheckCall,
+                amount: amt,
+            });
+        }
+
+        let hole = [robust_parse_card("3h").unwrap(), robust_parse_card("3d").unwrap()];
+        let ctx = build_environment(&state, hole, PlayMode::Lounge).unwrap();
+        assert_eq!(ctx.in_hand_count, 6, "Phantom Gayman6 must be folded leaving 6 in-hand");
+
+        let gayman_idx = ctx.active_seats.iter().position(|id| id == "gayman6").unwrap();
+        assert!(ctx.env.state.players[gayman_idx].is_folded, "Gayman6 must be folded");
+
+        for pid in ["ben_sb", "dravy", "pt2026", "bingbong", "talismann"] {
+            let idx = ctx.active_seats.iter().position(|id| id == pid).unwrap();
+            assert!(!ctx.env.state.players[idx].is_folded);
+            assert!(ctx.env.street_has_acted[idx], "Limper {} must have street_has_acted=true", pid);
+        }
+
+        let mut sim = ctx.env.clone();
+        let ended = sim.step(Action::CheckCall).unwrap();
+        assert!(!ended, "BB checking closed Preflop must deal Flop, not end hand");
+        assert_eq!(
+            sim.state.street,
+            Street::Flop,
+            "BB CheckCall in 6-way limped pot must immediately advance to Flop"
+        );
+    }
 }
