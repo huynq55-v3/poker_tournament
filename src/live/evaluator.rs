@@ -857,4 +857,105 @@ mod tests {
         );
         assert_eq!(sim.state.street, Street::Showdown);
     }
+
+    #[test]
+    fn test_preflop_blind_inference_and_stale_registered_metadata_sync() {
+        let adv_mlp = MLP::new(&[FEATURE_DIM, 64, NUM_ACTIONS]);
+        let policy = DeepCFRPolicy::new(Arc::new(RwLock::new(adv_mlp)), true);
+        let mut cfg = PlayConfig::for_mode(PlayMode::Lounge);
+        cfg.advice_only = true;
+
+        // 1. Giả lập restart giữa ván Preflop bàn 1/2 (HandState ban đầu mặc định sb=10, bb=20, min_raise=20)
+        // Gói gC đầu tiên KHÔNG có bigBlind/smallBlind hay tên player
+        let mut state = HandState::new();
+        assert!(!state.registered_synced);
+        assert!(!state.blinds_synced);
+        assert_eq!(state.bb_size, 20);
+
+        let live_gc = json!({
+            "hI": "hand_live_999",
+            "gT": [0, 0],
+            "pot": 17,
+            "cHB": 7,
+            "mR": 12,
+            "dealerID": "p_btn",
+            "seats": [[1, "p_sb"], [2, "p_bb"], [3, "p_utg"], [4, "p_mp"], [5, "p_hero"], [6, "p_btn"]],
+            "players": {
+                "p_sb":   { "stack": 238, "seat": 1 },
+                "p_bb":   { "stack": 97,  "seat": 2 },
+                "p_utg":  { "stack": 91,  "seat": 3 },
+                "p_mp":   { "stack": 242, "seat": 4 },
+                "p_hero": { "stack": 105, "seat": 5 },
+                "p_btn":  { "stack": 200, "seat": 6 }
+            },
+            "pGS": {
+                "p_sb": "inHand", "p_bb": "inHand", "p_utg": "inHand",
+                "p_mp": "inHand", "p_hero": "inHand", "p_btn": "fold"
+            },
+            "tB": { "p_sb": 1, "p_bb": 2, "p_utg": 7, "p_mp": 7 },
+            "pC": { "p_hero": { "cards": ["Kd", "4d"] } }
+        });
+        let _ = process_game_update(&mut state, &live_gc, &policy, &cfg);
+
+        assert!(!state.registered_synced, "Must still request registered sync");
+        assert!(!state.blinds_synced, "tB inference alone must keep blinds_synced=false until explicit blinds arrive");
+        assert_eq!(state.sb_size, 1, "Must infer SB=1 from Preflop tB=[1, 2, 7, 7]");
+        assert_eq!(state.bb_size, 2, "Must infer BB=2 from Preflop tB=[1, 2, 7, 7]");
+        assert_eq!(state.min_raise, 5, "mR=12 minus cHB=7 with bb=2 must yield min_raise=5");
+        assert!(
+            state.action_history.iter().any(|a| a.street == Street::Preflop && a.amount == 7),
+            "Preflop open to 7 must be recorded once bb_size=2 is inferred"
+        );
+
+        // 2. Giả lập trình duyệt gửi lại gói `registered` CŨ (hI khác, stack cũ, pot cũ, nhưng chứa bigBlind & tên thật)
+        let stale_reg = json!({
+            "currentPlayer": { "id": "p_hero" },
+            "gameState": {
+                "hI": "hand_old_1",
+                "bigBlind": 2,
+                "smallBlind": 1,
+                "pot": 999,
+                "cHB": 999,
+                "seats": [[1, "p_sb"], [2, "p_bb"]],
+                "players": {
+                    "p_sb":   { "name": "RegSB",     "stack": 180, "seat": 1 },
+                    "p_bb":   { "name": "FishBB",    "stack": 150, "seat": 2 },
+                    "p_utg":  { "name": "SharkUTG",  "stack": 500, "seat": 3 },
+                    "p_hero": { "name": "HeroReal",  "stack": 300, "seat": 5 }
+                }
+            }
+        });
+        crate::live::sync_registered_packet(&mut state, &stale_reg);
+
+        assert!(state.registered_synced);
+        assert!(state.blinds_synced);
+        assert_eq!(state.hero_id, "p_hero");
+        assert_eq!(state.bb_size, 2);
+        assert_eq!(state.sb_size, 1);
+        assert_eq!(state.hand_id, "hand_live_999", "Stale registered packet must NOT reset active hand_id");
+        assert_eq!(state.pn_total_pot, 17, "Stale registered packet must NOT overwrite live pot");
+        assert_eq!(state.players["p_utg"].stack, 91, "Stale registered packet must NOT overwrite live stack");
+        assert_eq!(state.players["p_utg"].name, "SharkUTG", "Missing player name must be hydrated from registered");
+        assert_eq!(state.players["p_sb"].name, "RegSB");
+        assert!(state.hero_cards.is_some(), "Live hole cards must remain intact");
+
+        // 3. Test thêm case tB chỉ có blinds [1, 2] và KHÔNG có mR => min_raise phải cập nhật theo bb=2
+        let mut s2 = HandState::new();
+        let blind_only_gc = json!({
+            "hI": "h_blind_only",
+            "gT": [0, 0],
+            "pot": 3,
+            "cHB": 2,
+            "seats": [[1, "sb"], [2, "bb"]],
+            "players": {
+                "sb": { "stack": 100, "seat": 1 },
+                "bb": { "stack": 100, "seat": 2 }
+            },
+            "tB": { "sb": 1, "bb": 2 }
+        });
+        let _ = process_game_update(&mut s2, &blind_only_gc, &policy, &cfg);
+        assert_eq!(s2.sb_size, 1);
+        assert_eq!(s2.bb_size, 2);
+        assert_eq!(s2.min_raise, 2);
+    }
 }

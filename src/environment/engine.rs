@@ -431,16 +431,22 @@ impl Environment {
 
     fn advance_to_next_player(&mut self) {
         let num_p = self.state.num_players;
-        let mut next = (self.state.current_player_idx + 1) % num_p;
-        let start = next;
-        loop {
-            if self.state.players[next].is_active() {
+        let cur = self.state.current_player_idx;
+        for offset in 1..=num_p {
+            let next = (cur + offset) % num_p;
+            if self.state.players[next].is_active()
+                && (!self.street_has_acted[next]
+                    || self.state.players[next].current_bet < self.state.current_highest_bet)
+            {
                 self.state.current_player_idx = next;
                 return;
             }
-            next = (next + 1) % num_p;
-            if next == start {
-                break;
+        }
+        for offset in 1..=num_p {
+            let next = (cur + offset) % num_p;
+            if self.state.players[next].is_active() {
+                self.state.current_player_idx = next;
+                return;
             }
         }
     }

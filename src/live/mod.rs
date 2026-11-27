@@ -5,7 +5,7 @@ pub mod protocol;
 use crate::deep_cfr::SubgameSolverConfig;
 pub use evaluator::run_gto_evaluation;
 pub use os_input::{execute_bot_action, set_target_game};
-pub use protocol::{build_active_seats, build_environment, parse_cards_array, process_game_update, robust_parse_card, EvalContext, HandActionRecord, HandState, PlayerTracker};
+pub use protocol::{build_active_seats, build_environment, parse_cards_array, process_game_update, robust_parse_card, sync_registered_packet, EvalContext, HandActionRecord, HandState, PlayerTracker};
 
 pub const DEFAULT_TOURNAMENT_ADV_PATH: &str = "deep_cfr_model.json";
 pub const DEFAULT_TOURNAMENT_STRAT_PATH: &str = "deep_cfr_strategy.json";

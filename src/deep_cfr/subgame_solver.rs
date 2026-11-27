@@ -12,24 +12,25 @@
 use crate::deep_cfr::policy::DeepCFRPolicy;
 use crate::environment::action::{Action, ActionMask, NUM_ACTIONS};
 use crate::environment::engine::Environment;
-use crate::environment::state::{GameState, Street};
+use crate::environment::state::{GameState, Street, MAX_PLAYERS};
 use crate::equity::icm::{calculate_icm_ev, get_sng_payouts};
-use crate::equity::{equity_vs_random, preflop_table};
+use crate::equity::{class_index, equity_vs_random, preflop_table};
 use crate::neural_network::MLP;
-use crate::poker_core::card::Card;
+use crate::poker_core::card::{Card, Rank, Suit};
 use crate::poker_core::deck::Deck;
 use crate::poker_core::evaluator::{evaluate_7_cards, HandRank};
 use rand::distributions::WeightedIndex;
 use rand::prelude::Distribution;
 use rand::{thread_rng, Rng};
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 const BAYESIAN_PROB_FLOOR: f32 = 1e-3;
 const HU_RANGE_SIZE: usize = 28;
 const HU_MAX_TREE_NODES: usize = 384;
 const HU_RUNOUT_SAMPLES: usize = 16;
-const MULTIWAY_RANGE_SIZE: usize = 24;
+const MULTIWAY_RANGE_SIZE: usize = 96;
 
 /// Lý do kích hoạt tìm kiếm theo độ sâu
 #[derive(Clone, Debug, PartialEq)]
@@ -972,6 +973,37 @@ fn eval_avg_strategy_pair(
     }
 }
 
+#[inline]
+fn category_balanced_prior(mask: &ActionMask) -> [f32; NUM_ACTIONS] {
+    let valid = mask.valid_actions();
+    let mut probs = [0.0f32; NUM_ACTIONS];
+    if valid.is_empty() {
+        return probs;
+    }
+    let has_fold = valid.contains(&Action::Fold);
+    let has_call = valid.contains(&Action::CheckCall);
+    let raises: Vec<Action> = valid
+        .iter()
+        .copied()
+        .filter(|&a| a != Action::Fold && a != Action::CheckCall)
+        .collect();
+    let cats = usize::from(has_fold) + usize::from(has_call) + usize::from(!raises.is_empty());
+    let cat_w = 1.0 / cats.max(1) as f32;
+    if has_fold {
+        probs[Action::Fold.to_index()] = cat_w;
+    }
+    if has_call {
+        probs[Action::CheckCall.to_index()] = cat_w;
+    }
+    if !raises.is_empty() {
+        let rw = cat_w / raises.len() as f32;
+        for a in raises {
+            probs[a.to_index()] = rw;
+        }
+    }
+    probs
+}
+
 #[derive(Clone)]
 struct MultiwayNode {
     regrets: [f32; NUM_ACTIONS],
@@ -979,7 +1011,7 @@ struct MultiwayNode {
 }
 
 impl MultiwayNode {
-    fn new_uniform() -> Self {
+    fn new_empty() -> Self {
         Self {
             regrets: [0.0f32; NUM_ACTIONS],
             policy_sum: [0.0f32; NUM_ACTIONS],
@@ -997,13 +1029,10 @@ impl MultiwayNode {
             for a in valid {
                 probs[a.to_index()] = self.regrets[a.to_index()].max(0.0) / pos_sum;
             }
+            probs
         } else {
-            let u = 1.0 / valid.len() as f32;
-            for a in valid {
-                probs[a.to_index()] = u;
-            }
+            category_balanced_prior(mask)
         }
-        probs
     }
 
     fn average_strategy(&self, mask: &ActionMask) -> [f32; NUM_ACTIONS] {
@@ -1033,6 +1062,38 @@ fn pack_board_sig(community: &[Card]) -> u64 {
     sig
 }
 
+fn preflop_sextile_buckets() -> &'static [u8; 169] {
+    static SEXTILES: OnceLock<[u8; 169]> = OnceLock::new();
+    SEXTILES.get_or_init(|| {
+        let mut entries: Vec<(usize, u32, f32)> = Vec::with_capacity(169);
+        for hi in 0..13u8 {
+            for lo in 0..=hi {
+                let (rh, rl) = (Rank::from_u8(hi), Rank::from_u8(lo));
+                if hi == lo {
+                    let h = [Card::new(rh, Suit::Spades), Card::new(rl, Suit::Hearts)];
+                    let cls = class_index(h[0], h[1]);
+                    entries.push((cls, 6, preflop_table().get(h[0], h[1], 1)));
+                } else {
+                    let s = [Card::new(rh, Suit::Spades), Card::new(rl, Suit::Spades)];
+                    let cls_s = class_index(s[0], s[1]);
+                    entries.push((cls_s, 4, preflop_table().get(s[0], s[1], 1)));
+                    let o = [Card::new(rh, Suit::Spades), Card::new(rl, Suit::Hearts)];
+                    let cls_o = class_index(o[0], o[1]);
+                    entries.push((cls_o, 12, preflop_table().get(o[0], o[1], 1)));
+                }
+            }
+        }
+        entries.sort_by(|a, b| a.2.total_cmp(&b.2));
+        let mut buckets = [0u8; 169];
+        let mut cum_combos = 0u32;
+        for (cls, combos, _) in entries {
+            buckets[cls] = (((cum_combos + combos / 2) * 6) / 1326).min(5) as u8;
+            cum_combos += combos;
+        }
+        buckets
+    })
+}
+
 #[inline]
 fn fast_hand_bucket(
     hole: [Card; 2],
@@ -1040,37 +1101,173 @@ fn fast_hand_bucket(
     opp_count: usize,
     bucket_cache: &mut HashMap<(u8, u8, u64), u8>,
 ) -> u8 {
+    let _ = opp_count;
+    if community.len() < 3 {
+        return preflop_sextile_buckets()[class_index(hole[0], hole[1])];
+    }
+
     let (lo, hi) = if hole[0].0 <= hole[1].0 {
         (hole[0].0, hole[1].0)
     } else {
         (hole[1].0, hole[0].0)
     };
-    let b_sig = if community.len() >= 3 {
-        pack_board_sig(community)
-    } else {
-        opp_count.max(1) as u64
-    };
+    let b_sig = pack_board_sig(community);
     let key = (lo, hi, b_sig);
     if let Some(&b) = bucket_cache.get(&key) {
         return b;
     }
 
-    let bucket = if community.len() >= 3 {
-        let eq = equity_vs_random(hole, community, 1);
-        ((eq * 10.0).floor() as i32).clamp(0, 9) as u8
-    } else {
-        let eq = preflop_table().get(hole[0], hole[1], opp_count.max(1));
-        ((eq * 10.0).floor() as i32).clamp(0, 9) as u8
-    };
+    let eq = equity_vs_random(hole, community, 1);
+    let bucket = ((eq * 8.0).floor() as i32).clamp(0, 7) as u8;
     bucket_cache.insert(key, bucket);
     bucket
 }
 
 #[inline]
-fn hash_seq(seq_hash: u64, act_idx: usize) -> u64 {
-    seq_hash
-        .wrapping_mul(1_099_511_628_211)
-        .wrapping_add((act_idx as u64) + 1)
+fn crn_uniform(seed: u64, seat: usize, depth: usize) -> f32 {
+    let mut x = seed
+        ^ ((seat as u64).wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        ^ ((depth as u64).wrapping_add(1).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    ((x >> 40) as f32) * (1.0f32 / 16_777_216.0f32)
+}
+
+#[inline]
+fn sample_action_from_probs_u(probs: &[f32; NUM_ACTIONS], mask: &ActionMask, u: f32) -> Action {
+    let valid = mask.valid_actions();
+    if valid.is_empty() {
+        return Action::Fold;
+    }
+    let total: f32 = valid.iter().map(|a| probs[a.to_index()].max(0.0)).sum();
+    if total <= 1e-8 {
+        let idx = ((u.clamp(0.0, 0.999_999) * valid.len() as f32) as usize).min(valid.len() - 1);
+        return valid[idx];
+    }
+    let target = u.clamp(0.0, 0.999_999) * total;
+    let mut acc = 0.0f32;
+    for &a in &valid {
+        acc += probs[a.to_index()].max(0.0);
+        if target <= acc {
+            return a;
+        }
+    }
+    valid[valid.len() - 1]
+}
+
+struct MultiwayBoardSet {
+    boards: Vec<[HandRank; MAX_PLAYERS]>,
+}
+
+impl MultiwayBoardSet {
+    fn build<R: Rng>(
+        env: &Environment,
+        in_hand_seats: &[usize],
+        rem_deck: &[Card],
+        n_boards: usize,
+        rng: &mut R,
+    ) -> Self {
+        let base_len = env.state.community_cards.len().min(5);
+        let need = 5usize.saturating_sub(base_len);
+        let seats_ok = !in_hand_seats.is_empty()
+            && in_hand_seats.iter().all(|&s| {
+                s < MAX_PLAYERS
+                    && env.state.players[s].hole_cards[0].is_some()
+                    && env.state.players[s].hole_cards[1].is_some()
+            });
+        if !seats_ok {
+            return Self { boards: Vec::new() };
+        }
+
+        let mut hole_pairs: [(usize, Card, Card); MAX_PLAYERS] = [(0, Card(0), Card(1)); MAX_PLAYERS];
+        let mut n_seats = 0usize;
+        for &s in in_hand_seats {
+            hole_pairs[n_seats] = (
+                s,
+                env.state.players[s].hole_cards[0].unwrap(),
+                env.state.players[s].hole_cards[1].unwrap(),
+            );
+            n_seats += 1;
+        }
+
+        let mut board = [Card(0); 5];
+        for (i, &c) in env.state.community_cards.iter().take(5).enumerate() {
+            board[i] = c;
+        }
+
+        if need == 0 {
+            let mut ranks = [HandRank(0); MAX_PLAYERS];
+            for &(s, h0, h1) in &hole_pairs[..n_seats] {
+                let seven = [board[0], board[1], board[2], board[3], board[4], h0, h1];
+                ranks[s] = evaluate_7_cards(&seven);
+            }
+            return Self { boards: vec![ranks] };
+        }
+
+        if rem_deck.len() < need || n_boards == 0 {
+            return Self { boards: Vec::new() };
+        }
+
+        let mut pool = rem_deck.to_vec();
+        let mut pos = pool.len();
+        let mut boards = Vec::with_capacity(n_boards);
+        for _ in 0..n_boards {
+            if pos + need > pool.len() {
+                for i in (1..pool.len()).rev() {
+                    let j = rng.gen_range(0..=i);
+                    pool.swap(i, j);
+                }
+                pos = 0;
+            }
+            for k in 0..need {
+                board[base_len + k] = pool[pos + k];
+            }
+            pos += need;
+
+            let mut ranks = [HandRank(0); MAX_PLAYERS];
+            for &(s, h0, h1) in &hole_pairs[..n_seats] {
+                let seven = [board[0], board[1], board[2], board[3], board[4], h0, h1];
+                ranks[s] = evaluate_7_cards(&seven);
+            }
+            boards.push(ranks);
+        }
+        Self { boards }
+    }
+}
+
+#[inline]
+fn multiway_state_key(
+    env: &Environment,
+    cur: usize,
+    depth: usize,
+    max_depth: usize,
+    raises_after_root: u8,
+) -> u64 {
+    if depth == 0 {
+        return 0;
+    }
+    let p = &env.state.players[cur];
+    let to_call = env.state.current_highest_bet.saturating_sub(p.current_bet);
+    let pot_before_bet = env.state.pot.saturating_sub(to_call).max(1);
+    let facing_tier: u64 = if to_call == 0 {
+        0
+    } else if to_call >= p.stack {
+        1
+    } else if to_call.saturating_mul(5) < pot_before_bet.saturating_mul(2) {
+        2
+    } else if to_call <= pot_before_bet {
+        3
+    } else if to_call <= pot_before_bet.saturating_mul(2) {
+        4
+    } else {
+        5
+    };
+    let street = env.state.street as u64;
+    let r_cap = raises_after_root.min(1) as u64;
+    let is_closing = u64::from(depth >= max_depth);
+    1u64 | (street << 1) | (facing_tier << 4) | (r_cap << 7) | (is_closing << 8)
 }
 
 pub struct SubgameSolver {
@@ -1292,9 +1489,34 @@ impl SubgameSolver {
         let can_finish_board = env.state.community_cards.len() + env.deck.remaining() >= 5;
 
         if in_hand_count <= 1 || (all_have_hole && can_finish_board) {
-            let mut sim = env.clone();
-            Self::resolve_pot_into_stacks(&mut sim);
-            return self.evaluate_resolved_stacks(&sim, target_seat, initial_target_stack, target_start_icm);
+            let need = 5usize.saturating_sub(env.state.community_cards.len());
+            if in_hand_count <= 1 || need == 0 {
+                let mut sim = env.clone();
+                Self::resolve_pot_into_stacks(&mut sim);
+                return self.evaluate_resolved_stacks(&sim, target_seat, initial_target_stack, target_start_icm);
+            }
+            let max_disjoint = (env.deck.remaining() / need).max(1);
+            let n_rollouts = (if need >= 4 { 6 } else { 3 }).min(max_disjoint);
+            let mut deck_copy = env.deck.clone();
+            let mut sum_ev = 0.0f32;
+            let mut done_rollouts = 0usize;
+            for _ in 0..n_rollouts {
+                let mut sim = env.clone();
+                for _ in 0..need {
+                    if let Some(c) = deck_copy.deal() {
+                        sim.state.community_cards.push(c);
+                    }
+                }
+                Self::resolve_pot_into_stacks(&mut sim);
+                sum_ev += self.evaluate_resolved_stacks(
+                    &sim,
+                    target_seat,
+                    initial_target_stack,
+                    target_start_icm,
+                );
+                done_rollouts += 1;
+            }
+            return sum_ev / done_rollouts.max(1) as f32;
         }
 
         // Fallback equity vs random khi bộ bài không đủ chia thêm
@@ -1329,6 +1551,212 @@ impl SubgameSolver {
             };
             let expected_chips = target_player.stack as f32 + (eq * env.state.pot as f32);
             (expected_chips - initial_target_stack as f32) / bb
+        }
+    }
+
+    fn evaluate_multiway_leaf(
+        &self,
+        before_opt: Option<(&Environment, usize)>,
+        env: &Environment,
+        board_set: &MultiwayBoardSet,
+        target_seat: usize,
+        initial_target_stack: u32,
+        target_start_icm: f32,
+    ) -> f32 {
+        let in_hand: Vec<usize> = env
+            .state
+            .players
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.is_in_hand())
+            .map(|(i, _)| i)
+            .collect();
+
+        if in_hand.len() <= 1 {
+            if env.state.pot == 0 {
+                return self.evaluate_resolved_stacks(
+                    env,
+                    target_seat,
+                    initial_target_stack,
+                    target_start_icm,
+                );
+            }
+            let mut sim = env.clone();
+            if let Some(&winner) = in_hand.first() {
+                sim.state.players[winner].stack += sim.state.pot;
+                sim.state.pot = 0;
+            }
+            return self.evaluate_resolved_stacks(
+                &sim,
+                target_seat,
+                initial_target_stack,
+                target_start_icm,
+            );
+        }
+
+        if env.state.players[target_seat].is_folded && !self.config.use_icm {
+            let bb = env.state.bb_size.max(1) as f32;
+            return (env.state.players[target_seat].stack as f32 - initial_target_stack as f32) / bb;
+        }
+
+        if board_set.boards.is_empty() {
+            return self.evaluate_multiway_outcome(
+                env,
+                target_seat,
+                initial_target_stack,
+                target_start_icm,
+            );
+        }
+
+        let (pre_stacks, pre_pot): (Vec<u32>, u32) = if env.state.pot > 0 {
+            (env.state.players.iter().map(|p| p.stack).collect(), env.state.pot)
+        } else if let Some((before_env, actor)) = before_opt {
+            let added = env.state.players[actor]
+                .total_contributed
+                .saturating_sub(before_env.state.players[actor].total_contributed);
+            let mut ps: Vec<u32> = before_env.state.players.iter().map(|p| p.stack).collect();
+            if actor < ps.len() {
+                ps[actor] = ps[actor].saturating_sub(added);
+            }
+            (ps, before_env.state.pot.saturating_add(added))
+        } else {
+            return self.evaluate_resolved_stacks(
+                env,
+                target_seat,
+                initial_target_stack,
+                target_start_icm,
+            );
+        };
+
+        let in_hand_mask: u32 = in_hand.iter().fold(0u32, |m, &i| m | (1u32 << i));
+        let mut slices: Vec<(u32, u32)> = Vec::new();
+        let all_have_contrib = in_hand
+            .iter()
+            .all(|&i| env.state.players[i].total_contributed > 0);
+        if all_have_contrib {
+            let mut contributions: Vec<(usize, u32)> = env
+                .state
+                .players
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (i, p.total_contributed))
+                .filter(|&(_, amt)| amt > 0)
+                .collect();
+            let mut rem_pot = pre_pot;
+            while !contributions.is_empty() && rem_pot > 0 {
+                let min_c = contributions.iter().map(|&(_, amt)| amt).min().unwrap();
+                let slice = (min_c * contributions.len() as u32).min(rem_pot);
+                let mut elig_mask = 0u32;
+                for &(idx, _) in &contributions {
+                    let bit = 1u32 << idx;
+                    if (in_hand_mask & bit) != 0 {
+                        elig_mask |= bit;
+                    }
+                }
+                if elig_mask != 0 && slice > 0 {
+                    slices.push((slice, elig_mask));
+                    rem_pot -= slice;
+                }
+                for (_, amt) in &mut contributions {
+                    *amt -= min_c;
+                }
+                contributions.retain(|&(_, amt)| amt > 0);
+            }
+            if rem_pot > 0 {
+                slices.push((rem_pot, in_hand_mask));
+            }
+        } else if pre_pot > 0 {
+            slices.push((pre_pot, in_hand_mask));
+        }
+
+        if !self.config.use_icm {
+            let n_boards = board_set.boards.len() as f64;
+            let bb = env.state.bb_size.max(1) as f64;
+            let target_bit = 1u32 << target_seat;
+            let mut target_won_sum = 0.0f64;
+            for ranks in &board_set.boards {
+                for &(slice_amt, elig_mask) in &slices {
+                    if (elig_mask & target_bit) == 0 {
+                        continue;
+                    }
+                    let mut best_rank: Option<HandRank> = None;
+                    let mut n_winners = 0u32;
+                    let mut m = elig_mask;
+                    while m != 0 {
+                        let seat = m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        let r = ranks[seat];
+                        match best_rank {
+                            None => {
+                                best_rank = Some(r);
+                                n_winners = 1;
+                            }
+                            Some(br) if r > br => {
+                                best_rank = Some(r);
+                                n_winners = 1;
+                            }
+                            Some(br) if r == br => {
+                                n_winners += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if best_rank == Some(ranks[target_seat]) && n_winners > 0 {
+                        target_won_sum += slice_amt as f64 / n_winners as f64;
+                    }
+                }
+            }
+            ((pre_stacks[target_seat] as f64 + target_won_sum / n_boards - initial_target_stack as f64) / bb) as f32
+        } else {
+            let n_boards = board_set.boards.len() as f32;
+            let payouts = get_sng_payouts(pre_stacks.len());
+            let mut icm_sum = 0.0f32;
+            let mut end_stacks = vec![0.0f32; pre_stacks.len()];
+            for ranks in &board_set.boards {
+                for (i, &st) in pre_stacks.iter().enumerate() {
+                    end_stacks[i] = st as f32;
+                }
+                for &(slice_amt, elig_mask) in &slices {
+                    let mut best_rank: Option<HandRank> = None;
+                    let mut winner_mask = 0u32;
+                    let mut n_winners = 0u32;
+                    let mut m = elig_mask;
+                    while m != 0 {
+                        let seat = m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        let r = ranks[seat];
+                        match best_rank {
+                            None => {
+                                best_rank = Some(r);
+                                winner_mask = 1u32 << seat;
+                                n_winners = 1;
+                            }
+                            Some(br) if r > br => {
+                                best_rank = Some(r);
+                                winner_mask = 1u32 << seat;
+                                n_winners = 1;
+                            }
+                            Some(br) if r == br => {
+                                winner_mask |= 1u32 << seat;
+                                n_winners += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if n_winners > 0 {
+                        let share = slice_amt as f32 / n_winners as f32;
+                        let mut wm = winner_mask;
+                        while wm != 0 {
+                            let seat = wm.trailing_zeros() as usize;
+                            wm &= wm - 1;
+                            end_stacks[seat] += share;
+                        }
+                    }
+                }
+                let end_evs = calculate_icm_ev(&end_stacks, payouts);
+                icm_sum += end_evs.get(target_seat).copied().unwrap_or(0.0);
+            }
+            ((icm_sum / n_boards) - target_start_icm) * 10.0
         }
     }
 
@@ -1791,20 +2219,29 @@ impl SubgameSolver {
         &self,
         env: &mut Environment,
         depth: usize,
-        iter_weight: f32,
+        max_depth: usize,
+        root_street: Street,
+        board_set: &MultiwayBoardSet,
+        regret_iter_w: f32,
+        policy_iter_w: f32,
         traverser_seat: usize,
         initial_traverser_stack: u32,
         traverser_start_icm: f32,
-        seq_hash: u64,
+        seat_roles: &[u8],
+        raises_after_root: u8,
+        regret_weight: f32,
         update_table: bool,
-        root_explore_eps: f32,
+        probe_all_root: bool,
+        crn_seed: Option<u64>,
         infoset_table: &mut HashMap<(u8, u8, u64), MultiwayNode>,
         bucket_cache: &mut HashMap<(u8, u8, u64), u8>,
         rng: &mut R,
     ) -> f32 {
-        if env.state.street == Street::Showdown {
-            return self.evaluate_multiway_outcome(
+        if env.state.street != root_street || env.state.street == Street::Showdown {
+            return self.evaluate_multiway_leaf(
+                None,
                 env,
+                board_set,
                 traverser_seat,
                 initial_traverser_stack,
                 traverser_start_icm,
@@ -1813,17 +2250,26 @@ impl SubgameSolver {
 
         let in_hand_count = env.state.players.iter().filter(|p| p.is_in_hand()).count();
         if in_hand_count <= 1 {
-            return self.evaluate_multiway_outcome(
+            return self.evaluate_multiway_leaf(
+                None,
                 env,
+                board_set,
                 traverser_seat,
                 initial_traverser_stack,
                 traverser_start_icm,
             );
         }
 
-        if depth >= self.config.max_depth {
-            return self.evaluate_multiway_outcome(
+        let has_unanswered_bet = env
+            .state
+            .players
+            .iter()
+            .any(|p| p.is_active() && p.current_bet < env.state.current_highest_bet);
+        if (depth >= max_depth && !has_unanswered_bet) || depth >= max_depth + env.state.num_players {
+            return self.evaluate_multiway_leaf(
+                None,
                 env,
+                board_set,
                 traverser_seat,
                 initial_traverser_stack,
                 traverser_start_icm,
@@ -1831,10 +2277,22 @@ impl SubgameSolver {
         }
 
         let cur = env.state.current_player_idx;
-        let mask = env.get_action_mask();
+        let mut mask = env.get_action_mask();
+        if depth >= max_depth {
+            let mut close_mask = ActionMask::EMPTY;
+            if mask.is_valid(Action::Fold) {
+                close_mask.enable(Action::Fold);
+            }
+            if mask.is_valid(Action::CheckCall) {
+                close_mask.enable(Action::CheckCall);
+            }
+            mask = close_mask;
+        }
         if mask.0 == 0 {
-            return self.evaluate_multiway_outcome(
+            return self.evaluate_multiway_leaf(
+                None,
                 env,
+                board_set,
                 traverser_seat,
                 initial_traverser_stack,
                 traverser_start_icm,
@@ -1854,29 +2312,44 @@ impl SubgameSolver {
             in_hand_count.saturating_sub(1),
             bucket_cache,
         );
-        let key = (cur as u8, bucket, seq_hash);
+        let role = seat_roles.get(cur).copied().unwrap_or(cur as u8);
+        let state_key = multiway_state_key(env, cur, depth, max_depth, raises_after_root);
+        let key = (role, bucket, state_key);
 
         let strat = if update_table {
-            let node = infoset_table.entry(key).or_insert_with(MultiwayNode::new_uniform);
+            let node = infoset_table.entry(key).or_insert_with(MultiwayNode::new_empty);
             node.current_strategy(&mask)
         } else if let Some(node) = infoset_table.get(&key) {
             node.average_strategy(&mask)
         } else {
-            Self::cfr_regret_matching(&[0.0; NUM_ACTIONS], &mask)
+            category_balanced_prior(&mask)
         };
 
         if update_table && cur == traverser_seat {
             let valid_actions = mask.valid_actions();
             let mut action_vals = [0.0f32; NUM_ACTIONS];
             let mut expected_v = 0.0f32;
+            let branch_seed = Some(crn_seed.unwrap_or_else(|| rng.gen::<u64>()));
 
             for &a in &valid_actions {
                 let a_idx = a.to_index();
                 let mut branch = env.clone();
                 let done = branch.step(a).unwrap_or(true);
-                let v = if done {
-                    self.evaluate_multiway_outcome(
+                let next_raises = if depth == 0 {
+                    0
+                } else if branch.state.current_highest_bet > env.state.current_highest_bet {
+                    raises_after_root.saturating_add(1).min(1)
+                } else {
+                    raises_after_root
+                };
+                let v = if a == Action::Fold && !self.config.use_icm {
+                    let bb = env.state.bb_size.max(1) as f32;
+                    (branch.state.players[traverser_seat].stack as f32 - initial_traverser_stack as f32) / bb
+                } else if done {
+                    self.evaluate_multiway_leaf(
+                        Some((env, cur)),
                         &branch,
+                        board_set,
                         traverser_seat,
                         initial_traverser_stack,
                         traverser_start_icm,
@@ -1885,13 +2358,20 @@ impl SubgameSolver {
                     self.traverse_multiway_cfr(
                         &mut branch,
                         depth + 1,
-                        iter_weight,
+                        max_depth,
+                        root_street,
+                        board_set,
+                        regret_iter_w,
+                        policy_iter_w,
                         traverser_seat,
                         initial_traverser_stack,
                         traverser_start_icm,
-                        hash_seq(seq_hash, a_idx),
+                        seat_roles,
+                        next_raises,
+                        regret_weight,
                         true,
-                        root_explore_eps,
+                        false,
+                        branch_seed,
                         infoset_table,
                         bucket_cache,
                         rng,
@@ -1904,34 +2384,149 @@ impl SubgameSolver {
             if let Some(node) = infoset_table.get_mut(&key) {
                 for &a in &valid_actions {
                     let a_idx = a.to_index();
-                    node.regrets[a_idx] = (node.regrets[a_idx] + (action_vals[a_idx] - expected_v)).max(0.0);
-                    node.policy_sum[a_idx] += iter_weight * strat[a_idx];
+                    node.regrets[a_idx] += regret_iter_w * regret_weight * (action_vals[a_idx] - expected_v);
+                    if policy_iter_w > 0.0 {
+                        node.policy_sum[a_idx] += policy_iter_w * regret_weight * strat[a_idx];
+                    }
                 }
             }
             expected_v
         } else {
-            // Ở depth == 0 trong pha cập nhật đối thủ, trộn thêm `root_explore_eps` khám phá đều các nhánh Hero
-            // để đối thủ luôn được ghé thăm và học phản ứng Nash cho mọi sizing (Check, Bet, All-In).
-            let sample_probs = if depth == 0 && cur != traverser_seat && root_explore_eps > 0.0 {
+            let unanswered_cnt = env
+                .state
+                .players
+                .iter()
+                .filter(|p| p.is_active() && p.current_bet < env.state.current_highest_bet)
+                .count();
+            if !update_table && (depth == 1 || (depth >= max_depth && unanswered_cnt <= 1)) {
                 let valid = mask.valid_actions();
-                let u = 1.0 / valid.len().max(1) as f32;
-                let mut mixed = [0.0f32; NUM_ACTIONS];
-                for a in valid {
-                    let idx = a.to_index();
-                    mixed[idx] = (1.0 - root_explore_eps) * strat[idx] + root_explore_eps * u;
+                let mut exp_v = 0.0f32;
+                let mut prob_sum = 0.0f32;
+                for &a in &valid {
+                    let a_idx = a.to_index();
+                    let p = strat[a_idx];
+                    if p <= 0.01 {
+                        continue;
+                    }
+                    prob_sum += p;
+                    let mut branch = env.clone();
+                    let done = branch.step(a).unwrap_or(true);
+                    let next_raises = if branch.state.current_highest_bet > env.state.current_highest_bet {
+                        raises_after_root.saturating_add(1).min(1)
+                    } else {
+                        raises_after_root
+                    };
+                    let v = if done {
+                        self.evaluate_multiway_leaf(
+                            Some((env, cur)),
+                            &branch,
+                            board_set,
+                            traverser_seat,
+                            initial_traverser_stack,
+                            traverser_start_icm,
+                        )
+                    } else {
+                        self.traverse_multiway_cfr(
+                            &mut branch,
+                            depth + 1,
+                            max_depth,
+                            root_street,
+                            board_set,
+                            regret_iter_w,
+                            policy_iter_w,
+                            traverser_seat,
+                            initial_traverser_stack,
+                            traverser_start_icm,
+                            seat_roles,
+                            next_raises,
+                            regret_weight,
+                            false,
+                            false,
+                            crn_seed,
+                            infoset_table,
+                            bucket_cache,
+                            rng,
+                        )
+                    };
+                    exp_v += p * v;
                 }
-                mixed
-            } else {
-                strat
-            };
+                if prob_sum > 1e-6 {
+                    return exp_v / prob_sum;
+                }
+            }
 
-            let a = sample_action_from_probs(&sample_probs, &mask, rng);
-            let a_idx = a.to_index();
+            if update_table && depth == 0 && cur != traverser_seat {
+                let valid = mask.valid_actions();
+                let mut exp_v = 0.0f32;
+                let mut weight_sum = 0.0f32;
+                for &a in &valid {
+                    if a == Action::Fold {
+                        continue;
+                    }
+                    let a_idx = a.to_index();
+                    let p = strat[a_idx];
+                    if !probe_all_root && p < 0.02 {
+                        continue;
+                    }
+                    let next_regret_weight = regret_weight * if probe_all_root { p.max(0.01) } else { p };
+                    let mut branch = env.clone();
+                    let done = branch.step(a).unwrap_or(true);
+                    let v = if done {
+                        self.evaluate_multiway_leaf(
+                            Some((env, cur)),
+                            &branch,
+                            board_set,
+                            traverser_seat,
+                            initial_traverser_stack,
+                            traverser_start_icm,
+                        )
+                    } else {
+                        self.traverse_multiway_cfr(
+                            &mut branch,
+                            1,
+                            max_depth,
+                            root_street,
+                            board_set,
+                            regret_iter_w,
+                            policy_iter_w,
+                            traverser_seat,
+                            initial_traverser_stack,
+                            traverser_start_icm,
+                            seat_roles,
+                            0,
+                            next_regret_weight,
+                            true,
+                            false,
+                            crn_seed,
+                            infoset_table,
+                            bucket_cache,
+                            rng,
+                        )
+                    };
+                    exp_v += p * v;
+                    weight_sum += p;
+                }
+                return if weight_sum > 1e-6 { exp_v / weight_sum } else { 0.0 };
+            }
+
+            let u = crn_seed
+                .map(|s| crn_uniform(s, cur, depth))
+                .unwrap_or_else(|| rng.gen::<f32>());
+            let a = sample_action_from_probs_u(&strat, &mask, u);
             let mut branch = env.clone();
             let done = branch.step(a).unwrap_or(true);
+            let next_raises = if depth == 0 {
+                0
+            } else if branch.state.current_highest_bet > env.state.current_highest_bet {
+                raises_after_root.saturating_add(1).min(1)
+            } else {
+                raises_after_root
+            };
             if done {
-                self.evaluate_multiway_outcome(
+                self.evaluate_multiway_leaf(
+                    Some((env, cur)),
                     &branch,
+                    board_set,
                     traverser_seat,
                     initial_traverser_stack,
                     traverser_start_icm,
@@ -1940,13 +2535,20 @@ impl SubgameSolver {
                 self.traverse_multiway_cfr(
                     &mut branch,
                     depth + 1,
-                    iter_weight,
+                    max_depth,
+                    root_street,
+                    board_set,
+                    regret_iter_w,
+                    policy_iter_w,
                     traverser_seat,
                     initial_traverser_stack,
                     traverser_start_icm,
-                    hash_seq(seq_hash, a_idx),
+                    seat_roles,
+                    next_raises,
+                    regret_weight,
                     update_table,
-                    root_explore_eps,
+                    false,
+                    crn_seed,
                     infoset_table,
                     bucket_cache,
                     rng,
@@ -2045,12 +2647,21 @@ impl SubgameSolver {
             .copied()
             .filter(|&s| s != hero_seat)
             .collect();
+        let mut seat_roles = vec![2u8; env.state.num_players];
+        seat_roles[hero_seat] = 0;
+        for &s in &all_opp_seats {
+            let has_hist = ranges.get(&s).map(|(_, _, steps)| *steps).unwrap_or(0) > 0;
+            seat_roles[s] = if has_hist { 1 } else { 2 };
+        }
         // Chỉ chọn đối thủ còn quyền hành động (không phí vòng lặp vào người đã All-In)
         let active_opp_seats: Vec<usize> = all_opp_seats
             .iter()
             .copied()
             .filter(|&s| env.state.players[s].is_active())
             .collect();
+        // Đảm bảo độ sâu đủ phủ ít nhất hết 1 vòng cược cho mọi người chơi active còn lại
+        let active_count = active_opp_seats.len() + usize::from(env.state.players[hero_seat].is_active());
+        let effective_max_depth = self.config.max_depth.max(active_count).min(8);
 
         // Tính Hero Showdown Equity ước lượng vs đối thủ trên sample
         let hero_showdown_eq = if let Some([hc0, hc1]) = hero_hole {
@@ -2059,180 +2670,153 @@ impl SubgameSolver {
             1.0 / in_hand_seats.len().max(1) as f32
         };
 
-        let iters = self.config.iterations.max(1);
-        let burn_in = iters / 3;
+        let root_street = env.state.street;
+        let base_need = 5usize.saturating_sub(env.state.community_cards.len().min(5));
+        let train_board_count = match base_need {
+            0 => 1,
+            1 => 8,
+            2 => 12,
+            _ => 16,
+        };
+        let eval_board_count = match base_need {
+            0 => 1,
+            1 => 12,
+            2 => 16,
+            _ => 24,
+        };
 
-        for iter_idx in 0..iters {
-            let iter_w = (iter_idx + 1) as f32;
+        let mut community_dead = [false; 52];
+        for c in &env.state.community_cards {
+            community_dead[c.0 as usize] = true;
+        }
+        let hero_start_icm = start_icms.get(hero_seat).copied().unwrap_or(0.0);
 
-            // Pha A: Cập nhật bảng infoset công khai cho chính Hero (value + bluff đều cập nhật)
-            {
-                let mut hero_pub_branch = env.clone();
-                let mut used = [false; 52];
-                for c in &env.state.community_cards {
-                    used[c.0 as usize] = true;
-                }
-                for (i, p) in hero_pub_branch.state.players.iter().enumerate() {
-                    if i != hero_seat {
-                        for c in p.hole_cards.iter().flatten() {
-                            used[c.0 as usize] = true;
-                        }
-                    }
-                }
-                for &s in in_hand_seats {
-                    let already_known = s != hero_seat
-                        && hero_pub_branch.state.players[s].hole_cards[0].is_some()
-                        && hero_pub_branch.state.players[s].hole_cards[1].is_some();
-                    if already_known {
-                        continue;
-                    }
-                    if let Some([c0, c1]) = sample_hand_from_bayesian_pool(
-                        ranges.get(&s).map(|(h, w, _)| (h.as_slice(), w.as_slice())),
-                        &mut used,
-                        &mut rng,
-                    ) {
-                        hero_pub_branch.state.players[s].hole_cards = [Some(c0), Some(c1)];
-                    }
-                }
-                let mut rem_deck: Vec<Card> = (0..52)
-                    .filter(|&idx| !used[idx])
-                    .map(|idx| Card(idx as u8))
-                    .collect();
-                for i in (1..rem_deck.len()).rev() {
-                    let j = rng.gen_range(0..=i);
-                    rem_deck.swap(i, j);
-                }
-                hero_pub_branch.deck = Deck::from_remaining(&rem_deck);
+        let base_iters = self.config.iterations.max(1);
+        let total_iters = base_iters.saturating_mul(3);
+        let burn_in = total_iters / 3;
 
-                self.traverse_multiway_cfr(
-                    &mut hero_pub_branch,
-                    0,
-                    iter_w,
-                    hero_seat,
-                    hero_initial_stack,
-                    start_icms.get(hero_seat).copied().unwrap_or(0.0),
-                    0,
-                    true,
-                    0.0,
-                    &mut infoset_table,
-                    &mut bucket_cache,
-                    &mut rng,
-                );
-            }
+        // Giai đoạn 1: Huấn luyện InfoSet đối thủ và Hero công khai (Pha B + Pha A)
+        for iter_idx in 0..total_iters {
+            let (public_env, rem_deck) = sample_multiway_world(
+                env,
+                in_hand_seats,
+                &community_dead,
+                hero_seat,
+                &ranges,
+                &mut rng,
+            );
+            let train_boards = MultiwayBoardSet::build(
+                &public_env,
+                in_hand_seats,
+                &rem_deck,
+                train_board_count,
+                &mut rng,
+            );
+            let regret_iter_w = (iter_idx + 1) as f32;
+            let policy_iter_w = if iter_idx >= burn_in {
+                (iter_idx - burn_in + 1) as f32
+            } else {
+                0.0
+            };
+            let probe = iter_idx % 2 == 0;
 
-            // Pha B: Cập nhật regret CFR+ cho 1 đối thủ active (dùng Hero public range + exploration 20% ở root)
-            if !active_opp_seats.is_empty() {
-                let opp_target = active_opp_seats[iter_idx % active_opp_seats.len()];
-                let mut opp_branch = env.clone();
-                let mut used = [false; 52];
-                for c in &env.state.community_cards {
-                    used[c.0 as usize] = true;
-                }
-                for (i, p) in opp_branch.state.players.iter().enumerate() {
-                    if i != hero_seat {
-                        for c in p.hole_cards.iter().flatten() {
-                            used[c.0 as usize] = true;
-                        }
-                    }
-                }
-                for &s in in_hand_seats {
-                    let already_known = s != hero_seat
-                        && opp_branch.state.players[s].hole_cards[0].is_some()
-                        && opp_branch.state.players[s].hole_cards[1].is_some();
-                    if already_known {
-                        continue;
-                    }
-                    if let Some([c0, c1]) = sample_hand_from_bayesian_pool(
-                        ranges.get(&s).map(|(h, w, _)| (h.as_slice(), w.as_slice())),
-                        &mut used,
-                        &mut rng,
-                    ) {
-                        opp_branch.state.players[s].hole_cards = [Some(c0), Some(c1)];
-                    }
-                }
-                let mut rem_deck: Vec<Card> = (0..52)
-                    .filter(|&idx| !used[idx])
-                    .map(|idx| Card(idx as u8))
-                    .collect();
-                for i in (1..rem_deck.len()).rev() {
-                    let j = rng.gen_range(0..=i);
-                    rem_deck.swap(i, j);
-                }
-                opp_branch.deck = Deck::from_remaining(&rem_deck);
-
+            // Pha B: Cập nhật regret CFR+ cho TẤT CẢ đối thủ active trước Hero
+            for &opp_target in &active_opp_seats {
+                let mut opp_branch = public_env.clone();
                 let init_opp_stack = opp_branch.state.players[opp_target].stack;
                 let opp_start_icm = start_icms.get(opp_target).copied().unwrap_or(0.0);
                 self.traverse_multiway_cfr(
                     &mut opp_branch,
                     0,
-                    iter_w,
+                    effective_max_depth,
+                    root_street,
+                    &train_boards,
+                    regret_iter_w,
+                    policy_iter_w,
                     opp_target,
                     init_opp_stack,
                     opp_start_icm,
+                    &seat_roles,
                     0,
+                    1.0,
                     true,
-                    0.20,
+                    probe,
+                    None,
                     &mut infoset_table,
                     &mut bucket_cache,
                     &mut rng,
                 );
             }
 
-            // Pha C: Duyệt tay bài thật `hero_hole` của Hero trên mọi nhánh root (read-only đối với bảng đối thủ)
-            let mut branch = env.clone();
-            let mut used = fixed_dead;
-            for (i, p) in branch.state.players.iter().enumerate() {
-                if i != hero_seat {
-                    for c in p.hole_cards.iter().flatten() {
-                        used[c.0 as usize] = true;
-                    }
-                }
-            }
-            for &s in &all_opp_seats {
-                if branch.state.players[s].hole_cards[0].is_some()
-                    && branch.state.players[s].hole_cards[1].is_some()
-                {
-                    continue;
-                }
-                if let Some([c0, c1]) = sample_hand_from_bayesian_pool(
-                    ranges.get(&s).map(|(h, w, _)| (h.as_slice(), w.as_slice())),
-                    &mut used,
+            // Pha A: Cập nhật bảng infoset công khai cho chính Hero (value + bluff đều cập nhật)
+            {
+                let mut hero_pub_branch = public_env.clone();
+                self.traverse_multiway_cfr(
+                    &mut hero_pub_branch,
+                    0,
+                    effective_max_depth,
+                    root_street,
+                    &train_boards,
+                    regret_iter_w,
+                    policy_iter_w,
+                    hero_seat,
+                    hero_initial_stack,
+                    hero_start_icm,
+                    &seat_roles,
+                    0,
+                    1.0,
+                    true,
+                    false,
+                    None,
+                    &mut infoset_table,
+                    &mut bucket_cache,
                     &mut rng,
-                ) {
-                    branch.state.players[s].hole_cards = [Some(c0), Some(c1)];
-                }
+                );
             }
-            let mut rem_deck: Vec<Card> = (0..52)
-                .filter(|&idx| !used[idx])
-                .map(|idx| Card(idx as u8))
-                .collect();
-            for i in (1..rem_deck.len()).rev() {
-                let j = rng.gen_range(0..=i);
-                rem_deck.swap(i, j);
-            }
-            branch.deck = Deck::from_remaining(&rem_deck);
+        }
+
+        // Giai đoạn 2 (Pha C): Đánh giá tay bài thật `hero_hole` trước chiến lược trung bình đã hội tụ
+        let eval_iters = base_iters.saturating_mul(2).clamp(160, 400);
+        for eval_idx in 0..eval_iters {
+            let (branch, rem_deck) = sample_multiway_world(
+                env,
+                &all_opp_seats,
+                &fixed_dead,
+                hero_seat,
+                &ranges,
+                &mut rng,
+            );
+            let eval_boards = MultiwayBoardSet::build(
+                &branch,
+                in_hand_seats,
+                &rem_deck,
+                eval_board_count,
+                &mut rng,
+            );
+            let crn_seed = Some(rng.gen::<u64>());
 
             let strat = Self::cfr_regret_matching(&root_regrets, &mask);
             let mut cur_vals = [0.0f32; NUM_ACTIONS];
             let mut expected_v = 0.0f32;
-            let track_stats = iter_idx >= burn_in;
-            if track_stats {
-                eval_n += 1;
-            }
+            eval_n += 1;
 
             for &a in &valid_actions {
                 let a_idx = a.to_index();
                 let mut child = branch.clone();
                 let done = child.step(a).unwrap_or(true);
-                let v = if done {
-                    self.evaluate_multiway_outcome(
+                let v = if a == Action::Fold && !self.config.use_icm {
+                    0.0
+                } else if done {
+                    self.evaluate_multiway_leaf(
+                        Some((&branch, hero_seat)),
                         &child,
+                        &eval_boards,
                         hero_seat,
                         hero_initial_stack,
-                        start_icms.get(hero_seat).copied().unwrap_or(0.0),
+                        hero_start_icm,
                     )
                 } else {
-                    if track_stats && child.state.current_player_idx != hero_seat {
+                    if a != Action::Fold && child.state.current_player_idx != hero_seat {
                         let opp_cur = child.state.current_player_idx;
                         let opp_mask = child.get_action_mask();
                         if opp_mask.0 != 0 {
@@ -2250,11 +2834,16 @@ impl SubgameSolver {
                                 opp_in.saturating_sub(1),
                                 &mut bucket_cache,
                             );
-                            let opp_key = (opp_cur as u8, bucket, hash_seq(0, a_idx));
+                            let opp_role = seat_roles.get(opp_cur).copied().unwrap_or(opp_cur as u8);
+                            let opp_key = (
+                                opp_role,
+                                bucket,
+                                multiway_state_key(&child, opp_cur, 1, effective_max_depth, 0),
+                            );
                             let opp_probs = if let Some(node) = infoset_table.get(&opp_key) {
                                 node.average_strategy(&opp_mask)
                             } else {
-                                Self::cfr_regret_matching(&[0.0; NUM_ACTIONS], &opp_mask)
+                                category_balanced_prior(&opp_mask)
                             };
                             opp_resp_total[a_idx] += 1;
                             for oa in opp_mask.valid_actions() {
@@ -2271,13 +2860,20 @@ impl SubgameSolver {
                     self.traverse_multiway_cfr(
                         &mut child,
                         1,
-                        iter_w,
+                        effective_max_depth,
+                        root_street,
+                        &eval_boards,
+                        1.0,
+                        0.0,
                         hero_seat,
                         hero_initial_stack,
-                        start_icms.get(hero_seat).copied().unwrap_or(0.0),
-                        hash_seq(0, a_idx),
+                        hero_start_icm,
+                        &seat_roles,
+                        0,
+                        1.0,
                         false,
-                        0.0,
+                        false,
+                        crn_seed,
                         &mut infoset_table,
                         &mut bucket_cache,
                         &mut rng,
@@ -2285,17 +2881,16 @@ impl SubgameSolver {
                 };
 
                 cur_vals[a_idx] = v;
-                if track_stats {
-                    sum_v[a_idx] += v as f64;
-                    sum_sq_v[a_idx] += (v as f64) * (v as f64);
-                }
+                sum_v[a_idx] += v as f64;
+                sum_sq_v[a_idx] += (v as f64) * (v as f64);
                 expected_v += strat[a_idx] * v;
             }
 
+            let post_w = (eval_idx + 1) as f32;
             for &a in &valid_actions {
                 let i = a.to_index();
-                root_regrets[i] = (root_regrets[i] + (cur_vals[i] - expected_v)).max(0.0);
-                root_policy_sum[i] += iter_w * strat[i];
+                root_regrets[i] += cur_vals[i] - expected_v;
+                root_policy_sum[i] += post_w * strat[i];
             }
         }
 
@@ -2355,7 +2950,7 @@ impl SubgameSolver {
             action_probs,
             action_evs,
             trigger,
-            iterations_run: iters,
+            iterations_run: total_iters,
             duration_ms: start_time.elapsed().as_secs_f64() * 1000.0,
             diagnostics: SubgameDiagnostics {
                 solver_kind: "N-Player Multiway CFR+",
@@ -2496,16 +3091,53 @@ fn sample_hand_from_bayesian_pool<R: Rng>(
     Some([c0, c1])
 }
 
-fn sample_action_from_probs<R: Rng>(probs: &[f32; NUM_ACTIONS], mask: &ActionMask, rng: &mut R) -> Action {
-    if let Ok(dist) = WeightedIndex::new(probs.iter()) {
-        let a_idx = dist.sample(rng);
-        if mask.is_index_valid(a_idx) {
-            if let Some(a) = Action::from_index(a_idx) {
-                return a;
+fn sample_multiway_world<R: Rng>(
+    env: &Environment,
+    seats_to_sample: &[usize],
+    base_dead: &[bool; 52],
+    hero_seat: usize,
+    ranges: &HashMap<usize, (Vec<[Card; 2]>, Vec<f32>, usize)>,
+    rng: &mut R,
+) -> (Environment, Vec<Card>) {
+    let mut sim = env.clone();
+    let mut used = *base_dead;
+    for (i, p) in sim.state.players.iter().enumerate() {
+        if i != hero_seat {
+            for c in p.hole_cards.iter().flatten() {
+                used[c.0 as usize] = true;
             }
         }
     }
-    mask.valid_actions().first().copied().unwrap_or(Action::Fold)
+    for &s in seats_to_sample {
+        let already_known = s != hero_seat
+            && sim.state.players[s].hole_cards[0].is_some()
+            && sim.state.players[s].hole_cards[1].is_some();
+        if already_known {
+            continue;
+        }
+        if let Some([c0, c1]) = sample_hand_from_bayesian_pool(
+            ranges.get(&s).map(|(h, w, _)| (h.as_slice(), w.as_slice())),
+            &mut used,
+            rng,
+        ) {
+            sim.state.players[s].hole_cards = [Some(c0), Some(c1)];
+        }
+    }
+    let mut rem_deck: Vec<Card> = (0..52)
+        .filter(|&idx| !used[idx])
+        .map(|idx| Card(idx as u8))
+        .collect();
+    for i in (1..rem_deck.len()).rev() {
+        let j = rng.gen_range(0..=i);
+        rem_deck.swap(i, j);
+    }
+    sim.deck = Deck::from_remaining(&rem_deck);
+    (sim, rem_deck)
+}
+
+#[allow(dead_code)]
+fn sample_action_from_probs<R: Rng>(probs: &[f32; NUM_ACTIONS], mask: &ActionMask, rng: &mut R) -> Action {
+    sample_action_from_probs_u(probs, mask, rng.gen::<f32>())
 }
 
 #[cfg(test)]
@@ -3115,5 +3747,110 @@ mod tests {
             res.action_evs[Action::Fold.to_index()],
             res.action_evs[Action::BetPot75.to_index()]
         );
+    }
+
+    #[test]
+    fn test_multiway_cfr_5way_preflop_k4s_full_round_depth_and_no_fold_opp_stats() {
+        // Tái dựng chính xác spot Preflop OOP 5-way [K♦ 4♦] (bàn 1/2, Hero stack 105 = 52.5 BB) đúng thứ tự vòng bàn:
+        // Seat 0 (UTG open 7), Seat 1 (MP call 7), Seat 2 (Hero BTN Kd4d), Seat 3 (SB bet 1), Seat 4 (BB bet 2)
+        let (adv_mlp, strat_mlp) = if let (Ok(adv), Ok(strat)) = (
+            MLP::load_from_file("deep_cfr_lounge_model.json"),
+            MLP::load_from_file("deep_cfr_lounge_strategy.json"),
+        ) {
+            if adv.input_dim() == crate::environment::FEATURE_DIM {
+                (adv, Some(strat))
+            } else {
+                (MLP::new(&[crate::environment::FEATURE_DIM, 64, NUM_ACTIONS]), None)
+            }
+        } else {
+            (MLP::new(&[crate::environment::FEATURE_DIM, 64, NUM_ACTIONS]), None)
+        };
+
+        let mut stacks = vec![200u32; 10];
+        stacks[0] = 91;  // Opp 1 (UTG, 3.5x open)
+        stacks[1] = 242; // Opp 2 (MP, call 3.5x)
+        stacks[2] = 105; // Hero (BTN)
+        stacks[3] = 238; // SB
+        stacks[4] = 97;  // BB
+
+        let mut env = Environment::new(10, &stacks, 2, 1, 2);
+        env.state.is_cash_game = true;
+        env.state.street = Street::Preflop;
+        env.state.pot = 17;
+        env.state.current_highest_bet = 7;
+        env.state.min_raise = 5;
+        env.state.current_player_idx = 2;
+
+        for s in 5..10 {
+            env.state.players[s].is_folded = true;
+        }
+        env.state.players[0].current_bet = 7;
+        env.state.players[0].total_contributed = 7;
+        env.state.players[0].hole_cards = [None, None];
+        env.state.players[1].current_bet = 7;
+        env.state.players[1].total_contributed = 7;
+        env.state.players[1].hole_cards = [None, None];
+        env.state.players[2].hole_cards = [
+            Some(Card::from_str_repr("Kd").unwrap()),
+            Some(Card::from_str_repr("4d").unwrap()),
+        ];
+        env.state.players[3].current_bet = 1;
+        env.state.players[3].total_contributed = 1;
+        env.state.players[3].hole_cards = [None, None];
+        env.state.players[4].current_bet = 2;
+        env.state.players[4].total_contributed = 2;
+        env.state.players[4].hole_cards = [None, None];
+
+        env.street_has_acted = vec![false; 10];
+        env.street_has_acted[0] = true;
+        env.street_has_acted[1] = true;
+
+        env.state.action_history = vec![
+            ActionRecord { player_idx: 0, street: Street::Preflop, action: Action::BetPot75, amount: 7 },
+            ActionRecord { player_idx: 1, street: Street::Preflop, action: Action::CheckCall, amount: 7 },
+        ];
+
+        let mut cfg = SubgameSolverConfig::lounge_cash_default();
+        cfg.iterations = 160;
+        cfg.max_depth = 4;
+        let solver = SubgameSolver::new(cfg);
+
+        let res = solver.resolve(
+            &env,
+            2,
+            &adv_mlp,
+            strat_mlp.as_ref(),
+            SearchTrigger::ManualForced,
+            None,
+        );
+
+        println!(
+            "\n[K4s 5-way Preflop 52.5BB] kind={} ESS={:.1} Hist={} Best={:?}",
+            res.diagnostics.solver_kind,
+            res.diagnostics.opp_bayesian_ess,
+            res.diagnostics.bayesian_history_steps,
+            res.best_action
+        );
+        for a in Action::ALL {
+            let i = a.to_index();
+            println!(
+                "  {:<15}: EV {:>+6.2} (±{:.2}) | GTO {:>5.1}% | Opp F:{:>4.1}% C:{:>4.1}% R:{:>4.1}%",
+                a.name(),
+                res.action_evs[i],
+                res.diagnostics.action_ev_se[i],
+                res.action_probs[i] * 100.0,
+                res.diagnostics.opp_fold_pct[i] * 100.0,
+                res.diagnostics.opp_call_pct[i] * 100.0,
+                res.diagnostics.opp_raise_pct[i] * 100.0
+            );
+        }
+
+        let fold_i = Action::Fold.to_index();
+        assert_eq!(res.diagnostics.opp_fold_pct[fold_i], 0.0, "Fold must not record opp_fold_pct");
+        assert_eq!(res.diagnostics.opp_call_pct[fold_i], 0.0, "Fold must not record opp_call_pct");
+        assert_eq!(res.diagnostics.opp_raise_pct[fold_i], 0.0, "Fold must not record opp_raise_pct");
+        assert!(res.action_evs[fold_i].abs() < 1e-4, "Fold EV in Chip-EV must be 0.0");
+        assert_ne!(res.best_action, Action::BetPot75, "K4s OOP facing 3.5x open + call at 52.5BB must not blast BetPot75");
+        assert_ne!(res.best_action, Action::AllIn, "K4s OOP facing 3.5x open + call at 52.5BB must not 3-bet shove AllIn");
     }
 }

@@ -523,6 +523,8 @@
     // 🌐 GIAO TIẾP VỚI RUST BACKEND (:3000)
     // =========================================================================
 
+    let lastSyncRequestMs = 0;
+
     function sendToRust(payload) {
         GM_xmlhttpRequest({
             method: "POST",
@@ -533,6 +535,15 @@
             onload: function(response) {
                 try {
                     const data = JSON.parse(response.responseText);
+                    if (data && data.need_sync) {
+                        const cachedReg = sessionStorage.getItem('pn_registered_packet');
+                        const now = Date.now();
+                        if (cachedReg && now - lastSyncRequestMs > 5000) {
+                            lastSyncRequestMs = now;
+                            console.log("🔄 [SILENT BOT] Backend chưa đồng bộ registered, tự động gửi lại cached pn_registered_packet...");
+                            sendToRust(cachedReg);
+                        }
+                    }
                     if (data && data.chat_message && !hasAnnouncedChat) {
                         hasAnnouncedChat = true;
                         console.log("💬 [SILENT BOT] Nhận yêu cầu gửi tin nhắn chat từ Rust:", data.chat_message);

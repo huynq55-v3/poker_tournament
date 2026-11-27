@@ -64,6 +64,9 @@ pub struct HandState {
     pub seats_order: Vec<String>,
     pub has_evaluated_this_decision: bool,
     pub hero_mavtb: Option<u32>,
+    pub registered_synced: bool,
+    pub blinds_synced: bool,
+    pub blinds_inferred: bool,
 }
 
 impl Default for HandState {
@@ -92,6 +95,9 @@ impl HandState {
             seats_order: Vec::new(),
             has_evaluated_this_decision: false,
             hero_mavtb: None,
+            registered_synced: false,
+            blinds_synced: false,
+            blinds_inferred: false,
         }
     }
 
@@ -110,6 +116,9 @@ impl HandState {
         self.dealer_seat = None;
         self.action_history.clear();
         self.hero_mavtb = None;
+        if !self.blinds_synced {
+            self.blinds_inferred = false;
+        }
 
         if !self.seats_order.is_empty() {
             self.players.retain(|id, _| self.seats_order.contains(id));
@@ -183,6 +192,218 @@ pub fn parse_cards_array(val: &Value) -> Option<[Card; 2]> {
     }
 }
 
+fn parse_seats_from_value(payload: &Value) -> Vec<(usize, String)> {
+    let mut v: Vec<(usize, String)> = Vec::new();
+    if let Some(arr) = payload.get("seats").and_then(|v| v.as_array()) {
+        for s in arr {
+            let (seat_num, pid_opt) = if let Some(a) = s.as_array() {
+                let seat = a.first().and_then(|v| v.as_u64()).map(|n| n as usize);
+                let pid = a
+                    .get(1)
+                    .and_then(|v| v.as_str())
+                    .or_else(|| a.get(1).and_then(|v| v.get("id")).and_then(|v| v.as_str()))
+                    .map(|s| s.to_string());
+                (seat, pid)
+            } else if let Some(obj) = s.as_object() {
+                let seat = obj
+                    .get("seat")
+                    .or_else(|| obj.get("seatNum"))
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as usize);
+                let pid = obj
+                    .get("id")
+                    .or_else(|| obj.get("player_id"))
+                    .or_else(|| obj.get("playerId"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                (seat, pid)
+            } else {
+                (None, None)
+            };
+
+            if let (Some(seat), Some(pid)) = (seat_num, pid_opt) {
+                v.push((seat, pid));
+            }
+        }
+    } else if let Some(obj) = payload.get("seats").and_then(|v| v.as_object()) {
+        for (k, val) in obj {
+            if let Ok(seat) = k.parse::<usize>() {
+                if let Some(pid) = val.as_str().or_else(|| val.get("id").and_then(|v| v.as_str())) {
+                    v.push((seat, pid.to_string()));
+                }
+            }
+        }
+    }
+    v.sort_by_key(|(s, _)| *s);
+    v
+}
+
+fn apply_explicit_blinds(state: &mut HandState, payload: &Value) {
+    if let Some(bb) = payload
+        .get("bigBlind")
+        .or_else(|| payload.get("bB"))
+        .and_then(|v| v.as_u64())
+    {
+        if bb > 0 {
+            let old_bb = state.bb_size;
+            state.bb_size = bb as u32;
+            state.blinds_synced = true;
+            state.blinds_inferred = true;
+            if state.min_raise == old_bb || state.min_raise < state.bb_size {
+                state.min_raise = state.bb_size;
+            }
+        }
+    }
+    if let Some(sb) = payload
+        .get("smallBlind")
+        .or_else(|| payload.get("sB"))
+        .and_then(|v| v.as_u64())
+    {
+        if sb > 0 {
+            state.sb_size = sb as u32;
+        }
+    }
+}
+
+fn infer_preflop_blinds_from_tb(state: &mut HandState, payload: &Value) {
+    if state.blinds_synced || state.blinds_inferred || state.street != Street::Preflop {
+        return;
+    }
+    let Some(tb_obj) = payload.get("tB").and_then(|v| v.as_object()) else {
+        return;
+    };
+
+    let mut pos_bets: Vec<u32> = tb_obj
+        .values()
+        .filter_map(|v| v.as_u64().map(|x| x as u32))
+        .filter(|&x| x > 0)
+        .collect();
+    if pos_bets.is_empty() {
+        return;
+    }
+    pos_bets.sort_unstable();
+    pos_bets.dedup();
+
+    let old_bb = state.bb_size;
+    let has_explicit_mr = payload.get("mR").and_then(|v| v.as_u64()).is_some();
+
+    if pos_bets.len() >= 2 {
+        let b0 = pos_bets[0];
+        let b1 = pos_bets[1];
+        if b1 > b0 && b1 <= b0.saturating_mul(3) {
+            state.sb_size = b0;
+            state.bb_size = b1;
+            state.blinds_inferred = true;
+        } else if b0 < state.bb_size {
+            state.bb_size = b0;
+            state.sb_size = (b0 / 2).max(1);
+            state.blinds_inferred = true;
+        }
+    } else {
+        let b0 = pos_bets[0];
+        if state.highest_bet > b0 && state.highest_bet <= b0.saturating_mul(3) {
+            state.sb_size = b0;
+            state.bb_size = state.highest_bet;
+            state.blinds_inferred = true;
+        } else if b0 < state.bb_size {
+            state.bb_size = b0;
+            state.sb_size = (b0 / 2).max(1);
+            state.blinds_inferred = true;
+        }
+    }
+
+    if state.blinds_inferred
+        && !has_explicit_mr
+        && (state.min_raise == old_bb || state.min_raise < state.bb_size || state.highest_bet <= state.bb_size)
+    {
+        state.min_raise = state.bb_size;
+    }
+}
+
+/// Đồng bộ metadata bàn (hero ID, blinds, tên người chơi, seats) từ gói `registered`
+/// một cách an toàn khi reconnect/restart giữa ván: không reset hay ghi đè trạng thái ván đang chạy.
+pub fn sync_registered_packet(state: &mut HandState, payload: &Value) {
+    if let Some(cp) = payload.get("currentPlayer") {
+        if let Some(id) = cp
+            .get("id")
+            .or_else(|| cp.get("networkUsername"))
+            .or_else(|| cp.get("name"))
+            .and_then(|v| v.as_str())
+        {
+            if state.hero_id != id {
+                println!("🎯 [HERO] Đã nhận diện ID: '{}' (từ registered)", id);
+                state.hero_id = id.to_string();
+            }
+        }
+    }
+
+    state.registered_synced = true;
+
+    let Some(gs) = payload.get("gameState") else {
+        return;
+    };
+
+    apply_explicit_blinds(state, gs);
+
+    let active_hand_running = !state.hand_id.is_empty();
+    if let Some(players_obj) = gs.get("players").and_then(|v| v.as_object()) {
+        for (pid, pval) in players_obj {
+            if active_hand_running {
+                if let Some(entry) = state.players.get_mut(pid) {
+                    if let Some(n) = pval.get("name").and_then(|v| v.as_str()) {
+                        if !n.is_empty() {
+                            entry.name = n.to_string();
+                        }
+                    }
+                    if entry.seat_num == 99 {
+                        if let Some(seat) = pval
+                            .get("seat")
+                            .or_else(|| pval.get("seatNum"))
+                            .and_then(|v| v.as_u64())
+                        {
+                            entry.seat_num = seat as usize;
+                        }
+                    }
+                }
+            } else {
+                let entry = state.players.entry(pid.clone()).or_insert_with(|| PlayerTracker {
+                    id: pid.clone(),
+                    ..Default::default()
+                });
+                if let Some(s) = pval.get("stack").and_then(|v| v.as_u64()) {
+                    entry.stack = s as u32;
+                }
+                if let Some(n) = pval.get("name").and_then(|v| v.as_str()) {
+                    if !n.is_empty() {
+                        entry.name = n.to_string();
+                    }
+                }
+                if let Some(seat) = pval
+                    .get("seat")
+                    .or_else(|| pval.get("seatNum"))
+                    .and_then(|v| v.as_u64())
+                {
+                    entry.seat_num = seat as usize;
+                }
+            }
+        }
+    }
+
+    if state.seats_order.is_empty() {
+        let seats = parse_seats_from_value(gs);
+        if !seats.is_empty() {
+            for (seat, pid) in &seats {
+                if let Some(entry) = state.players.get_mut(pid) {
+                    if entry.seat_num == 99 {
+                        entry.seat_num = *seat;
+                    }
+                }
+            }
+            state.seats_order = seats.into_iter().map(|(_, id)| id).collect();
+        }
+    }
+}
+
 pub fn process_game_update(
     state: &mut HandState,
     payload: &Value,
@@ -223,73 +444,19 @@ pub fn process_game_update(
         }
     }
 
-    if let Some(arr) = payload.get("seats").and_then(|v| v.as_array()) {
-        let mut v: Vec<(usize, String)> = Vec::new();
-        for s in arr {
-            let (seat_num, pid_opt) = if let Some(a) = s.as_array() {
-                let seat = a.first().and_then(|v| v.as_u64()).map(|n| n as usize);
-                let pid = a
-                    .get(1)
-                    .and_then(|v| v.as_str())
-                    .or_else(|| a.get(1).and_then(|v| v.get("id")).and_then(|v| v.as_str()))
-                    .map(|s| s.to_string());
-                (seat, pid)
-            } else if let Some(obj) = s.as_object() {
-                let seat = obj
-                    .get("seat")
-                    .or_else(|| obj.get("seatNum"))
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as usize);
-                let pid = obj
-                    .get("id")
-                    .or_else(|| obj.get("player_id"))
-                    .or_else(|| obj.get("playerId"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                (seat, pid)
-            } else {
-                (None, None)
-            };
-
-            if let (Some(seat), Some(pid)) = (seat_num, pid_opt) {
-                let entry = state.players.entry(pid.clone()).or_insert_with(|| PlayerTracker {
-                    id: pid.clone(),
-                    ..Default::default()
-                });
-                entry.seat_num = seat;
-                v.push((seat, pid));
-            }
+    let seats = parse_seats_from_value(payload);
+    if !seats.is_empty() {
+        for (seat, pid) in &seats {
+            let entry = state.players.entry(pid.clone()).or_insert_with(|| PlayerTracker {
+                id: pid.clone(),
+                ..Default::default()
+            });
+            entry.seat_num = *seat;
         }
-        if !v.is_empty() {
-            v.sort_by_key(|(s, _)| *s);
-            state.seats_order = v.into_iter().map(|(_, id)| id).collect();
-        }
-    } else if let Some(obj) = payload.get("seats").and_then(|v| v.as_object()) {
-        let mut v: Vec<(usize, String)> = Vec::new();
-        for (k, val) in obj {
-            if let Ok(seat) = k.parse::<usize>() {
-                if let Some(pid) = val.as_str().or_else(|| val.get("id").and_then(|v| v.as_str())) {
-                    let entry = state.players.entry(pid.to_string()).or_insert_with(|| PlayerTracker {
-                        id: pid.to_string(),
-                        ..Default::default()
-                    });
-                    entry.seat_num = seat;
-                    v.push((seat, pid.to_string()));
-                }
-            }
-        }
-        if !v.is_empty() {
-            v.sort_by_key(|(s, _)| *s);
-            state.seats_order = v.into_iter().map(|(_, id)| id).collect();
-        }
+        state.seats_order = seats.into_iter().map(|(_, id)| id).collect();
     }
 
-    if let Some(bb) = payload.get("bigBlind").and_then(|v| v.as_u64()) {
-        state.bb_size = bb as u32;
-    }
-    if let Some(sb) = payload.get("smallBlind").and_then(|v| v.as_u64()) {
-        state.sb_size = sb as u32;
-    }
+    apply_explicit_blinds(state, payload);
 
     if let Some(p) = payload.get("pot") {
         if let Some(num) = p.as_u64() {
@@ -303,6 +470,8 @@ pub fn process_game_update(
     if let Some(chb) = payload.get("cHB").and_then(|v| v.as_u64()) {
         state.highest_bet = chb as u32;
     }
+
+    infer_preflop_blinds_from_tb(state, payload);
 
     if let Some(mr) = payload.get("mR").and_then(|v| v.as_u64()) {
         state.min_raise = (mr as u32).saturating_sub(state.highest_bet).max(state.bb_size);

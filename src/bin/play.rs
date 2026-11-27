@@ -3,7 +3,7 @@ use poker_tournament::environment::FEATURE_DIM;
 use poker_tournament::equity::preflop_table;
 use poker_tournament::live::{
     DecisionMode, HandState, InPageAction, PlayConfig, PlayMode, process_game_update,
-    set_target_game,
+    set_target_game, sync_registered_packet,
 };
 use poker_tournament::neural_network::MLP;
 use serde_json::{Value, json};
@@ -294,24 +294,12 @@ fn handle_client(
 
             match event_name {
                 "registered" => {
-                    if let Some(cp) = payload.get("currentPlayer") {
-                        if let Some(id) = cp
-                            .get("id")
-                            .or_else(|| cp.get("networkUsername"))
-                            .or_else(|| cp.get("name"))
-                            .and_then(|v| v.as_str())
-                        {
-                            if state.hero_id != id {
-                                println!(
-                                    "🎯 [HERO] Đã nhận diện ID: '{}' (từ registered)",
-                                    id
-                                );
-                                state.hero_id = id.to_string();
-                            }
+                    let was_empty = state.hand_id.is_empty();
+                    sync_registered_packet(state, payload);
+                    if was_empty {
+                        if let Some(gs) = payload.get("gameState") {
+                            pending_action = process_game_update(state, gs, policy, cfg);
                         }
-                    }
-                    if let Some(gs) = payload.get("gameState") {
-                        pending_action = process_game_update(state, gs, policy, cfg);
                     }
                 }
                 "gC" => {
@@ -324,7 +312,8 @@ fn handle_client(
 
     let json_resp = json!({
         "status": "ok",
-        "bot_action": pending_action
+        "bot_action": pending_action,
+        "need_sync": !state.registered_synced
     });
     let body_str = json_resp.to_string();
     let resp = format!(
