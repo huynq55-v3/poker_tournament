@@ -29,6 +29,10 @@ enigo = "0.3"
 name = "rl_gpu_check"
 required-features = ["rl"]
 
+[[bin]]
+name = "train_rl"
+required-features = ["rl"]
+
 [features]
 rl = ["dep:burn"]
 rl-cuda = ["rl", "burn/cuda"]
