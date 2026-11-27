@@ -76,6 +76,7 @@ pub fn run_gto_evaluation(
     }
 
     let features = env.state.encode_features(hero_seat);
+    let (bp_raw_adv, bp_probs, _) = blueprint_eval(policy, &features, &mask);
 
     let mut solver_cfg = cfg.solver_config.clone();
     solver_cfg.use_icm = !cfg.mode.is_cash_game();
@@ -94,14 +95,26 @@ pub fn run_gto_evaluation(
             );
             (res.action_evs, res.action_probs, Some(res))
         } else {
-            blueprint_eval(policy, &features, &mask)
+            (bp_raw_adv, bp_probs, None)
         }
     } else {
-        blueprint_eval(policy, &features, &mask)
+        (bp_raw_adv, bp_probs, None)
     };
 
+    let opp_is_active_and_unacted = (0..num_players)
+        .filter(|&i| i != hero_seat && env.state.players[i].is_in_hand())
+        .any(|i| env.state.players[i].is_active() && !env.street_has_acted[i]);
+    let hero_pos_tag = if !opp_is_active_and_unacted { "IP" } else { "OOP" };
+
     println!("\n============================================================");
-    println!("🎯 [{} - ĐẾN LƯỢT BẠN] - VÒNG: {:?}", cfg.mode.label(), state.street);
+    println!(
+        "🎯 [{} - ĐẾN LƯỢT BẠN] - VÒNG: {:?} ({}) | Hero Seat #{} (BTN #{})",
+        cfg.mode.label(),
+        state.street,
+        hero_pos_tag,
+        hero_seat,
+        env.state.button_idx
+    );
     println!("👥 Người còn trong ván: {} / Ghế active trên bàn: {}", in_hand_count, num_players);
     println!("🃏 Bài tẩy : [ {} {} ]", hole[0], hole[1]);
     if !state.community_cards.is_empty() {
@@ -117,8 +130,57 @@ pub fn run_gto_evaluation(
     let eff_chips = (eff_bb * state.bb_size.max(1) as f32).round() as u32;
     println!("⚡ Effective Stack : {} chip ({:.1} BB)", eff_chips, eff_bb);
 
+    // Log đối thủ in-hand & lịch sử cược đã tái dựng để dễ debug live
+    let opp_summaries: Vec<String> = ctx
+        .active_seats
+        .iter()
+        .enumerate()
+        .filter(|&(seat, _)| seat != hero_seat && env.state.players[seat].is_in_hand())
+        .map(|(seat, pid)| {
+            let name = state
+                .players
+                .get(pid)
+                .map(|p| p.name.as_str())
+                .unwrap_or(pid.as_str());
+            let pl = &env.state.players[seat];
+            format!(
+                "{}(s:{},bet:{},tot:{},acted:{})",
+                name, pl.stack, pl.current_bet, pl.total_contributed, env.street_has_acted[seat]
+            )
+        })
+        .collect();
+    if !opp_summaries.is_empty() {
+        println!("🎭 Đối thủ in-hand: {}", opp_summaries.join(" | "));
+    }
+
+    if state.action_history.is_empty() {
+        println!("📜 Lịch sử cược  : (Chưa ghi nhận action trước lượt này -> Bayesian Uniform Prior)");
+    } else {
+        let hist_str: Vec<String> = state
+            .action_history
+            .iter()
+            .map(|r| {
+                let name = state
+                    .players
+                    .get(&r.player_id)
+                    .map(|p| p.name.as_str())
+                    .unwrap_or(r.player_id.as_str());
+                format!("{:?}:{}:{:?}({})", r.street, name, r.action, r.amount)
+            })
+            .collect();
+        println!("📜 Lịch sử cược  : {}", hist_str.join(" -> "));
+    }
+
+    let bp_summary: Vec<String> = Action::ALL
+        .iter()
+        .filter(|a| mask.is_valid(**a))
+        .map(|a| format!("{} {:.1}%", a.name(), bp_probs[a.to_index()] * 100.0))
+        .collect();
+    println!("🧠 Blueprint Prior: {}", bp_summary.join(" | "));
+
     let ev_unit = if solver.config.use_icm { "ICM" } else { "BB" };
     if let Some(ref res) = solver_result_opt {
+        let d = &res.diagnostics;
         println!("\n╔══════════════════════════════════════════════════════════════╗");
         println!("║ 🔍 [SUBGAME SOLVER ACTIVATED - {}]                         ║", ev_unit);
         println!("╚══════════════════════════════════════════════════════════════╝");
@@ -126,6 +188,15 @@ pub fn run_gto_evaluation(
         println!(
             "⏱️  Thời gian giải   : {:.2} ms ({} iters, max depth {})",
             res.duration_ms, res.iterations_run, solver.config.max_depth
+        );
+        println!(
+            "🔬 Giải thuật       : {} ({} in hand | Range: {} | ESS: {:.1} | Hist steps: {} | Showdown Eq: {:.1}%)",
+            d.solver_kind,
+            d.num_in_hand,
+            d.opp_range_size,
+            d.opp_bayesian_ess,
+            d.bayesian_history_steps,
+            d.hero_showdown_eq * 100.0
         );
     } else if cfg.enable_solver {
         println!("⚡ [FAST POLICY INFERENCE] Tình huống chuẩn Blueprint -> Mạng Nơ-ron tức thì");
@@ -159,13 +230,14 @@ pub fn run_gto_evaluation(
     let (chosen_idx, decision_note) = match cfg.decision_mode {
         DecisionMode::PureMaxEv => {
             if let Some(ref res) = solver_result_opt {
+                let tie_eps = if solver.config.use_icm { 1e-3 } else { 1e-2 };
                 let mut best_i = 0;
                 let mut best_ev = f32::NEG_INFINITY;
                 let mut best_p = -1.0f32;
                 for (i, &ev) in res.action_evs.iter().enumerate().take(NUM_ACTIONS) {
                     if mask.is_index_valid(i) {
                         let p = res.action_probs[i];
-                        if ev > best_ev || ((ev - best_ev).abs() < 1e-4 && p > best_p) {
+                        if ev > best_ev + tie_eps || ((ev - best_ev).abs() <= tie_eps && p > best_p) {
                             best_ev = ev;
                             best_p = p;
                             best_i = i;
@@ -174,11 +246,12 @@ pub fn run_gto_evaluation(
                 }
                 let best_act = Action::from_index(best_i).unwrap();
                 let note = format!(
-                    "⚡ [SOLVER EV MAX] Nhánh EV cao nhất từ Search Tree: {:?} (EV: {:>+6.2} {}, GTO: {:.1}%)",
+                    "⚡ [SOLVER EV MAX] Nhánh EV cao nhất từ Search Tree: {:?} (EV: {:>+6.2} {}, GTO: {:.1}%, BP: {:.1}%)",
                     best_act,
                     best_ev,
                     ev_unit,
-                    best_p * 100.0
+                    best_p * 100.0,
+                    bp_probs[best_i] * 100.0
                 );
                 (best_i, note)
             } else {
@@ -359,12 +432,37 @@ pub fn run_gto_evaluation(
         };
         let status = if is_valid { "" } else { " (Bị khóa)" };
         let raw_val = raw_adv.get(i).copied().unwrap_or(0.0);
+        let se_str = match solver_result_opt {
+            Some(ref res) if is_valid && res.diagnostics.action_ev_se[i] > 0.0 => {
+                format!(" (±{:.2})", res.diagnostics.action_ev_se[i])
+            }
+            _ => String::new(),
+        };
+        let opp_str = match solver_result_opt {
+            Some(ref res) => {
+                let d = &res.diagnostics;
+                if is_valid && (d.opp_fold_pct[i] + d.opp_call_pct[i] + d.opp_raise_pct[i]) > 1e-4 {
+                    format!(
+                        " | Opp F:{:>4.1}% C:{:>4.1}% R:{:>4.1}%",
+                        d.opp_fold_pct[i] * 100.0,
+                        d.opp_call_pct[i] * 100.0,
+                        d.opp_raise_pct[i] * 100.0
+                    )
+                } else {
+                    String::new()
+                }
+            }
+            None => String::new(),
+        };
         println!(
-            "    {:<14}: EV: {:>+6.2} (GTO: {:>5.1}%) | [{:<15}]{}{}",
+            "    {:<15}: EV: {:>+6.2}{} (GTO: {:>5.1}% | BP: {:>5.1}%) | [{:<15}]{}{}{}",
             act.name(),
             raw_val,
+            se_str,
             p * 100.0,
+            bp_probs[i] * 100.0,
             get_action_desc(act),
+            opp_str,
             rec,
             status
         );

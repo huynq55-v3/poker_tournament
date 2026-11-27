@@ -10,8 +10,8 @@ pub mod sampler;
 pub mod self_play;
 
 pub use deep_cfr::{
-    AdvantageMemory, DeepCFRPolicy, DeepCFRTrainer, SearchTrigger, StrategyMemory, SubgameResult,
-    SubgameSolver, SubgameSolverConfig,
+    AdvantageMemory, DeepCFRPolicy, DeepCFRTrainer, SearchTrigger, StrategyMemory,
+    SubgameDiagnostics, SubgameResult, SubgameSolver, SubgameSolverConfig,
 };
 pub use environment::{Action, ActionMask, Environment, GameState, PlayerState, Street};
 pub use gui::{BlindLevel, PokerNowApp, TournamentBlindSchedule};
