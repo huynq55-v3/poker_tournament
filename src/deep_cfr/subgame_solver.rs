@@ -20,6 +20,7 @@ use crate::poker_core::card::{Card, Rank, Suit};
 use crate::poker_core::deck::Deck;
 use crate::poker_core::evaluator::{evaluate_7_cards, HandRank};
 use rand::distributions::WeightedIndex;
+use rayon::prelude::*;
 use rand::prelude::Distribution;
 use rand::rngs::StdRng;
 use rand::{thread_rng, Rng, SeedableRng};
@@ -31,7 +32,8 @@ const BAYESIAN_PROB_FLOOR: f32 = 1e-3;
 const HU_RANGE_SIZE: usize = 28;
 const HU_MAX_TREE_NODES: usize = 384;
 const HU_RUNOUT_SAMPLES: usize = 16;
-const MULTIWAY_RANGE_SIZE: usize = 96;
+/// `usize::MAX` = liệt kê toàn bộ combo công khai cho range đối thủ multiway.
+const MULTIWAY_RANGE_SIZE: usize = usize::MAX;
 
 /// Lý do kích hoạt tìm kiếm theo độ sâu
 #[derive(Clone, Debug, PartialEq)]
@@ -78,6 +80,8 @@ pub struct SubgameSolverConfig {
     pub use_icm: bool,                  // Đánh giá EV theo Tournament ICM (mặc định true)
     pub rng_seed: Option<u64>,          // Seed cố định cho RNG của solver (None = ngẫu nhiên; dùng cho test tái lập)
     pub decision_confidence_z: f32,     // Số SE của hiệu số EV coi là "hoà thống kê" khi chọn action (mặc định 1.0)
+    pub max_eval_iters: usize,          // Trần số vòng Pha C thích ứng (dừng sớm khi action tốt nhất đã tách biệt)
+    pub stop_confidence_z: f32,         // Số SE hiệu số EV cần để dừng sớm Pha C (chặt hơn ngưỡng hoà vì kiểm tra lặp)
 }
 
 impl Default for SubgameSolverConfig {
@@ -91,6 +95,8 @@ impl Default for SubgameSolverConfig {
             use_icm: true,
             rng_seed: None,
             decision_confidence_z: 1.0,
+            max_eval_iters: 3840,
+            stop_confidence_z: 2.0,
         }
     }
 }
@@ -100,13 +106,15 @@ impl SubgameSolverConfig {
     pub fn lounge_cash_default() -> Self {
         Self {
             max_depth: 4,
-            iterations: 120,
+            iterations: 320,
             min_pot_bb_trigger: 15.0,
             unusual_bet_ratio_trigger: 1.10,
             search_turn_river: true,
             use_icm: false,
             rng_seed: None,
             decision_confidence_z: 1.0,
+            max_eval_iters: 3840,
+            stop_confidence_z: 2.0,
         }
     }
 }
@@ -344,8 +352,11 @@ fn build_bayesian_range<R: Rng>(
         return (Vec::new(), Vec::new(), 0);
     }
 
-    let mut hands: Vec<[Card; 2]> = Vec::with_capacity(target_size);
-    let mut seen: HashSet<(u8, u8)> = HashSet::with_capacity(target_size * 2);
+    let total_combos = public_cards.len() * (public_cards.len() - 1) / 2;
+    let enumerate_all = target_size >= total_combos;
+    let cap = target_size.min(total_combos + 1);
+    let mut hands: Vec<[Card; 2]> = Vec::with_capacity(cap);
+    let mut seen: HashSet<(u8, u8)> = HashSet::with_capacity(cap * 2);
 
     // Nếu là Hero public range (cho đối thủ cập nhật CFR không nhìn trộm bài thật):
     // khe [0] luôn là bài thật của Hero.
@@ -372,7 +383,19 @@ fn build_bayesian_range<R: Rng>(
         non_avoid_cards = public_cards.clone();
     }
 
-    let max_attempts = target_size * 12;
+    if enumerate_all {
+        // Liệt kê toàn bộ combo công khai (range đầy đủ, không nhiễu lấy mẫu giữa các lần giải)
+        for i in 0..public_cards.len() {
+            for j in (i + 1)..public_cards.len() {
+                let (a, b) = (public_cards[i], public_cards[j]);
+                if seen.insert((a.0.min(b.0), a.0.max(b.0))) {
+                    hands.push([a, b]);
+                }
+            }
+        }
+    }
+
+    let max_attempts = if enumerate_all { 0 } else { target_size * 12 };
     for _ in 0..max_attempts {
         if hands.len() >= target_size {
             break;
@@ -403,16 +426,37 @@ fn build_bayesian_range<R: Rng>(
 
     let mut weights = vec![1.0f32; hands.len()];
     if !snapshots.is_empty() {
-        for (h_idx, &[c0, c1]) in hands.iter().enumerate() {
-            let mut likelihood = 1.0f32;
-            for (snap, mask, act) in &snapshots {
-                let mut s_clone = snap.clone();
-                s_clone.players[target_seat].hole_cards = [Some(c0), Some(c1)];
-                let probs = blueprint_probs_for_state(&s_clone, target_seat, mask, adv_net, strat_net);
-                let p_act = probs[act.to_index()].max(BAYESIAN_PROB_FLOOR);
-                likelihood *= p_act;
+        // Likelihood độc lập theo từng tay -> tính song song (kết quả y hệt bản tuần tự)
+        weights = hands
+            .par_iter()
+            .map(|&[c0, c1]| {
+                let mut likelihood = 1.0f32;
+                for (snap, mask, act) in &snapshots {
+                    let mut s_clone = snap.clone();
+                    s_clone.players[target_seat].hole_cards = [Some(c0), Some(c1)];
+                    let probs = blueprint_probs_for_state(&s_clone, target_seat, mask, adv_net, strat_net);
+                    likelihood *= probs[act.to_index()].max(BAYESIAN_PROB_FLOOR);
+                }
+                likelihood
+            })
+            .collect();
+
+        // Preflop: likelihood chỉ phụ thuộc bài tẩy, và các combo cùng lớp (169 lớp) đẳng cấu theo chất.
+        // Feature one-hot theo lá làm net cho nhiễu khác nhau giữa các chất -> lấy P(a | lớp) = trung bình
+        // likelihood trên các combo cùng lớp (prior đều trong lớp), khử nhiễu mà không thêm tham số.
+        let all_preflop = snapshots.iter().all(|(snap, _, _)| snap.community_cards.is_empty());
+        if all_preflop {
+            let mut cls_sum = [0.0f64; 169];
+            let mut cls_cnt = [0u32; 169];
+            for (&[c0, c1], &w) in hands.iter().zip(weights.iter()) {
+                let k = class_index(c0, c1);
+                cls_sum[k] += w as f64;
+                cls_cnt[k] += 1;
             }
-            weights[h_idx] = likelihood;
+            for (&[c0, c1], w) in hands.iter().zip(weights.iter_mut()) {
+                let k = class_index(c0, c1);
+                *w = (cls_sum[k] / cls_cnt[k].max(1) as f64) as f32;
+            }
         }
     }
 
@@ -2849,8 +2893,12 @@ impl SubgameSolver {
         }
 
         // Giai đoạn 2 (Pha C): Đánh giá tay bài thật `hero_hole` trước chiến lược trung bình đã hội tụ
-        let eval_iters = base_iters.saturating_mul(3).clamp(240, 480);
-        for eval_idx in 0..eval_iters {
+        // Pha C thích ứng: chạy theo từng lô `min_eval`, dừng khi action EV cao nhất tách biệt thống kê
+        // (EV_best - EV_a > z * SE(hiệu số) với mọi a) hoặc chạm trần `max_eval_iters`.
+        let min_eval = base_iters.saturating_mul(3).clamp(240, 480);
+        let max_eval = self.config.max_eval_iters.max(min_eval);
+        let mut eval_idx = 0usize;
+        while eval_idx < max_eval {
             let (branch, rem_deck) = sample_multiway_world(
                 &work_env,
                 &all_opp_seats,
@@ -2972,6 +3020,19 @@ impl SubgameSolver {
                 let i = a.to_index();
                 root_regrets[i] += cur_vals[i] - expected_v;
                 root_policy_sum[i] += post_w * strat[i];
+            }
+            eval_idx += 1;
+            if eval_idx % min_eval == 0
+                && phase_c_best_is_separated(
+                    &valid_actions,
+                    &sum_v,
+                    &sum_sq_v,
+                    &sum_cross_v,
+                    eval_n,
+                    self.config.stop_confidence_z,
+                )
+            {
+                break;
             }
         }
 
@@ -3139,6 +3200,33 @@ impl SubgameSolver {
             start_time,
         )
     }
+}
+
+/// Kiểm tra action có EV mẫu cao nhất đã vượt mọi action khác quá `z` lần SE của hiệu số (mẫu CRN ghép cặp).
+fn phase_c_best_is_separated(
+    valid_actions: &[Action],
+    sum_v: &[f64; NUM_ACTIONS],
+    sum_sq_v: &[f64; NUM_ACTIONS],
+    sum_cross_v: &[[f64; NUM_ACTIONS]; NUM_ACTIONS],
+    n: u32,
+    z: f32,
+) -> bool {
+    if n < 2 || valid_actions.len() < 2 {
+        return true;
+    }
+    let n_f = n as f64;
+    let mut b = valid_actions[0].to_index();
+    for a in valid_actions {
+        if sum_v[a.to_index()] > sum_v[b] {
+            b = a.to_index();
+        }
+    }
+    valid_actions.iter().map(|a| a.to_index()).filter(|&i| i != b).all(|i| {
+        let d_mean = (sum_v[b] - sum_v[i]) / n_f;
+        let d_sq = (sum_sq_v[b] + sum_sq_v[i] - 2.0 * sum_cross_v[b][i]) / n_f;
+        let se = ((d_sq - d_mean * d_mean).max(0.0) / n_f).sqrt();
+        d_mean > z.max(0.0) as f64 * se
+    })
 }
 
 /// Chọn action: lấy nhánh EV cao nhất `b`; mọi nhánh `a` có `EV_b - EV_a <= z * SE(EV_b - EV_a)`
@@ -3993,23 +4081,8 @@ mod tests {
         assert_ne!(res.best_action, Action::AllIn, "K4s OOP facing 3.5x open + call at 52.5BB must not 3-bet shove AllIn");
     }
 
-    #[test]
-    fn test_multiway_cfr_bb_33_6way_limped_pot_checks_not_shoves_49bb() {
-        // Tái dựng chính xác spot BB [3♥ 3♦] 6-way limped pot (1/2, Hero stack behind 98, pot 12):
-        // Seat 0: BenMin486 SB (s:96, bet:2, tot:2, acted:true)
-        // Seat 1: Hero BB [3h 3d] (s:98, bet:2, tot:2)
-        // Seat 2: dravy (s:134, bet:2, tot:2, acted:true)
-        // Seat 3: pt2026 (s:672, bet:2, tot:2, acted:true)
-        // Seat 4: bingbong3425 (s:358, bet:2, tot:2, acted:true)
-        // Seat 5: talismann BTN (s:1566, bet:2, tot:2, acted:true)
-        // Hermetic: không đọc model ngoài repo; MLP trọng số 0 => blueprint trung tính & tất định
-        let mut adv_mlp = MLP::new(&[crate::environment::FEATURE_DIM, 64, NUM_ACTIONS]);
-        for l in &mut adv_mlp.layers {
-            l.weights.fill(0.0);
-            l.bias.fill(0.0);
-        }
-        let strat_mlp: Option<MLP> = None;
-
+    /// Spot BB [3♥ 3♦] 6-way limped pot (1/2, Hero stack behind 98, pot 12).
+    fn build_bb_33_limped_6way_env() -> Environment {
         let mut stacks = vec![200u32; 9];
         stacks[0] = 96;
         stacks[1] = 98;
@@ -4051,6 +4124,73 @@ mod tests {
             ActionRecord { player_idx: 5, street: Street::Preflop, action: Action::CheckCall, amount: 2 },
             ActionRecord { player_idx: 0, street: Street::Preflop, action: Action::CheckCall, amount: 1 },
         ];
+        env
+    }
+
+    fn mean_std(xs: &[f32]) -> (f32, f32) {
+        let n = xs.len().max(1) as f32;
+        let m = xs.iter().sum::<f32>() / n;
+        let v = xs.iter().map(|x| (x - m) * (x - m)).sum::<f32>() / (n - 1.0).max(1.0);
+        (m, v.sqrt())
+    }
+
+    /// Harness đo độ ổn định Stage 1 giữa các lần chạy (cần model thật, không tất định).
+    /// Chạy: cargo test --release --lib stage1_stability -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn stage1_stability_harness_bb_33_real_model() {
+        let adv = match MLP::load_from_file("deep_cfr_lounge_model.json") {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let strat = MLP::load_from_file("deep_cfr_lounge_strategy.json").ok();
+        let runs: usize = std::env::var("STAB_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
+        let env = build_bb_33_limped_6way_env();
+        let solver = SubgameSolver::new(SubgameSolverConfig::lounge_cash_default());
+        let mut evs: Vec<Vec<f32>> = vec![Vec::new(); NUM_ACTIONS];
+        let mut picks = [0usize; NUM_ACTIONS];
+        let mut ms = Vec::new();
+        for _ in 0..runs {
+            let res = solver.resolve(&env, 1, &adv, strat.as_ref(), SearchTrigger::ManualForced, None);
+            for a in Action::ALL {
+                let i = a.to_index();
+                if res.action_evs[i].is_finite() {
+                    evs[i].push(res.action_evs[i]);
+                }
+            }
+            picks[res.best_action.to_index()] += 1;
+            ms.push(res.duration_ms as f32);
+        }
+        let (t_mean, _) = mean_std(&ms);
+        println!("\n[STAB 33] runs={} avg_ms={:.0}", runs, t_mean);
+        for a in Action::ALL {
+            let i = a.to_index();
+            if evs[i].is_empty() {
+                continue;
+            }
+            let (m, sd) = mean_std(&evs[i]);
+            println!("  {:<15} EV mean {:>+6.2}  between-run SD {:>5.2}  picked {}/{}", a.name(), m, sd, picks[i], runs);
+        }
+    }
+
+    #[test]
+    fn test_multiway_cfr_bb_33_6way_limped_pot_checks_not_shoves_49bb() {
+        // Tái dựng chính xác spot BB [3♥ 3♦] 6-way limped pot (1/2, Hero stack behind 98, pot 12):
+        // Seat 0: BenMin486 SB (s:96, bet:2, tot:2, acted:true)
+        // Seat 1: Hero BB [3h 3d] (s:98, bet:2, tot:2)
+        // Seat 2: dravy (s:134, bet:2, tot:2, acted:true)
+        // Seat 3: pt2026 (s:672, bet:2, tot:2, acted:true)
+        // Seat 4: bingbong3425 (s:358, bet:2, tot:2, acted:true)
+        // Seat 5: talismann BTN (s:1566, bet:2, tot:2, acted:true)
+        // Hermetic: không đọc model ngoài repo; MLP trọng số 0 => blueprint trung tính & tất định
+        let mut adv_mlp = MLP::new(&[crate::environment::FEATURE_DIM, 64, NUM_ACTIONS]);
+        for l in &mut adv_mlp.layers {
+            l.weights.fill(0.0);
+            l.bias.fill(0.0);
+        }
+        let strat_mlp: Option<MLP> = None;
+
+        let env = build_bb_33_limped_6way_env();
 
         let mut cfg = SubgameSolverConfig::lounge_cash_default();
         cfg.iterations = 160;
